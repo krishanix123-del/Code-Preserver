@@ -1,0 +1,107 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+:root {
+  --primary: #0a0e27;
+  --secondary: #1a1f4f;
+  --accent-blue: #00d4ff;
+  --accent-electric: #0099ff;
+  --text-main: #e8f0ff;
+  --text-secondary: #a0b0d0;
+  --border-color: #004d7f;
+}
+
+html, body, #root {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  font-family: 'Segoe UI', 'Poppins', sans-serif;
+  background: linear-gradient(135deg, #0a0e27 0%, #1a1f4f 100%);
+  color: #e8f0ff;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+@keyframes glow-pulse {
+  0%, 100% { text-shadow: 0 0 15px #00d4ff, 0 0 30px #0099ff; }
+  50% { text-shadow: 0 0 25px #00d4ff, 0 0 40px #0099ff; }
+}
+
+@keyframes bounce-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.05); }
+}
+
+@keyframes slideIn {
+  from { transform: translateX(400px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+@keyframes slideUpIn {
+  from { transform: translateY(30px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+@keyframes timerPulse {
+  0% { text-shadow: 0 0 5px #00d4ff; }
+  100% { text-shadow: 0 0 15px #00d4ff; }
+}
+
+@keyframes heartBeat {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.2); }
+  100% { transform: scale(1); }
+}
+
+@keyframes statusBlink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(20px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.logo-glow { animation: glow-pulse 3s ease-in-out infinite; }
+.bounce-pulse { animation: bounce-pulse 2s ease-in-out infinite; }
+.timer-pulse { animation: timerPulse 1s ease-in-out infinite alternate; }
+
+.notification {
+  padding: 8px 16px;
+  border-radius: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  animation: slideIn 0.3s ease;
+  max-width: 320px;
+  word-break: break-word;
+}
+
+.chat-popup {
+  animation: slideUpIn 0.3s ease;
+}
+
+.chat-messages-scroll::-webkit-scrollbar { width: 4px; }
+.chat-messages-scroll::-webkit-scrollbar-thumb { background: #00d4ff; border-radius: 4px; }
+.members-scroll::-webkit-scrollbar { width: 4px; }
+.members-scroll::-webkit-scrollbar-thumb { background: #004d7f; border-radius: 4px; }
+
+/* Mobile optimizations */
+@media (max-width: 767px) {
+  html, body, #root {
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+  button {
+    -webkit-tap-highlight-color: transparent;
+  }
+  input, textarea {
+    font-size: 16px !important; /* Prevent iOS zoom on focus */
+  }
+}
