@@ -25,7 +25,7 @@ function membersList(room: RoomInfo) {
 export function attachSignaling(httpServer: HttpServer) {
   const io = new IOServer(httpServer, {
     cors: { origin: "*", methods: ["GET", "POST"] },
-    path: "/socket.io",
+    path: "/api/socket.io",
     pingTimeout: 120000,
     pingInterval: 30000,
   });

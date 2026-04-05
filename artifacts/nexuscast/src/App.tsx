@@ -190,12 +190,12 @@ export default function App() {
   // Socket.IO setup
   useEffect(() => {
     const socket = io("/", {
-      path: "/socket.io",
+      path: "/api/socket.io",
       transports: ["websocket", "polling"],
       reconnection: true,
       reconnectionAttempts: Infinity,
-      reconnectionDelay: 1000,
-      reconnectionDelayMax: 5000,
+      reconnectionDelay: 500,
+      reconnectionDelayMax: 3000,
     });
     socketRef.current = socket;
 
