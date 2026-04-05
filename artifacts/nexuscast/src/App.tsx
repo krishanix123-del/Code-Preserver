@@ -141,6 +141,14 @@ export default function App() {
     };
   }, []);
 
+  // Sync camera stream into miniVideoRef whenever screen sharing turns on with camera active
+  useEffect(() => {
+    if (isWebcamOn && isScreenSharing && miniVideoRef.current && localStreamRef.current) {
+      miniVideoRef.current.srcObject = localStreamRef.current;
+      miniVideoRef.current.play().catch(() => {});
+    }
+  }, [isWebcamOn, isScreenSharing]);
+
   // Fix 8: mobile detection
   useEffect(() => {
     const check = () => setIsMobile(window.innerWidth < 768);
@@ -467,17 +475,31 @@ export default function App() {
     }
 
     if (option === "screen" || option === "both") {
-      try {
-        if (!navigator.mediaDevices.getDisplayMedia) {
-          notify("Screen sharing not supported on this device/browser", "error");
-          if (!cameraStarted) return;
-        } else {
-          const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: true });
+      const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+      if (!navigator.mediaDevices?.getDisplayMedia || isIOS) {
+        const msg = isIOS
+          ? "iOS Safari doesn't support screen sharing. Use Camera instead, or try Chrome on Android."
+          : "Screen sharing is not supported on this browser. Try Chrome or Firefox on desktop/Android.";
+        notify(msg, "error");
+        if (!cameraStarted) return;
+      } else {
+        try {
+          // Use minimal constraints for best mobile compatibility
+          const isMob = /Android|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+          const screenConstraints: DisplayMediaStreamOptions = isMob
+            ? { video: true }
+            : { video: { frameRate: 30 }, audio: true };
+          const screenStream = await navigator.mediaDevices.getDisplayMedia(screenConstraints);
           screenStreamRef.current = screenStream;
           // Fix 6: attach FIRST before state update
           if (localCenterRef.current) {
             localCenterRef.current.srcObject = screenStream;
             localCenterRef.current.play().catch(() => {});
+          }
+          // Attach camera to mini player if camera is also active
+          if (cameraStarted && localStreamRef.current && miniVideoRef.current) {
+            miniVideoRef.current.srcObject = localStreamRef.current;
+            miniVideoRef.current.play().catch(() => {});
           }
           const screenVideoTrack = screenStream.getVideoTracks()[0];
           pcsRef.current.forEach(pc => {
@@ -506,10 +528,13 @@ export default function App() {
               });
             }
           };
+        } catch (err: unknown) {
+          const name = err instanceof Error ? err.name : "";
+          if (name === "NotAllowedError") notify("Screen sharing permission denied.", "error");
+          else if (name !== "AbortError") notify("Screen sharing not available on this device/browser.", "error");
+          else notify("Screen share cancelled.", "info");
+          if (!cameraStarted) return;
         }
-      } catch {
-        notify("Screen share cancelled", "info");
-        if (!cameraStarted) return;
       }
     }
 
@@ -568,18 +593,30 @@ export default function App() {
       setIsScreenSharing(false);
       notify("Screen share stopped. Stream continues.", "info");
     } else {
+      const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+      if (!navigator.mediaDevices?.getDisplayMedia || isIOS) {
+        const msg = isIOS
+          ? "iOS Safari doesn't support screen sharing. Use Camera instead, or try Chrome on Android."
+          : "Screen sharing is not supported on this browser. Try Chrome or Firefox on desktop/Android.";
+        notify(msg, "error");
+        return;
+      }
       try {
-        if (!navigator.mediaDevices.getDisplayMedia) {
-          notify("Screen sharing not supported on this device/browser", "error");
-          return;
-        }
-        // Fix 7: more compatible getDisplayMedia call
-        const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: true });
+        const isMob = /Android|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+        const screenConstraints: DisplayMediaStreamOptions = isMob
+          ? { video: true }
+          : { video: { frameRate: 30 }, audio: true };
+        const screenStream = await navigator.mediaDevices.getDisplayMedia(screenConstraints);
         screenStreamRef.current = screenStream;
-        // Fix 6: attach BEFORE state update
+        // Fix 6: attach BEFORE state update — screen goes to center
         if (localCenterRef.current) {
           localCenterRef.current.srcObject = screenStream;
           localCenterRef.current.play().catch(() => {});
+        }
+        // Attach camera to mini player if camera is on
+        if (localStreamRef.current && miniVideoRef.current) {
+          miniVideoRef.current.srcObject = localStreamRef.current;
+          miniVideoRef.current.play().catch(() => {});
         }
         const screenTrack = screenStream.getVideoTracks()[0];
         pcsRef.current.forEach(pc => {
@@ -601,7 +638,6 @@ export default function App() {
             if (localStreamRef.current) localCenterRef.current.play().catch(() => {});
           }
           setIsScreenSharing(false);
-          // Fix 1: don't end stream
           notify("Screen sharing stopped. Stream continues.", "info");
           if (localStreamRef.current) {
             const camTrack = localStreamRef.current.getVideoTracks()[0];
@@ -611,7 +647,12 @@ export default function App() {
             });
           }
         };
-      } catch { notify("Screen share cancelled", "info"); }
+      } catch (err: unknown) {
+        const name = err instanceof Error ? err.name : "";
+        if (name === "NotAllowedError") notify("Screen sharing permission denied.", "error");
+        else if (name !== "AbortError") notify("Screen sharing not available on this device/browser.", "error");
+        else notify("Screen share cancelled.", "info");
+      }
     }
   }
 
@@ -753,23 +794,35 @@ export default function App() {
   // ─── SHARED MODALS ────────────────────────────────────────────────────────────
   const sharedModals = (
     <>
-      {showStreamStartModal && (
-        <ModalOverlay onClose={() => setShowStreamStartModal(false)}>
-          <ModalBox title="🔴 START STREAMING">
-            <p style={{ fontSize: 12, color: "#a0b0d0", marginBottom: 4 }}>What do you want to broadcast?</p>
-            <button onClick={() => startStreamWithOption("camera")} style={{ ...btnSt, display: "flex", alignItems: "center", gap: 10, justifyContent: "center", padding: "13px 20px" }}>
-              <span style={{ fontSize: 20 }}>📹</span> Camera Only
-            </button>
-            <button onClick={() => startStreamWithOption("screen")} style={{ ...btnSt, display: "flex", alignItems: "center", gap: 10, justifyContent: "center", padding: "13px 20px", background: "linear-gradient(135deg, #0099ff, #0066cc)" }}>
-              <span style={{ fontSize: 20 }}>🖥️</span> Screen Only
-            </button>
-            <button onClick={() => startStreamWithOption("both")} style={{ ...btnSt, display: "flex", alignItems: "center", gap: 10, justifyContent: "center", padding: "13px 20px", background: "linear-gradient(135deg, #00d4ff, #9900ff)" }}>
-              <span style={{ fontSize: 20 }}>📹🖥️</span> Camera + Screen
-            </button>
-            <button onClick={() => setShowStreamStartModal(false)} style={btn2St}>CANCEL</button>
-          </ModalBox>
-        </ModalOverlay>
-      )}
+      {showStreamStartModal && (() => {
+        const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+        const canScreen = !isIOS && !!navigator.mediaDevices?.getDisplayMedia;
+        return (
+          <ModalOverlay onClose={() => setShowStreamStartModal(false)}>
+            <ModalBox title="🔴 START STREAMING">
+              <p style={{ fontSize: 12, color: "#a0b0d0", marginBottom: 4 }}>What do you want to broadcast?</p>
+              <button onClick={() => startStreamWithOption("camera")} style={{ ...btnSt, display: "flex", alignItems: "center", gap: 10, justifyContent: "center", padding: "13px 20px" }}>
+                <span style={{ fontSize: 20 }}>📹</span> Camera Only
+              </button>
+              {canScreen ? (
+                <>
+                  <button onClick={() => startStreamWithOption("screen")} style={{ ...btnSt, display: "flex", alignItems: "center", gap: 10, justifyContent: "center", padding: "13px 20px", background: "linear-gradient(135deg, #0099ff, #0066cc)" }}>
+                    <span style={{ fontSize: 20 }}>🖥️</span> Screen Only
+                  </button>
+                  <button onClick={() => startStreamWithOption("both")} style={{ ...btnSt, display: "flex", alignItems: "center", gap: 10, justifyContent: "center", padding: "13px 20px", background: "linear-gradient(135deg, #00d4ff, #9900ff)" }}>
+                    <span style={{ fontSize: 20 }}>📹🖥️</span> Camera + Screen
+                  </button>
+                </>
+              ) : (
+                <p style={{ fontSize: 10, color: "#ffaa00", background: "rgba(255,170,0,0.08)", border: "1px solid #ffaa00", borderRadius: 8, padding: "8px 12px", margin: 0 }}>
+                  {isIOS ? "⚠️ Screen sharing is not supported on iOS Safari. Use Camera, or open in Chrome on Android." : "⚠️ Screen sharing not supported on this browser."}
+                </p>
+              )}
+              <button onClick={() => setShowStreamStartModal(false)} style={btn2St}>CANCEL</button>
+            </ModalBox>
+          </ModalOverlay>
+        );
+      })()}
 
       {showTeamModal && <ModalOverlay onClose={() => setShowTeamModal(false)}>
         <ModalBox title="👥 TEAM">
@@ -1300,12 +1353,12 @@ export default function App() {
         </div>
       </div>
 
-      {/* DRAGGABLE MINI WEBCAM */}
-      {isWebcamOn && (
-        <div ref={miniPlayerRef} style={{ ...miniStyle, width: 220, height: 170, background: "#0a0e27", border: "2px solid #00d4ff", borderRadius: 12, overflow: "hidden", boxShadow: "0 0 20px rgba(0,212,255,0.4)", userSelect: "none", zIndex: 900 }}>
+      {/* DRAGGABLE MINI WEBCAM — only visible when screen sharing is active */}
+      {isWebcamOn && isScreenSharing && (
+        <div ref={miniPlayerRef} style={{ ...miniStyle, width: 200, height: 155, background: "#0a0e27", border: "2px solid #00d4ff", borderRadius: 12, overflow: "hidden", boxShadow: "0 0 20px rgba(0,212,255,0.4)", userSelect: "none", zIndex: 900 }}>
           <div onPointerDown={onMiniPointerDown} onPointerMove={onMiniPointerMove} onPointerUp={onMiniPointerUp} style={{ background: "rgba(0,212,255,0.15)", padding: "4px 8px", borderBottom: "1px solid #00d4ff", display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 9, color: "#00d4ff", cursor: "grab" }}>
             <span>⠿ 📹 YOUR CAM</span>
-            {isScreenSharing && <span style={{ fontSize: 7, opacity: 0.6 }}>screen→center</span>}
+            <span style={{ fontSize: 7, opacity: 0.6 }}>drag to move</span>
           </div>
           <video ref={miniVideoRef} autoPlay muted playsInline style={{ width: "100%", height: "calc(100% - 26px)", objectFit: "cover", background: "#000", display: "block" }} />
         </div>
