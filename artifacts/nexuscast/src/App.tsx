@@ -253,6 +253,12 @@ export default function App() {
     socket.on("peer-stopped-stream", ({ peerId }: { peerId: string }) => {
       setMembers(p => p.map(m => m.peerId === peerId ? { ...m, isStreaming: false } : m));
       setJoinStreamPrompt(null);
+      // Fix 7: clear remote video immediately so no frozen frame
+      const vid = remoteVideoRefs.current.get(peerId);
+      if (vid) { vid.pause(); vid.srcObject = null; }
+      setRemoteStreams(p => p.filter(r => r.peerId !== peerId));
+      setFocusedStream(p => p?.peerId === peerId ? null : p);
+      notify("Streamer stopped sharing.", "info");
     });
 
     socket.on("join-stream-request", ({ from, userId: uid, avatar }: { from: string; userId: string; avatar: string }) => {
@@ -271,6 +277,12 @@ export default function App() {
     socket.on("stream-join-declined", () => {
       notify("Host declined your request", "error");
       setJoinStreamPrompt(null);
+    });
+
+    // Fix 5: host notified when a member joins their stream
+    socket.on("stream-member-joined", ({ userId: uid }: { userId: string }) => {
+      notify(`${uid} joined your stream! 🎉`, "success");
+      addMsg("⚡ SYSTEM", `${uid} has joined your stream`);
     });
 
     socket.on("you-were-kicked", ({ byUserId }: { byUserId: string }) => {
@@ -411,6 +423,9 @@ export default function App() {
   function removePeer(peerId: string) {
     const pc = pcsRef.current.get(peerId);
     if (pc) { pc.close(); pcsRef.current.delete(peerId); }
+    // Fix 1/7: clear video srcObject to prevent frozen/black frame ghost
+    const vid = remoteVideoRefs.current.get(peerId);
+    if (vid) { vid.pause(); vid.srcObject = null; }
     remoteVideoRefs.current.delete(peerId);
     setRemoteStreams(p => p.filter(r => r.peerId !== peerId));
     setMembers(p => p.filter(m => m.peerId !== peerId));
@@ -423,17 +438,23 @@ export default function App() {
     else setShowStreamStartModal(true);
   }
 
-  // Fix 4: End stream but STAY in room
+  // Fix 2/4/7: End stream but STAY in room — keep PCs alive, just stop tracks
   function endStreamOnly() {
+    // Stop all local media tracks
     localStreamRef.current?.getTracks().forEach(t => t.stop());
     localStreamRef.current = null;
     screenStreamRef.current?.getTracks().forEach(t => t.stop());
     screenStreamRef.current = null;
     if (miniVideoRef.current) miniVideoRef.current.srcObject = null;
     if (localCenterRef.current) localCenterRef.current.srcObject = null;
+    // Signal stop to server BEFORE touching PCs
     if (currentRoomRef.current) socketRef.current?.emit("stop-stream");
-    pcsRef.current.forEach(pc => pc.close()); pcsRef.current.clear();
-    setRemoteStreams([]); setFocusedStream(null);
+    // Remove all senders from PCs but keep connections alive (fixes auto-leaving & frozen frames)
+    pcsRef.current.forEach(pc => {
+      pc.getSenders().forEach(sender => {
+        try { pc.removeTrack(sender); } catch {}
+      });
+    });
     setIsStreaming(false); setIsWebcamOn(false); setIsScreenSharing(false); setIsMicOn(false);
     addMsg("⚡ SYSTEM", "Stream ended. You are still in the room.");
     notify("Stream ended. Still in room.", "info");
@@ -786,6 +807,9 @@ export default function App() {
     return [...(me ? [{ ...me, isRoomHost: iAmRoomHost }] : []), ...roomHost, ...favs, ...rest];
   }, [members, iAmRoomHost]);
 
+  // Fix 3/4/6: only the room host can start a stream; if already streaming always show END
+  const canStartStream = iAmRoomHost || isStreaming;
+  // If any other member is streaming, host should still see the button (to start their own or end theirs)
   const showLocalCenter = (isStreaming || isWebcamOn || isScreenSharing) && !focusedStream && remoteStreams.length === 0;
   const showRemoteCenter = !!focusedStream || remoteStreams.length > 0;
   const notifColor = (t: string) => t === "success" ? "#00ff44" : t === "error" ? "#ff4444" : t === "warning" ? "#ffaa00" : "#00d4ff";
@@ -986,9 +1010,12 @@ export default function App() {
 
         {/* STREAM CONTROLS */}
         <div style={{ background: "rgba(10,14,39,0.95)", borderBottom: "1px solid #004d7f", padding: "10px 12px", display: "flex", gap: 8, justifyContent: "center", flexShrink: 0, flexWrap: "wrap", alignItems: "center" }}>
-          <button onClick={handleStreamButtonClick} style={{ padding: "10px 18px", borderRadius: 10, border: `2px solid ${isStreaming ? "#ff4444" : "#00d4ff"}`, background: isStreaming ? "rgba(255,0,0,0.2)" : "rgba(0,212,255,0.15)", color: isStreaming ? "#ff6666" : "#00d4ff", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>
-            {isStreaming ? "⏹ END" : "▶ STREAM"}
-          </button>
+          {/* Fix 3: STREAM button only for host */}
+          {canStartStream && (
+            <button onClick={handleStreamButtonClick} style={{ padding: "10px 18px", borderRadius: 10, border: `2px solid ${isStreaming ? "#ff4444" : "#00d4ff"}`, background: isStreaming ? "rgba(255,0,0,0.2)" : "rgba(0,212,255,0.15)", color: isStreaming ? "#ff6666" : "#00d4ff", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>
+              {isStreaming ? "⏹ END" : "▶ STREAM"}
+            </button>
+          )}
           <button onClick={toggleWebcam} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isWebcamOn ? "#00d4ff" : "#334"}`, background: isWebcamOn ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isWebcamOn ? "#00d4ff" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>📹</button>
           <button onClick={toggleScreenShare} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isScreenSharing ? "#00d4ff" : "#334"}`, background: isScreenSharing ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isScreenSharing ? "#00d4ff" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>🖥️</button>
           {(isStreaming || joinedStreamHostId) && (
@@ -1099,9 +1126,12 @@ export default function App() {
                           {openMenuMember === member.peerId && (
                             <div style={{ position: "absolute", top: "100%", right: 0, background: "linear-gradient(135deg, #0d1435, #1a1f4f)", border: "1px solid #00d4ff", borderRadius: 10, overflow: "hidden", zIndex: 300, minWidth: 160, boxShadow: "0 8px 24px rgba(0,0,0,0.7)" }}>
                               <div onClick={() => toggleFav(member.peerId)} style={{ ...menuItemSt, fontSize: 13 }}>{member.isFav ? "💔 Unfavorite" : "❤️ Favorite"}</div>
-                              <div onClick={() => muteMember(member.peerId)} style={{ ...menuItemSt, fontSize: 13 }}>🔇 Mute (5s)</div>
-                              <div onClick={() => openChangeNameModal(member.peerId)} style={{ ...menuItemSt, fontSize: 13 }}>✏️ Change Name</div>
-                              <div onClick={() => kickMember(member.peerId)} style={{ ...menuItemSt, fontSize: 13, color: "#ff6666", borderBottom: "none" }}>🚫 Remove</div>
+                              {/* Fix 4: only host sees mute/kick/rename controls */}
+                              {iAmRoomHost && <>
+                                <div onClick={() => muteMember(member.peerId)} style={{ ...menuItemSt, fontSize: 13 }}>🔇 Mute (5s)</div>
+                                <div onClick={() => openChangeNameModal(member.peerId)} style={{ ...menuItemSt, fontSize: 13 }}>✏️ Change Name</div>
+                                <div onClick={() => kickMember(member.peerId)} style={{ ...menuItemSt, fontSize: 13, color: "#ff6666", borderBottom: "none" }}>🚫 Remove</div>
+                              </>}
                             </div>
                           )}
                         </div>
@@ -1128,7 +1158,6 @@ export default function App() {
         </div>
 
         {streamNotifBanner}
-        {incomingReqsUI}
         {sharedModals}
         {notificationsUI}
         {chatPopupsUI}
@@ -1163,7 +1192,8 @@ export default function App() {
           <div style={panelSt}>
             <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
               {[
-                { icon: isStreaming ? "⏹" : "▶", label: "STREAM", active: isStreaming, onClick: handleStreamButtonClick, color: isStreaming ? "#ff4444" : "#00d4ff" },
+                // Fix 3: STREAM button only visible to host (canStartStream)
+                ...(canStartStream ? [{ icon: isStreaming ? "⏹" : "▶", label: "STREAM", active: isStreaming, onClick: handleStreamButtonClick, color: isStreaming ? "#ff4444" : "#00d4ff" }] : []),
                 { icon: "📹", label: "CAMERA", active: isWebcamOn, onClick: toggleWebcam, color: "#00d4ff" },
                 { icon: "🖥️", label: "SCREEN", active: isScreenSharing, onClick: toggleScreenShare, color: "#00d4ff" },
                 { icon: "👥", label: "TEAM", active: false, onClick: () => setShowTeamModal(true), color: "#00d4ff" },
@@ -1338,9 +1368,12 @@ export default function App() {
                           {openMenuMember === member.peerId && (
                             <div style={{ position: "absolute", top: "100%", right: 0, background: "linear-gradient(135deg, #0d1435, #1a1f4f)", border: "1px solid #00d4ff", borderRadius: 10, overflow: "hidden", zIndex: 300, minWidth: 155, boxShadow: "0 8px 24px rgba(0,0,0,0.6)" }}>
                               <div onClick={() => toggleFav(member.peerId)} style={menuItemSt}>{member.isFav ? "💔 Unfavorite" : "❤️ Favorite"}</div>
-                              <div onClick={() => muteMember(member.peerId)} style={menuItemSt}>🔇 Mute (5s)</div>
-                              <div onClick={() => openChangeNameModal(member.peerId)} style={menuItemSt}>✏️ Change Name</div>
-                              <div onClick={() => kickMember(member.peerId)} style={{ ...menuItemSt, color: "#ff6666", borderBottom: "none" }}>🚫 Remove</div>
+                              {/* Fix 4: only host sees mute/kick/rename on desktop */}
+                              {iAmRoomHost && <>
+                                <div onClick={() => muteMember(member.peerId)} style={menuItemSt}>🔇 Mute (5s)</div>
+                                <div onClick={() => openChangeNameModal(member.peerId)} style={menuItemSt}>✏️ Change Name</div>
+                                <div onClick={() => kickMember(member.peerId)} style={{ ...menuItemSt, color: "#ff6666", borderBottom: "none" }}>🚫 Remove</div>
+                              </>}
                             </div>
                           )}
                         </div>
@@ -1365,7 +1398,6 @@ export default function App() {
       )}
 
       {streamNotifBanner}
-      {incomingReqsUI}
       {sharedModals}
       {notificationsUI}
       {chatPopupsUI}
