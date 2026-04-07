@@ -1,6 +1,6 @@
 kind = "web"
 previewPath = "/"
-title = "NEXUSCAST - Stream Dashboard"
+title = "NexusCast - Stream Dashboard"
 version = "1.0.0"
 id = "artifacts/nexuscast"
 router = "path"
@@ -12,7 +12,7 @@ version = "1.0.0"
 [[services]]
 name = "web"
 paths = [ "/" ]
-localPort = 5173
+localPort = 19783
 
 [services.development]
 run = "pnpm --filter @workspace/nexuscast run dev"
@@ -27,5 +27,5 @@ from = "/*"
 to = "/index.html"
 
 [services.env]
-PORT = "5173"
+PORT = "19783"
 BASE_PATH = "/"
