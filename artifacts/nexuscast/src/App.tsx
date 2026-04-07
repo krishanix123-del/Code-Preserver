@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { io, Socket } from "socket.io-client";
+import QRCode from "qrcode";
 
 const AVATARS = ["👤", "👨", "🧑", "👦", "👩", "👧", "👸", "🧔", "👱", "🦸", "🧙", "🤖"];
 const QUICK_MSGS = [
@@ -84,6 +85,7 @@ export default function App() {
   const [joinCodeInput, setJoinCodeInput] = useState("");
   const [newUserIdInput, setNewUserIdInput] = useState("");
   const [shareCode, setShareCode] = useState("");
+  const [shareQrDataUrl, setShareQrDataUrl] = useState("");
   const [openMenuMember, setOpenMenuMember] = useState<string | null>(null);
 
   // Fix 8: mobile detection
@@ -169,6 +171,18 @@ export default function App() {
   useEffect(() => { isScreenSharingRef.current = isScreenSharing; }, [isScreenSharing]);
   useEffect(() => { isWebcamOnRef.current = isWebcamOn; }, [isWebcamOn]);
 
+  // Generate QR code whenever shareCode changes
+  useEffect(() => {
+    if (shareCode) {
+      const url = `${window.location.origin}/?room=${shareCode}`;
+      QRCode.toDataURL(url, { width: 220, margin: 1, color: { dark: "#00d4ff", light: "#050915" } })
+        .then(dataUrl => setShareQrDataUrl(dataUrl))
+        .catch(() => {});
+    } else {
+      setShareQrDataUrl("");
+    }
+  }, [shareCode]);
+
   useEffect(() => {
     if (isStreaming) {
       streamTimerRef.current = setInterval(() => setStreamSec(s => s + 1), 1000);
@@ -216,6 +230,20 @@ export default function App() {
       if (currentRoomRef.current) {
         socket.emit("join-room", { roomCode: currentRoomRef.current, userId: userIdRef.current, avatar: userAvatarRef.current });
         if (isStreamingRef.current) socket.emit("start-stream");
+      } else {
+        // Auto-join from URL parameter (mobile app deep link / QR code scan)
+        try {
+          const params = new URLSearchParams(window.location.search);
+          const roomParam = params.get("room");
+          if (roomParam && roomParam.length >= 4) {
+            const code = roomParam.toUpperCase();
+            setCurrentRoom(code);
+            setMembers([{ peerId: "me", userId: userIdRef.current, avatar: userAvatarRef.current, isFav: false, isStreaming: false, isRoomHost: false }]);
+            socket.emit("join-room", { roomCode: code, userId: userIdRef.current, avatar: userAvatarRef.current });
+            addMsg("⚡ SYSTEM", `Auto-joined room: ${code}`);
+            notify(`Joined room ${code}`, "success");
+          }
+        } catch {}
       }
     });
 
@@ -460,10 +488,13 @@ export default function App() {
         applyVideoEncodingParams(pc);
       }
       if (pc.connectionState === "failed") {
-        // Attempt ICE restart before giving up
-        try { pc.restartIce(); } catch { removePeer(peerId); }
+        // Attempt ICE restart — do NOT remove peer from UI here.
+        // The server will emit "peer-left" when the peer truly disconnects.
+        try { pc.restartIce(); } catch {}
         setTimeout(() => {
-          if (pc.connectionState === "failed") removePeer(peerId);
+          if (pc.connectionState === "failed") {
+            try { pc.restartIce(); } catch {}
+          }
         }, 5000);
       }
     };
@@ -678,6 +709,12 @@ export default function App() {
         localCenterRef.current.srcObject = localStreamRef.current;
         if (localStreamRef.current) localCenterRef.current.play().catch(() => {});
       }
+      // Replace screen video track with camera track on all peer connections (prevents frozen frame)
+      const camTrack = localStreamRef.current?.getVideoTracks()[0] ?? null;
+      pcsRef.current.forEach(pc => {
+        const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
+        if (videoSender) videoSender.replaceTrack(camTrack).catch(() => {});
+      });
       setIsScreenSharing(false);
       notify("Screen share stopped. Stream continues.", "info");
     } else {
@@ -927,7 +964,17 @@ export default function App() {
       {showShareModal && <ModalOverlay onClose={() => setShowShareModal(false)}>
         <ModalBox title="✅ ROOM CREATED">
           <div style={{ fontSize: 34, margin: "10px 0", fontFamily: "monospace", color: "#00d4ff", letterSpacing: 6 }}>{shareCode}</div>
-          <p style={{ fontSize: 11, color: "#a0b0d0", margin: "0 0 12px" }}>Share this code — works across 4G ↔ WiFi</p>
+          <p style={{ fontSize: 11, color: "#a0b0d0", margin: "0 0 8px" }}>Share this code — works across 4G ↔ WiFi</p>
+          {shareQrDataUrl ? (
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6, marginBottom: 12 }}>
+              <img src={shareQrDataUrl} alt="Room QR Code" style={{ width: 140, height: 140, borderRadius: 10, border: "2px solid #00d4ff" }} />
+              <span style={{ fontSize: 9, color: "#a0b0d0" }}>📱 Scan with NexusCast mobile app</span>
+            </div>
+          ) : (
+            <div style={{ height: 140, display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 12 }}>
+              <span style={{ fontSize: 11, color: "#a0b0d0" }}>Generating QR code...</span>
+            </div>
+          )}
           <button onClick={() => { navigator.clipboard.writeText(shareCode); notify("Copied!", "success"); }} style={btnSt}>📋 COPY CODE</button>
           <button onClick={() => setShowShareModal(false)} style={btn2St}>START STREAMING</button>
         </ModalBox>
