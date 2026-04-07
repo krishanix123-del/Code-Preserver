@@ -27,8 +27,11 @@ export function attachSignaling(httpServer: HttpServer) {
   const io = new IOServer(httpServer, {
     cors: { origin: "*", methods: ["GET", "POST"] },
     path: "/api/socket.io",
-    pingTimeout: 120000,
-    pingInterval: 30000,
+    pingTimeout: 60000,
+    pingInterval: 20000,
+    upgradeTimeout: 30000,
+    transports: ["websocket", "polling"],
+    allowEIO3: true,
   });
 
   io.on("connection", (socket: Socket) => {

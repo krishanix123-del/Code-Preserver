@@ -15,11 +15,14 @@ const RTC_CONFIG: RTCConfiguration = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
+    { urls: "stun:stun2.l.google.com:19302" },
     { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
     { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
     { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
   ],
   iceCandidatePoolSize: 10,
+  bundlePolicy: "max-bundle",
+  rtcpMuxPolicy: "require",
 };
 
 interface ChatMessage { id: number; sender: string; text: string; }
@@ -226,11 +229,11 @@ export default function App() {
       setIAmRoomHost(iAmHost);
       peers.forEach(({ peerId, userId: uid, avatar, isStreaming: streaming, isRoomHost }) => {
         setMembers(p => p.find(m => m.peerId === peerId) ? p : [...p, { peerId, userId: uid, avatar, isFav: false, isStreaming: streaming, isRoomHost }]);
-        // Fix 2: only notification, no accept prompt for existing stream when joining
         if (streaming) {
-          notify(`${uid} is already streaming!`, "info");
-          addMsg("⚡ SYSTEM", `${uid} is currently streaming`);
-          setJoinStreamPrompt({ hostPeerId: peerId, hostUserId: uid });
+          notify(`${uid} is streaming — joining automatically...`, "info");
+          addMsg("⚡ SYSTEM", `${uid} is streaming — auto-joining`);
+          // Auto-join stream without requiring permission
+          connectToHost(peerId, socket);
         }
       });
     });
@@ -243,11 +246,12 @@ export default function App() {
     });
 
     socket.on("peer-started-stream", ({ peerId, userId: uid }: { peerId: string; userId: string }) => {
-      notify(`${uid} started streaming`, "info");
-      addMsg("⚡ SYSTEM", `${uid} started streaming`);
+      notify(`${uid} started streaming — auto-joining! 📺`, "success");
+      addMsg("⚡ SYSTEM", `${uid} started streaming — joining automatically`);
       setMembers(p => p.map(m => m.peerId === peerId ? { ...m, isStreaming: true } : m));
-      // Fix 2: notification banner only — no accept/decline buttons
-      setJoinStreamPrompt({ hostPeerId: peerId, hostUserId: uid });
+      setJoinedStreamHostId(peerId);
+      // Auto-join immediately — no permission required
+      connectToHost(peerId, socket);
     });
 
     socket.on("peer-stopped-stream", ({ peerId }: { peerId: string }) => {
@@ -365,12 +369,50 @@ export default function App() {
     };
   }, []);
 
+  function applyVideoEncodingParams(pc: RTCPeerConnection) {
+    pc.getSenders().forEach(async sender => {
+      if (sender.track?.kind === "video") {
+        try {
+          const params = sender.getParameters();
+          if (params.encodings && params.encodings.length > 0) {
+            params.encodings[0].maxBitrate = 2500000;
+            params.encodings[0].degradationPreference = "maintain-framerate";
+          } else if (params.encodings) {
+            params.encodings.push({ maxBitrate: 2500000, degradationPreference: "maintain-framerate" });
+          }
+          await sender.setParameters(params);
+        } catch {}
+      }
+    });
+  }
+
+  function attachStreamToVideo(peerId: string, stream: MediaStream) {
+    const vid = remoteVideoRefs.current.get(peerId);
+    if (!vid) return;
+    if (vid.srcObject !== stream) {
+      vid.srcObject = stream;
+    }
+    const tryPlay = (attempt = 0) => {
+      vid.play().catch(() => {
+        if (attempt < 5) setTimeout(() => tryPlay(attempt + 1), 500);
+      });
+    };
+    tryPlay();
+    // Retry if video stays black (no video data yet)
+    setTimeout(() => {
+      if (vid.videoWidth === 0 && vid.srcObject === stream) {
+        vid.srcObject = null;
+        vid.srcObject = stream;
+        vid.play().catch(() => {});
+      }
+    }, 2000);
+  }
+
   function getOrCreatePC(peerId: string, socket: Socket): RTCPeerConnection {
     if (pcsRef.current.has(peerId)) return pcsRef.current.get(peerId)!;
     const pc = new RTCPeerConnection(RTC_CONFIG);
     pcsRef.current.set(peerId, pc);
 
-    // Fix 10: Add all available tracks — camera audio+video AND screen video
     if (localStreamRef.current) {
       localStreamRef.current.getAudioTracks().forEach(t => pc.addTrack(t, localStreamRef.current!));
       if (!isScreenSharingRef.current) {
@@ -387,31 +429,56 @@ export default function App() {
     };
 
     pc.ontrack = e => {
-      if (e.streams && e.streams[0]) {
-        const stream = e.streams[0];
-        setRemoteStreams(p => {
-          const exists = p.find(r => r.peerId === peerId);
-          return exists ? p.map(r => r.peerId === peerId ? { peerId, stream } : r) : [...p, { peerId, stream }];
-        });
-        setFocusedStream(prev => prev?.peerId === peerId ? { peerId, stream } : prev ?? { peerId, stream });
-        const vid = remoteVideoRefs.current.get(peerId);
-        if (vid && vid.srcObject !== stream) { vid.srcObject = stream; vid.play().catch(() => {}); }
+      const stream = e.streams?.[0];
+      if (!stream) return;
+      setRemoteStreams(p => {
+        const exists = p.find(r => r.peerId === peerId);
+        return exists ? p.map(r => r.peerId === peerId ? { peerId, stream } : r) : [...p, { peerId, stream }];
+      });
+      setFocusedStream(prev => prev?.peerId === peerId ? { peerId, stream } : prev ?? { peerId, stream });
+      attachStreamToVideo(peerId, stream);
+      // Also listen for new tracks added later (e.g., screen share added mid-stream)
+      stream.onaddtrack = () => attachStreamToVideo(peerId, stream);
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      if (pc.iceConnectionState === "disconnected") {
+        // Give it 4s to recover, then restart ICE
+        setTimeout(() => {
+          if (pc.iceConnectionState === "disconnected" || pc.iceConnectionState === "failed") {
+            try { pc.restartIce(); } catch {}
+          }
+        }, 4000);
+      }
+      if (pc.iceConnectionState === "failed") {
+        try { pc.restartIce(); } catch {}
       }
     };
 
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === "failed") removePeer(peerId);
+      if (pc.connectionState === "connected") {
+        applyVideoEncodingParams(pc);
+      }
+      if (pc.connectionState === "failed") {
+        // Attempt ICE restart before giving up
+        try { pc.restartIce(); } catch { removePeer(peerId); }
+        setTimeout(() => {
+          if (pc.connectionState === "failed") removePeer(peerId);
+        }, 5000);
+      }
     };
     return pc;
   }
 
   async function connectToHost(hostPeerId: string, socket: Socket) {
+    // Don't create duplicate connections
+    if (pcsRef.current.has(hostPeerId)) return;
     let micStream: MediaStream | null = null;
     try { micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false }); } catch { }
     const pc = getOrCreatePC(hostPeerId, socket);
     if (micStream) {
       micStream.getAudioTracks().forEach(t => { t.enabled = false; pc.addTrack(t, micStream!); });
-      localStreamRef.current = micStream;
+      if (!localStreamRef.current) localStreamRef.current = micStream;
     }
     try {
       const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
@@ -505,10 +572,10 @@ export default function App() {
         if (!cameraStarted) return;
       } else {
         try {
-          // Use minimal constraints for best mobile compatibility
+          // Chrome Android supports getDisplayMedia — use adaptive constraints
           const isMob = /Android|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
           const screenConstraints: DisplayMediaStreamOptions = isMob
-            ? { video: true }
+            ? { video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } } }
             : { video: { frameRate: 30 }, audio: true };
           const screenStream = await navigator.mediaDevices.getDisplayMedia(screenConstraints);
           screenStreamRef.current = screenStream;
@@ -625,7 +692,7 @@ export default function App() {
       try {
         const isMob = /Android|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
         const screenConstraints: DisplayMediaStreamOptions = isMob
-          ? { video: true }
+          ? { video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } } }
           : { video: { frameRate: 30 }, audio: true };
         const screenStream = await navigator.mediaDevices.getDisplayMedia(screenConstraints);
         screenStreamRef.current = screenStream;
@@ -908,18 +975,17 @@ export default function App() {
     </>
   );
 
-  // ─── FIX 2: stream notification banner (shown on both desktop and mobile) ─────
+  // Stream notification banner — auto-join only, no manual Join button needed
   const streamNotifBanner = joinStreamPrompt && (
     <div style={{ position: "fixed", top: isMobile ? 60 : 70, left: isMobile ? 12 : "50%", right: isMobile ? 12 : "auto", transform: isMobile ? "none" : "translateX(-50%)", zIndex: 2500 }}>
       <div style={{ background: "linear-gradient(135deg, #0a0e27, #1a2558)", padding: "12px 18px", border: "2px solid #00d4ff", borderRadius: 12, display: "flex", alignItems: "center", gap: 12, boxShadow: "0 0 30px rgba(0,212,255,0.3)", maxWidth: 420 }}>
         <span style={{ fontSize: 22 }}>📡</span>
         <div style={{ flex: 1 }}>
-          <div style={{ color: "#00d4ff", fontSize: 12, fontWeight: 700 }}>Stream Alert</div>
+          <div style={{ color: "#00d4ff", fontSize: 12, fontWeight: 700 }}>📺 Stream Joined</div>
           <div style={{ color: "#e8f0ff", fontSize: 11, marginTop: 2 }}>
-            <strong>{joinStreamPrompt.hostUserId}</strong> has started streaming!
+            <strong>{joinStreamPrompt.hostUserId}</strong> started streaming — you are auto-connected!
           </div>
         </div>
-        <button onClick={requestJoinStream} style={{ padding: "7px 13px", background: "linear-gradient(135deg, #00d4ff, #0099ff)", color: "#0a0e27", border: "none", borderRadius: 7, cursor: "pointer", fontSize: 11, fontWeight: 700, flexShrink: 0 }}>📺 Join</button>
         <button onClick={() => setJoinStreamPrompt(null)} style={{ padding: "7px 10px", background: "rgba(255,0,0,0.1)", color: "#ff6666", border: "1px solid #ff4444", borderRadius: 7, cursor: "pointer", fontSize: 11, flexShrink: 0 }}>✖</button>
       </div>
     </div>
