@@ -138,7 +138,7 @@ export function attachSignaling(httpServer: HttpServer) {
     });
 
     socket.on("chat-message", ({ roomCode, userId, text }: { roomCode: string; userId: string; text: string }) => {
-      socket.to(roomCode).emit("chat-message", { from: socket.id, userId, text, timestamp: Date.now() });
+      io.to(roomCode).emit("chat-message", { from: socket.id, userId, text, timestamp: Date.now() });
     });
 
     socket.on("offer", ({ to, offer }: { to: string; offer: RTCSessionDescriptionInit }) => {

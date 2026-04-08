@@ -114,6 +114,7 @@ export default function App() {
   const chatEndRef = useRef<HTMLDivElement>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const screenStreamRef = useRef<MediaStream | null>(null);
+  const audioStreamRef = useRef<MediaStream | null>(null); // room mic (mesh audio)
   const miniVideoRef = useRef<HTMLVideoElement>(null);
   const localCenterRef = useRef<HTMLVideoElement>(null);
   const pcsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
@@ -274,9 +275,9 @@ export default function App() {
         if (streaming) {
           notify(`${uid} is streaming — joining automatically...`, "info");
           addMsg("⚡ SYSTEM", `${uid} is streaming — auto-joining`);
-          // Auto-join stream without requiring permission
-          connectToHost(peerId, socket);
         }
+        // New joiner initiates connections to ALL existing peers (audio mesh)
+        connectToPeer(peerId, socket);
       });
     });
 
@@ -284,6 +285,7 @@ export default function App() {
       notify(`${uid} joined the room`, "info");
       addMsg("⚡ SYSTEM", `${uid} joined`);
       setMembers(p => p.find(m => m.peerId === peerId) ? p : [...p, { peerId, userId: uid, avatar, isFav: false, isStreaming: false, isRoomHost }]);
+      // Don't initiate — the new peer sends offers to existing peers; just notify if we're streaming
       if (isStreamingRef.current) socket.emit("start-stream");
     });
 
@@ -292,8 +294,8 @@ export default function App() {
       addMsg("⚡ SYSTEM", `${uid} started streaming — joining automatically`);
       setMembers(p => p.map(m => m.peerId === peerId ? { ...m, isStreaming: true } : m));
       setJoinedStreamHostId(peerId);
-      // Auto-join immediately — no permission required
-      connectToHost(peerId, socket);
+      // If we have no PC with this peer yet (joined before stream started), connect now
+      if (!pcsRef.current.has(peerId)) connectToPeer(peerId, socket);
     });
 
     socket.on("peer-stopped-stream", ({ peerId }: { peerId: string }) => {
@@ -317,7 +319,7 @@ export default function App() {
       addMsg("⚡ SYSTEM", "You joined the stream!");
       setJoinedStreamHostId(hostPeerId);
       setJoinStreamPrompt(null);
-      connectToHost(hostPeerId, socket);
+      if (!pcsRef.current.has(hostPeerId)) connectToPeer(hostPeerId, socket);
     });
 
     socket.on("stream-join-declined", () => {
@@ -345,6 +347,7 @@ export default function App() {
       notify(`🔇 You were muted by ${byUserId} for ${durationMs / 1000} seconds`, "warning");
       setIsMuted(true); setIsMicOn(false);
       localStreamRef.current?.getAudioTracks().forEach(t => { t.enabled = false; });
+      audioStreamRef.current?.getAudioTracks().forEach(t => { t.enabled = false; });
       setTimeout(() => { setIsMuted(false); notify("You can now unmute yourself", "info"); }, durationMs);
     });
 
@@ -354,6 +357,7 @@ export default function App() {
     });
 
     socket.on("offer", async ({ from, offer }: { from: string; offer: RTCSessionDescriptionInit }) => {
+      await initRoomAudio(); // ensure we have mic track ready before building PC
       const pc = getOrCreatePC(from, socket);
       try {
         await pc.setRemoteDescription(new RTCSessionDescription(offer));
@@ -408,6 +412,8 @@ export default function App() {
     return () => {
       pcsRef.current.forEach(pc => pc.close());
       pcsRef.current.clear();
+      audioStreamRef.current?.getTracks().forEach(t => t.stop());
+      audioStreamRef.current = null;
       socket.disconnect();
     };
   }, []);
@@ -451,16 +457,30 @@ export default function App() {
     }, 2000);
   }
 
+  async function initRoomAudio() {
+    if (audioStreamRef.current) return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      stream.getAudioTracks().forEach(t => { t.enabled = false; }); // default muted until user enables
+      audioStreamRef.current = stream;
+    } catch { /* mic not available */ }
+  }
+
   function getOrCreatePC(peerId: string, socket: Socket): RTCPeerConnection {
     if (pcsRef.current.has(peerId)) return pcsRef.current.get(peerId)!;
     const pc = new RTCPeerConnection(RTC_CONFIG);
     pcsRef.current.set(peerId, pc);
 
+    // Add room audio track (mesh voice)
+    if (audioStreamRef.current) {
+      audioStreamRef.current.getAudioTracks().forEach(t => pc.addTrack(t, audioStreamRef.current!));
+    }
+    // Add local stream audio/video if streaming
     if (localStreamRef.current) {
-      localStreamRef.current.getAudioTracks().forEach(t => pc.addTrack(t, localStreamRef.current!));
       if (!isScreenSharingRef.current) {
         localStreamRef.current.getVideoTracks().forEach(t => pc.addTrack(t, localStreamRef.current!));
       }
+      // Don't add audio from localStream — audioStreamRef handles it
     }
     if (isScreenSharingRef.current && screenStreamRef.current) {
       screenStreamRef.current.getVideoTracks().forEach(t => pc.addTrack(t, screenStreamRef.current!));
@@ -516,21 +536,16 @@ export default function App() {
     return pc;
   }
 
-  async function connectToHost(hostPeerId: string, socket: Socket) {
-    // Don't create duplicate connections
-    if (pcsRef.current.has(hostPeerId)) return;
-    let micStream: MediaStream | null = null;
-    try { micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false }); } catch { }
-    const pc = getOrCreatePC(hostPeerId, socket);
-    if (micStream) {
-      micStream.getAudioTracks().forEach(t => { t.enabled = false; pc.addTrack(t, micStream!); });
-      if (!localStreamRef.current) localStreamRef.current = micStream;
-    }
+  // connectToPeer: initiator side — we create the offer (used for ALL peers, not just host)
+  async function connectToPeer(peerId: string, socket: Socket) {
+    if (pcsRef.current.has(peerId)) return;
+    await initRoomAudio(); // ensure we have mic access before creating PC
+    const pc = getOrCreatePC(peerId, socket);
     try {
       const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
       await pc.setLocalDescription(offer);
-      socket.emit("offer", { to: hostPeerId, offer });
-    } catch (err) { console.error("connectToHost:", err); }
+      socket.emit("offer", { to: peerId, offer });
+    } catch (err) { console.error("connectToPeer:", err); }
   }
 
   function removePeer(peerId: string) {
@@ -798,12 +813,15 @@ export default function App() {
 
   function toggleMic() {
     if (isMuted) { notify("You are muted by host. Please wait.", "warning"); return; }
-    const stream = localStreamRef.current;
+    // Use audioStreamRef (room audio mesh) — fallback to localStreamRef
+    const stream = audioStreamRef.current || localStreamRef.current;
     if (!stream) { notify("No microphone available", "error"); return; }
     const audioTrack = stream.getAudioTracks()[0];
     if (!audioTrack) { notify("No microphone found", "error"); return; }
     const next = !isMicOn;
     audioTrack.enabled = next;
+    // Also toggle localStream audio if available
+    localStreamRef.current?.getAudioTracks().forEach(t => { t.enabled = next; });
     setIsMicOn(next);
     notify(next ? "Mic ON 🎙️" : "Mic muted 🔇", "info");
   }
@@ -837,8 +855,12 @@ export default function App() {
   function deleteRoom() {
     socketRef.current?.emit("leave-room");
     pcsRef.current.forEach(pc => pc.close()); pcsRef.current.clear();
+    // Stop room audio stream so mic is released
+    audioStreamRef.current?.getTracks().forEach(t => t.stop());
+    audioStreamRef.current = null;
     setRemoteStreams([]); setFocusedStream(null); setMembers([]);
     setCurrentRoom(null); setJoinedStreamHostId(null); setIAmRoomHost(false);
+    setIsMicOn(false);
     addMsg("⚡ SYSTEM", "Left room.");
     notify("Left the room", "info");
     if (_isNativeApp) postToNative({ type: "leave_room" });
@@ -895,13 +917,13 @@ export default function App() {
   function sendMsg() {
     if (!chatInput.trim()) return;
     if (currentRoom && socketRef.current) socketRef.current.emit("chat-message", { roomCode: currentRoom, userId, text: chatInput.trim() });
-    addMsg(userId, chatInput.trim());
+    // Don't add locally — server now echoes back to sender via io.to(room)
     setChatInput("");
   }
 
   function quickMsg(text: string) {
     if (currentRoom && socketRef.current) socketRef.current.emit("chat-message", { roomCode: currentRoom, userId, text });
-    addMsg(userId, text);
+    // Don't add locally — server now echoes back to sender via io.to(room)
   }
 
   function saveUserId() {
@@ -921,11 +943,12 @@ export default function App() {
   }
 
   const sortedMembers = useMemo(() => {
+    // "me" always first, host always last, other members in between (favs first)
     const me = members.find(m => m.peerId === "me");
-    const roomHost = members.filter(m => m.peerId !== "me" && m.isRoomHost);
-    const favs = members.filter(m => m.peerId !== "me" && !m.isRoomHost && m.isFav);
-    const rest = members.filter(m => m.peerId !== "me" && !m.isRoomHost && !m.isFav);
-    return [...(me ? [{ ...me, isRoomHost: iAmRoomHost }] : []), ...roomHost, ...favs, ...rest];
+    const hostMembers = members.filter(m => m.peerId !== "me" && m.isRoomHost);
+    const favOthers = members.filter(m => m.peerId !== "me" && !m.isRoomHost && m.isFav);
+    const restOthers = members.filter(m => m.peerId !== "me" && !m.isRoomHost && !m.isFav);
+    return [...(me ? [{ ...me, isRoomHost: iAmRoomHost }] : []), ...favOthers, ...restOthers, ...hostMembers];
   }, [members, iAmRoomHost]);
 
   // Fix 3/4/6: only the room host can start a stream; if already streaming always show END
@@ -1188,15 +1211,7 @@ export default function App() {
                 <div>• Use Chat tab for messages</div>
                 <div>• Use Members tab to manage users</div>
               </div>
-              {remoteStreams.length > 1 && (
-                <div style={{ display: "flex", gap: 6, overflowX: "auto" }}>
-                  {remoteStreams.map(rs => (
-                    <div key={rs.peerId} onClick={() => setFocusedStream(rs)} style={{ width: 90, height: 68, border: `2px solid ${focusedStream?.peerId === rs.peerId ? "#00d4ff" : "#004d7f"}`, borderRadius: 8, overflow: "hidden", flexShrink: 0, cursor: "pointer" }}>
-                      <RemoteVideoEl stream={rs.stream} peerId={rs.peerId} videoRefs={remoteVideoRefs} small />
-                    </div>
-                  ))}
-                </div>
-              )}
+              {/* multi-stream thumbnail picker removed */}
             </div>
           )}
 
@@ -1410,15 +1425,7 @@ export default function App() {
               </div>
             )}
 
-            {remoteStreams.length > 1 && (
-              <div style={{ position: "absolute", bottom: 10, left: 10, display: "flex", gap: 6, zIndex: 20 }}>
-                {remoteStreams.map(rs => (
-                  <div key={rs.peerId} onClick={() => setFocusedStream(rs)} style={{ width: 76, height: 57, border: `2px solid ${focusedStream?.peerId === rs.peerId ? "#00d4ff" : "#004d7f"}`, borderRadius: 8, overflow: "hidden", cursor: "pointer", background: "#000" }}>
-                    <RemoteVideoEl stream={rs.stream} peerId={rs.peerId} videoRefs={remoteVideoRefs} small />
-                  </div>
-                ))}
-              </div>
-            )}
+            {/* thumbnail picker removed — single main view only */}
           </div>
         </div>
 

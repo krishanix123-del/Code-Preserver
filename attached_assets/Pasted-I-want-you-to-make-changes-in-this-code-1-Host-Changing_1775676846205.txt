@@ -1,0 +1,52 @@
+I want you to make changes in this code :
+
+1) Host Changing (If the host is streaming then make it at the top of the member and if some other members are joing in the room that is being shared by the host and for example the member joined the room it should hsow that particular member at the top and just below it show the host id by mentioning [host] beside it. In conclusion, in any device the host id will be just below the member names .
+Computer A                       Computer B
+USER_256 [Host]                 USer654 [Memember] 
+USer654 [Memember]              USER_256 [Host]
+Like this.This is very important do this properly and perfectly.
+
+2) In the chat if the host is sending message then its showing two times but the member is seeing only one time and same goes for the member 
+if any member is sending any message then its showing two times in the chat section but it's showing only one time to the host. Correct It.This is very important do this properly and perfectly.
+
+3)Automatic Leaving Of the members after some time . It should not happen the member can only leave when he/she is being removed by the host from the room or the member himself/herself leave the room. This is very important do this properly and perfectly.
+
+4)Live screen is not visible to the members its showing black screen . it should fix this Do like this that whenever the host is sharing the live screen of his/her window then in the member's screen show the host's live screen only . Just like in WhatsApp we use share you screen where one people can see another screen easily like that .This is very important do this properly and perfectly.
+
+5) Remove the views options even the eye emoji as well. This is very important do this properly and perfectly.
+
+6)If the host removed a particular member then a notification should be displayed in the member's screen that the host has removed you from the room. This is very important do this properly and perfectly.
+
+7) Most important voice hearing . Like we call anyone and we can hear other's voices same here you have to .Every member should be able to hear each and everyone and in the three dot options keep an extra ooption named mute which will help the host to mute any player anytime easily and the particular member gets muted easily and after 5 seconds the member can unmute by himself/herself. For the host in the three dot there should be Fav,Mute,Remove,Change name where all have done just add mute option. And for all the members in that room there should be getting only fav and Change name options. and if any member change any member's name then it should be notified to the host that this member has changed this member's name to this name. This is very important do this properly and perfectly.
+
+I want you to make changes in the code :
+1) If I am turning off the camera or screen sharing then the live streaming is getting end automatically don't do that . Live stream should be independent and the live stream will end whenever I will click on end stream then only otherwise it won't end fix this.This is very important do this properly and perfectly.
+
+
+2) Remove the accept button when the host is streaming and someone member is joining that accept option remove just keep the notify button that the host has started the stream as it was. This is very important do this properly and perfectly.
+
+
+3)And if any of the members of the room is sending any message then the message should be shown in the chat section and as well as in the main window for example the host has started the stream and all members has joined the stream and room and the host went for seeing video out of the nexuscast window then if any message is sent by any member then the member should show in the chat sections and a pop up message should appear like in WhatsApp if we are out of WhatsApp window a pop up comes that this person has sent this message same here and keep a text message for writing and sending message in the pop up section.This is very important do this properly and perfectly.
+
+
+4)Whenever the host is ending the stream the host is getting out of the room fix this.This is very important do this properly and perfectly.
+
+
+5) If the host leaves or delete the room then all the members will be leaving the room by giving a message to the members that the host has left or deleted the room.This is very important do this properly and perfectly.
+
+
+6) and whenever i am sharing my screen and i am clicking the stream start then my live screen is showing black instead of saying the live screen as it was showing before starting the stream fix this and same goes for webcamera its getting black whenever i am starting the stream. This is very important do this properly and perfectly.
+
+
+7) For mobile the live screen sharing is not working so fix that.This is very important do this properly and perfectly.
+
+
+8)Change the mobile interface like an app where all options and everything should be shown properly and arranged perfectly and clearly so that anyone if see then can be impressed but don't change anything of the interface of the computer.
+
+9) Whenever the host is starting the stream ask him/her that u need to turn on any one of the following : Camera or live screen or both (camera or live screen) if the host clicks on the camera then on the camera and if the host is clcicking on live screen then turn on the live screen sharing( the live screen should be as in the WhatsApp is there where we can see other people can see other live screen same here)This is very important do this properly and perfectly.
+
+10) If the host wants to keep both camera and live screen then it should or independently 
+
+**THE MOST IMPORTANT THING THAT DONT CHANGE ANY THING FROM THECODE AND KEEPING ALL THE FEATURES SAME AND SAME**
+
+ want you to fix this errors : 1) During streaming sometimes its getting black fix this. 2) Sometimes memebers are getting out of the room so fix this. 3) Too much lag in the camera and in live screen sharing when streaming is on fix that . 4) Proper working and smooth running of the app . 5) Live screen sharing should support in mobile i am using chrome browser the screen sharing should be working on any mobile just like we share our screen in whatsapp same here. 6) remove the permission of joining the stream whenever any memember is wanting to join the stream just notify then and whenever they join just get them in without permission . MOST IMPORTANT ALL EXISTING FEATURES SHOULD BE SAME NO CHANGE AT ALL
