@@ -1124,15 +1124,17 @@ export default function App() {
       <div style={{ display: "flex", flexDirection: "column", width: "100%", height: "100%", overflow: "hidden", background: "#050915" }}
         onClick={() => { if (openMenuMember) setOpenMenuMember(null); unlockAudio(); }}>
 
-        {/* MOBILE HEADER */}
-        <header style={{ background: "linear-gradient(90deg, #0a0e27, #1a2558, #0a0e27)", borderBottom: "2px solid #00d4ff", padding: "10px 16px", display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0, zIndex: 100 }}>
-          <div style={{ fontSize: 16, fontWeight: 900, letterSpacing: 3, color: "#00d4ff" }}>⚡ NEXUSCAST</div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <div style={{ width: 8, height: 8, borderRadius: "50%", background: isConnected ? (isStreaming ? "#ff0000" : "#00ff00") : "#ff8800", animation: isStreaming ? "statusBlink 1s infinite" : "none" }} />
-            <span style={{ fontSize: 10, color: "#00d4ff", fontWeight: 600 }}>{isConnected ? (isStreaming ? "🔴 LIVE" : currentRoom || "ONLINE") : "..."}</span>
-            <span style={{ fontSize: 10, color: "#a0b0d0" }}>👥{members.length}</span>
-          </div>
-        </header>
+        {/* MOBILE HEADER — hidden inside native app (native wrapper provides its own) */}
+        {!_isNativeApp && (
+          <header style={{ background: "linear-gradient(90deg, #0a0e27, #1a2558, #0a0e27)", borderBottom: "2px solid #00d4ff", padding: "10px 16px", display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0, zIndex: 100 }}>
+            <div style={{ fontSize: 16, fontWeight: 900, letterSpacing: 3, color: "#00d4ff" }}>⚡ NEXUSCAST</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div style={{ width: 8, height: 8, borderRadius: "50%", background: isConnected ? (isStreaming ? "#ff0000" : "#00ff00") : "#ff8800", animation: isStreaming ? "statusBlink 1s infinite" : "none" }} />
+              <span style={{ fontSize: 10, color: "#00d4ff", fontWeight: 600 }}>{isConnected ? (isStreaming ? "🔴 LIVE" : currentRoom || "ONLINE") : "..."}</span>
+              <span style={{ fontSize: 10, color: "#a0b0d0" }}>👥{members.length}</span>
+            </div>
+          </header>
+        )}
 
         {/* VIDEO AREA */}
         <div style={{ position: "relative", background: "#000", aspectRatio: "16/9", flexShrink: 0, overflow: "hidden" }}>
