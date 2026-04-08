@@ -3,6 +3,20 @@ import { io, Socket } from "socket.io-client";
 import QRCode from "qrcode";
 
 const AVATARS = ["👤", "👨", "🧑", "👦", "👩", "👧", "👸", "🧔", "👱", "🦸", "🧙", "🤖"];
+
+// Read URL params set by the native mobile shell before the component mounts
+const _initParams = new URLSearchParams(typeof window !== "undefined" ? window.location.search : "");
+const _nativeUid = _initParams.get("uid") ?? null;
+const _nativeAvatar = _initParams.get("avatar") ? decodeURIComponent(_initParams.get("avatar")!) : null;
+const _isNativeApp = _initParams.get("native") === "1";
+
+/** Post a message to the React Native WebView wrapper (no-op in browser) */
+function postToNative(data: Record<string, unknown>) {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (window as any).ReactNativeWebView?.postMessage(JSON.stringify(data));
+  } catch {}
+}
 const QUICK_MSGS = [
   { label: "🔴 Push!", text: "Push! 🔴" },
   { label: "👀 Watch!", text: "Watch! 👀" },
@@ -50,8 +64,8 @@ export default function App() {
   const [streamSec, setStreamSec] = useState(0);
   const [currentRoom, setCurrentRoom] = useState<string | null>(null);
   const [iAmRoomHost, setIAmRoomHost] = useState(false);
-  const [userId, setUserId] = useState("USER_" + Math.random().toString(36).substr(2, 4).toUpperCase());
-  const [userAvatar, setUserAvatar] = useState("👤");
+  const [userId, setUserId] = useState(_nativeUid || "USER_" + Math.random().toString(36).substr(2, 4).toUpperCase());
+  const [userAvatar, setUserAvatar] = useState(_nativeAvatar || "👤");
 
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
@@ -324,7 +338,7 @@ export default function App() {
       pcsRef.current.clear();
       setRemoteStreams([]); setFocusedStream(null); setMembers([]);
       setCurrentRoom(null); setJoinedStreamHostId(null); setIAmRoomHost(false);
-      // Fix 1: don't end stream on kick — only leave room
+      if (_isNativeApp) postToNative({ type: "leave_room" });
     });
 
     socket.on("you-are-muted", ({ byUserId, durationMs }: { byUserId: string; durationMs: number }) => {
@@ -388,6 +402,7 @@ export default function App() {
       setRemoteStreams([]); setFocusedStream(null); setMembers([]);
       setCurrentRoom(null); setJoinedStreamHostId(null);
       setJoinStreamPrompt(null); setIAmRoomHost(false);
+      if (_isNativeApp) postToNative({ type: "leave_room" });
     });
 
     return () => {
@@ -808,6 +823,7 @@ export default function App() {
     joinRoomOnServer(code);
     setShowShareModal(true);
     setShowTeamModal(false);
+    if (_isNativeApp) postToNative({ type: "room_created", code });
   }
 
   function joinTeamFromModal() {
@@ -825,6 +841,7 @@ export default function App() {
     setCurrentRoom(null); setJoinedStreamHostId(null); setIAmRoomHost(false);
     addMsg("⚡ SYSTEM", "Left room.");
     notify("Left the room", "info");
+    if (_isNativeApp) postToNative({ type: "leave_room" });
   }
 
   function acceptJoinRequest(req: IncomingJoinReq) {

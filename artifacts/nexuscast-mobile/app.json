@@ -37,7 +37,13 @@
       [
         "expo-camera",
         {
-          "cameraPermission": "Allow NexusCast to access your camera to scan QR codes and join rooms."
+          "cameraPermission": "Allow NexusCast to access your camera to scan QR codes and for webcam streaming."
+        }
+      ],
+      [
+        "expo-av",
+        {
+          "microphonePermission": "Allow NexusCast to access your microphone for live audio streaming."
         }
       ]
     ],
