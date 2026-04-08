@@ -272,12 +272,13 @@ export default function App() {
       setIAmRoomHost(iAmHost);
       peers.forEach(({ peerId, userId: uid, avatar, isStreaming: streaming, isRoomHost }) => {
         setMembers(p => p.find(m => m.peerId === peerId) ? p : [...p, { peerId, userId: uid, avatar, isFav: false, isStreaming: streaming, isRoomHost }]);
-        if (streaming) {
-          notify(`${uid} is streaming — joining automatically...`, "info");
-          addMsg("⚡ SYSTEM", `${uid} is streaming — auto-joining`);
-        }
-        // New joiner initiates connections to ALL existing peers (audio mesh)
+        // Always connect to every existing peer so the host can push video later via renegotiation
+        // (if they aren't streaming yet the onnegotiationneeded handler will push tracks when they start)
         connectToPeer(peerId, socket);
+        if (streaming) {
+          notify(`${uid} is streaming — auto-joining!`, "info");
+          addMsg("⚡ SYSTEM", `${uid} is streaming — joining automatically`);
+        }
       });
     });
 
@@ -357,7 +358,7 @@ export default function App() {
     });
 
     socket.on("offer", async ({ from, offer }: { from: string; offer: RTCSessionDescriptionInit }) => {
-      await initRoomAudio(); // ensure we have mic track ready before building PC
+      initRoomAudio().catch(() => {}); // start mic in background, don't block answer
       const pc = getOrCreatePC(from, socket);
       try {
         await pc.setRemoteDescription(new RTCSessionDescription(offer));
@@ -523,8 +524,6 @@ export default function App() {
         applyVideoEncodingParams(pc);
       }
       if (pc.connectionState === "failed") {
-        // Attempt ICE restart — do NOT remove peer from UI here.
-        // The server will emit "peer-left" when the peer truly disconnects.
         try { pc.restartIce(); } catch {}
         setTimeout(() => {
           if (pc.connectionState === "failed") {
@@ -533,13 +532,26 @@ export default function App() {
         }, 5000);
       }
     };
+
+    // CRITICAL: renegotiate when tracks are added/removed after connection
+    // (e.g. host starts streaming after member already joined)
+    pc.onnegotiationneeded = async () => {
+      if (!currentRoomRef.current) return;
+      try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        socket.emit("offer", { to: peerId, offer });
+      } catch {}
+    };
+
     return pc;
   }
 
-  // connectToPeer: initiator side — we create the offer (used for ALL peers, not just host)
+  // connectToPeer: initiator side — we create the offer (for all peers)
   async function connectToPeer(peerId: string, socket: Socket) {
     if (pcsRef.current.has(peerId)) return;
-    await initRoomAudio(); // ensure we have mic access before creating PC
+    // Fire mic init in background — don't block connection on permission prompt
+    initRoomAudio().catch(() => {});
     const pc = getOrCreatePC(peerId, socket);
     try {
       const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
@@ -625,10 +637,13 @@ export default function App() {
 
     if (option === "screen" || option === "both") {
       const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
-      if (!navigator.mediaDevices?.getDisplayMedia || isIOS) {
+      const isAndroidWebView = _isNativeApp || /wv/.test(navigator.userAgent) || (/Android/.test(navigator.userAgent) && /Version\/[\d.]+/.test(navigator.userAgent));
+      if (!navigator.mediaDevices?.getDisplayMedia || isIOS || isAndroidWebView) {
         const msg = isIOS
-          ? "iOS Safari doesn't support screen sharing. Use Camera instead, or try Chrome on Android."
-          : "Screen sharing is not supported on this browser. Try Chrome or Firefox on desktop/Android.";
+          ? "Screen sharing is not available on iOS. Use Camera instead."
+          : isAndroidWebView
+            ? "Screen sharing is not supported inside the mobile app. Use Camera instead."
+            : "Screen sharing is not supported on this browser. Try Chrome or Firefox on desktop.";
         notify(msg, "error");
         if (!cameraStarted) return;
       } else {
@@ -964,7 +979,8 @@ export default function App() {
     <>
       {showStreamStartModal && (() => {
         const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
-        const canScreen = !isIOS && !!navigator.mediaDevices?.getDisplayMedia;
+        const inWebView = _isNativeApp || /wv/.test(navigator.userAgent) || (/Android/.test(navigator.userAgent) && /Version\/[\d.]+/.test(navigator.userAgent));
+        const canScreen = !isIOS && !inWebView && !!navigator.mediaDevices?.getDisplayMedia;
         return (
           <ModalOverlay onClose={() => setShowStreamStartModal(false)}>
             <ModalBox title="🔴 START STREAMING">
@@ -983,7 +999,7 @@ export default function App() {
                 </>
               ) : (
                 <p style={{ fontSize: 10, color: "#ffaa00", background: "rgba(255,170,0,0.08)", border: "1px solid #ffaa00", borderRadius: 8, padding: "8px 12px", margin: 0 }}>
-                  {isIOS ? "⚠️ Screen sharing is not supported on iOS Safari. Use Camera, or open in Chrome on Android." : "⚠️ Screen sharing not supported on this browser."}
+                  {isIOS ? "⚠️ Screen sharing is not available on iOS. Use Camera instead." : inWebView ? "⚠️ Screen sharing is not available in the mobile app. Use Camera instead." : "⚠️ Screen sharing not supported on this browser."}
                 </p>
               )}
               <button onClick={() => setShowStreamStartModal(false)} style={btn2St}>CANCEL</button>
