@@ -419,17 +419,27 @@ export default function App() {
     };
   }, []);
 
-  function applyVideoEncodingParams(pc: RTCPeerConnection) {
+  // Adaptive encoding: lower bitrate on mobile, separate caps for camera vs screen share
+  function applyVideoEncodingParams(pc: RTCPeerConnection, isScreenShare = false) {
+    const isMob = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+    // Mobile: camera 600 Kbps / screen 900 Kbps | Desktop: camera 1200 Kbps / screen 2000 Kbps
+    const maxBitrate = isScreenShare
+      ? (isMob ? 900_000 : 2_000_000)
+      : (isMob ? 600_000 : 1_200_000);
+    const maxFramerate = isScreenShare
+      ? (isMob ? 15 : 24)
+      : (isMob ? 24 : 30);
+
     pc.getSenders().forEach(async sender => {
       if (sender.track?.kind === "video") {
         try {
           const params = sender.getParameters();
-          if (params.encodings && params.encodings.length > 0) {
-            params.encodings[0].maxBitrate = 2500000;
-            params.encodings[0].degradationPreference = "maintain-framerate";
-          } else if (params.encodings) {
-            params.encodings.push({ maxBitrate: 2500000, degradationPreference: "maintain-framerate" });
+          if (!params.encodings || params.encodings.length === 0) {
+            params.encodings = [{}];
           }
+          params.encodings[0].maxBitrate = maxBitrate;
+          params.encodings[0].maxFramerate = maxFramerate;
+          params.encodings[0].degradationPreference = "maintain-framerate";
           await sender.setParameters(params);
         } catch {}
       }
@@ -521,7 +531,8 @@ export default function App() {
 
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === "connected") {
-        applyVideoEncodingParams(pc);
+        // Detect whether this PC is carrying screen share or camera
+        applyVideoEncodingParams(pc, isScreenSharingRef.current);
       }
       if (pc.connectionState === "failed") {
         try { pc.restartIce(); } catch {}
@@ -533,15 +544,20 @@ export default function App() {
       }
     };
 
-    // CRITICAL: renegotiate when tracks are added/removed after connection
-    // (e.g. host starts streaming after member already joined)
-    pc.onnegotiationneeded = async () => {
+    // CRITICAL: renegotiate when tracks are added/removed after connection.
+    // Debounce 150ms to batch simultaneous addTrack calls (video+audio) into ONE offer.
+    let _negotiationTimer: ReturnType<typeof setTimeout> | null = null;
+    pc.onnegotiationneeded = () => {
       if (!currentRoomRef.current) return;
-      try {
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        socket.emit("offer", { to: peerId, offer });
-      } catch {}
+      if (_negotiationTimer) clearTimeout(_negotiationTimer);
+      _negotiationTimer = setTimeout(async () => {
+        if (pc.signalingState !== "stable") return; // avoid collisions
+        try {
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          socket.emit("offer", { to: peerId, offer });
+        } catch {}
+      }, 150);
     };
 
     return pc;
@@ -609,7 +625,14 @@ export default function App() {
 
     if (option === "camera" || option === "both") {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        const isMob = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+        // Cap resolution & fps upfront — prevents the browser encoding at 4K/60fps and causing lag
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: isMob
+            ? { width: { ideal: 640, max: 1280 }, height: { ideal: 480, max: 720 }, frameRate: { ideal: 24, max: 30 } }
+            : { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } },
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
         localStreamRef.current = stream;
         // Fix 6: attach FIRST, then update state
         if (miniVideoRef.current) { miniVideoRef.current.srcObject = stream; miniVideoRef.current.play().catch(() => {}); }
@@ -617,7 +640,7 @@ export default function App() {
           localCenterRef.current.srcObject = stream;
           localCenterRef.current.play().catch(() => {});
         }
-        // Send to existing peers
+        // Send to existing peers; apply encoding caps after a short delay (browser needs ICE first)
         pcsRef.current.forEach(pc => {
           const senders = pc.getSenders();
           stream.getTracks().forEach(track => {
@@ -625,6 +648,7 @@ export default function App() {
             if (existing) existing.replaceTrack(track).catch(() => {});
             else pc.addTrack(track, stream);
           });
+          setTimeout(() => applyVideoEncodingParams(pc, false), 1500);
         });
         cameraStarted = true;
         setIsWebcamOn(true);
@@ -648,11 +672,11 @@ export default function App() {
         if (!cameraStarted) return;
       } else {
         try {
-          // Chrome Android supports getDisplayMedia — use adaptive constraints
           const isMob = /Android|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+          // Screen share: 15fps on mobile (screen barely changes), 24fps on desktop to save bandwidth
           const screenConstraints: DisplayMediaStreamOptions = isMob
-            ? { video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } } }
-            : { video: { frameRate: 30 }, audio: true };
+            ? { video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 15, max: 15 } } }
+            : { video: { frameRate: { ideal: 24, max: 30 } }, audio: true };
           const screenStream = await navigator.mediaDevices.getDisplayMedia(screenConstraints);
           screenStreamRef.current = screenStream;
           // Fix 6: attach FIRST before state update
@@ -675,6 +699,8 @@ export default function App() {
               const audioSender = pc.getSenders().find(s => s.track?.kind === "audio");
               if (!audioSender) pc.addTrack(screenAudio, screenStream);
             }
+            // Apply screen share encoding caps (lower fps cap, higher bitrate than camera)
+            setTimeout(() => applyVideoEncodingParams(pc, true), 1500);
           });
           screenStarted = true;
           setIsScreenSharing(true);

@@ -14,13 +14,28 @@
       "backgroundColor": "#050915"
     },
     "ios": {
-      "supportsTablet": false
+      "supportsTablet": false,
+      "bundleIdentifier": "com.nexuscast.mobile",
+      "infoPlist": {
+        "NSCameraUsageDescription": "NexusCast uses the camera for video streaming.",
+        "NSMicrophoneUsageDescription": "NexusCast uses the microphone for audio streaming."
+      }
     },
     "android": {
+      "package": "com.nexuscast.mobile",
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/icon.png",
         "backgroundColor": "#050915"
-      }
+      },
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION",
+        "android.permission.INTERNET",
+        "android.permission.ACCESS_NETWORK_STATE"
+      ]
     },
     "web": {
       "favicon": "./assets/images/icon.png"
@@ -37,7 +52,7 @@
       [
         "expo-camera",
         {
-          "cameraPermission": "Allow NexusCast to access your camera to scan QR codes and for webcam streaming."
+          "cameraPermission": "Allow NexusCast to access your camera for streaming."
         }
       ],
       [
