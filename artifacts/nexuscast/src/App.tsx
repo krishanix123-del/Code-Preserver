@@ -739,21 +739,30 @@ export default function App() {
     notify("You are now LIVE! 🔴", "success");
   }
 
-  // Fix 1: Camera toggle — independent of stream
+  // Camera toggle — independent of stream, with adaptive constraints to prevent lag
   async function toggleWebcam() {
     if (isWebcamOn) {
       localStreamRef.current?.getTracks().forEach(t => t.stop());
       localStreamRef.current = null;
       if (miniVideoRef.current) miniVideoRef.current.srcObject = null;
       if (!isScreenSharingRef.current && localCenterRef.current) localCenterRef.current.srcObject = null;
+      // Replace video sender with null track so remote side doesn't freeze
+      pcsRef.current.forEach(pc => {
+        const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
+        if (videoSender) videoSender.replaceTrack(null).catch(() => {});
+      });
       setIsWebcamOn(false);
-      // Fix 1: do NOT end stream
       notify("Camera off. Stream continues.", "info");
     } else {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        const isMob = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: isMob
+            ? { width: { ideal: 640, max: 1280 }, height: { ideal: 480, max: 720 }, frameRate: { ideal: 24, max: 30 } }
+            : { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } },
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
         localStreamRef.current = stream;
-        // Fix 6: attach before state update
         if (miniVideoRef.current) { miniVideoRef.current.srcObject = stream; miniVideoRef.current.play().catch(() => {}); }
         if (!isScreenSharingRef.current && localCenterRef.current) {
           localCenterRef.current.srcObject = stream;
@@ -766,6 +775,7 @@ export default function App() {
             if (existing) existing.replaceTrack(track).catch(() => {});
             else pc.addTrack(track, stream);
           });
+          setTimeout(() => applyVideoEncodingParams(pc, false), 1500);
         });
         setIsWebcamOn(true);
         notify("Camera is on 📹", "success");
@@ -773,17 +783,15 @@ export default function App() {
     }
   }
 
-  // Fix 1+7: Screen share toggle — does NOT end stream
+  // Screen share toggle — does NOT end stream; handles all environments correctly
   async function toggleScreenShare() {
     if (isScreenSharing) {
       screenStreamRef.current?.getTracks().forEach(t => t.stop());
       screenStreamRef.current = null;
-      // Fix 6: attach back to camera immediately
       if (localCenterRef.current) {
         localCenterRef.current.srcObject = localStreamRef.current;
         if (localStreamRef.current) localCenterRef.current.play().catch(() => {});
       }
-      // Replace screen video track with camera track on all peer connections (prevents frozen frame)
       const camTrack = localStreamRef.current?.getVideoTracks()[0] ?? null;
       pcsRef.current.forEach(pc => {
         const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
@@ -793,26 +801,27 @@ export default function App() {
       notify("Screen share stopped. Stream continues.", "info");
     } else {
       const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+      const isAndroidWebView = _isNativeApp || /wv/.test(navigator.userAgent) || (/Android/.test(navigator.userAgent) && /Version\/[\d.]+/.test(navigator.userAgent));
+      // In native WebView: open Chrome instead of showing an error
+      if (isAndroidWebView && !isIOS) {
+        postToNative({ type: "open_in_browser_for_screen_share", url: window.location.href });
+        return;
+      }
       if (!navigator.mediaDevices?.getDisplayMedia || isIOS) {
-        const msg = isIOS
-          ? "iOS Safari doesn't support screen sharing. Use Camera instead, or try Chrome on Android."
-          : "Screen sharing is not supported on this browser. Try Chrome or Firefox on desktop/Android.";
-        notify(msg, "error");
+        notify(isIOS ? "Screen sharing is not available on iOS. Use Camera instead." : "Screen sharing is not supported on this browser. Try Chrome or Firefox on desktop.", "error");
         return;
       }
       try {
         const isMob = /Android|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
         const screenConstraints: DisplayMediaStreamOptions = isMob
-          ? { video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } } }
-          : { video: { frameRate: 30 }, audio: true };
+          ? { video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 15, max: 15 } } }
+          : { video: { frameRate: { ideal: 24, max: 30 } }, audio: true };
         const screenStream = await navigator.mediaDevices.getDisplayMedia(screenConstraints);
         screenStreamRef.current = screenStream;
-        // Fix 6: attach BEFORE state update — screen goes to center
         if (localCenterRef.current) {
           localCenterRef.current.srcObject = screenStream;
           localCenterRef.current.play().catch(() => {});
         }
-        // Attach camera to mini player if camera is on
         if (localStreamRef.current && miniVideoRef.current) {
           miniVideoRef.current.srcObject = localStreamRef.current;
           miniVideoRef.current.play().catch(() => {});
@@ -827,6 +836,7 @@ export default function App() {
             const audioSender = pc.getSenders().find(s => s.track?.kind === "audio");
             if (!audioSender) pc.addTrack(screenAudio, screenStream);
           }
+          setTimeout(() => applyVideoEncodingParams(pc, true), 1500);
         });
         setIsScreenSharing(true);
         notify("Screen sharing active 🖥️", "success");
@@ -838,13 +848,11 @@ export default function App() {
           }
           setIsScreenSharing(false);
           notify("Screen sharing stopped. Stream continues.", "info");
-          if (localStreamRef.current) {
-            const camTrack = localStreamRef.current.getVideoTracks()[0];
-            if (camTrack) pcsRef.current.forEach(pc => {
-              const sender = pc.getSenders().find(s => s.track?.kind === "video");
-              if (sender) sender.replaceTrack(camTrack).catch(() => {});
-            });
-          }
+          const camTrack = localStreamRef.current?.getVideoTracks()[0];
+          if (camTrack) pcsRef.current.forEach(pc => {
+            const sender = pc.getSenders().find(s => s.track?.kind === "video");
+            if (sender) sender.replaceTrack(camTrack).catch(() => {});
+          });
         };
       } catch (err: unknown) {
         const name = err instanceof Error ? err.name : "";
