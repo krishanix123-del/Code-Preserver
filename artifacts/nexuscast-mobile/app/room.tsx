@@ -6,6 +6,8 @@ import { router, useLocalSearchParams } from "expo-router";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  Alert,
+  Linking,
   Platform,
   StatusBar,
   StyleSheet,
@@ -95,6 +97,35 @@ export default function RoomScreen() {
     router.back();
   }
 
+  // Opens the current room in Chrome where getDisplayMedia (screen share) is fully supported
+  function openInBrowserForScreenShare(_url?: string) {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    Alert.alert(
+      "🖥️ Screen Share via Browser",
+      "Android's Chrome browser supports full screen sharing. The room will open in your browser — join with the same room code and tap Screen Share there.\n\nRoom: " + code,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Open in Browser",
+          onPress: async () => {
+            try {
+              // Try to open in Chrome specifically first, fall back to default browser
+              const chromeIntent = `intent://${WEB_DOMAIN}/?room=${code}&uid=${encodedUser}&avatar=${encodedAvatar}#Intent;scheme=https;package=com.android.chrome;end;`;
+              const canOpenChrome = await Linking.canOpenURL(chromeIntent).catch(() => false);
+              if (canOpenChrome) {
+                await Linking.openURL(chromeIntent);
+              } else {
+                await Linking.openURL(`https://${WEB_DOMAIN}/?room=${code}&uid=${encodedUser}&avatar=${encodedAvatar}`);
+              }
+            } catch {
+              await Linking.openURL(`https://${WEB_DOMAIN}/?room=${code}&uid=${encodedUser}&avatar=${encodedAvatar}`).catch(() => {});
+            }
+          },
+        },
+      ]
+    );
+  }
+
   // Handle messages posted from the web app (window.ReactNativeWebView.postMessage)
   const handleMessage = useCallback((event: WebViewMessageEvent) => {
     try {
@@ -103,6 +134,8 @@ export default function RoomScreen() {
         handleBack();
       } else if (data.type === "room_created" && data.code) {
         addRecentRoom(String(data.code));
+      } else if (data.type === "open_in_browser_for_screen_share") {
+        openInBrowserForScreenShare(data.url);
       }
     } catch {}
   }, []);
@@ -172,6 +205,15 @@ export default function RoomScreen() {
             <Text style={[styles.hostTag, { color: colors.hostBadge }]}>HOST</Text>
           )}
         </View>
+
+        <TouchableOpacity
+          style={styles.screenShareBtn}
+          onPress={() => openInBrowserForScreenShare()}
+          activeOpacity={0.7}
+        >
+          <Feather name="monitor" size={15} color="#00d4ff" />
+          <Text style={styles.screenShareBtnText}>Screen</Text>
+        </TouchableOpacity>
 
         <TouchableOpacity
           style={[styles.leaveBtn, { borderColor: "#ff4444" }]}
@@ -309,6 +351,24 @@ const styles = StyleSheet.create({
     paddingHorizontal: 5,
     paddingVertical: 2,
     borderRadius: 4,
+  },
+  screenShareBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 5,
+    height: 36,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    backgroundColor: "rgba(0,212,255,0.08)",
+    borderWidth: 1,
+    borderColor: "#00d4ff44",
+  },
+  screenShareBtnText: {
+    fontSize: 11,
+    fontWeight: "700" as const,
+    color: "#00d4ff",
+    fontFamily: "Inter_700Bold",
   },
   leaveBtn: {
     width: 36,

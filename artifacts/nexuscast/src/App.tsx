@@ -663,12 +663,15 @@ export default function App() {
       const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
       const isAndroidWebView = _isNativeApp || /wv/.test(navigator.userAgent) || (/Android/.test(navigator.userAgent) && /Version\/[\d.]+/.test(navigator.userAgent));
       if (!navigator.mediaDevices?.getDisplayMedia || isIOS || isAndroidWebView) {
-        const msg = isIOS
-          ? "Screen sharing is not available on iOS. Use Camera instead."
-          : isAndroidWebView
-            ? "Screen sharing is not supported inside the mobile app. Use Camera instead."
+        if (isAndroidWebView && !isIOS) {
+          // Tell the native app to open this room in Chrome where getDisplayMedia works
+          postToNative({ type: "open_in_browser_for_screen_share", url: window.location.href });
+        } else {
+          const msg = isIOS
+            ? "Screen sharing is not available on iOS. Use Camera instead."
             : "Screen sharing is not supported on this browser. Try Chrome or Firefox on desktop.";
-        notify(msg, "error");
+          notify(msg, "error");
+        }
         if (!cameraStarted) return;
       } else {
         try {
@@ -1023,9 +1026,16 @@ export default function App() {
                     <span style={{ fontSize: 20 }}>📹🖥️</span> Camera + Screen
                   </button>
                 </>
+              ) : inWebView && !isIOS ? (
+                <button
+                  onClick={() => { setShowStreamStartModal(false); postToNative({ type: "open_in_browser_for_screen_share", url: window.location.href }); }}
+                  style={{ ...btnSt, display: "flex", alignItems: "center", gap: 10, justifyContent: "center", padding: "13px 20px", background: "linear-gradient(135deg, #1a7f3f, #115c2d)" }}
+                >
+                  <span style={{ fontSize: 20 }}>🌐</span> Screen Share via Browser
+                </button>
               ) : (
                 <p style={{ fontSize: 10, color: "#ffaa00", background: "rgba(255,170,0,0.08)", border: "1px solid #ffaa00", borderRadius: 8, padding: "8px 12px", margin: 0 }}>
-                  {isIOS ? "⚠️ Screen sharing is not available on iOS. Use Camera instead." : inWebView ? "⚠️ Screen sharing is not available in the mobile app. Use Camera instead." : "⚠️ Screen sharing not supported on this browser."}
+                  {isIOS ? "⚠️ Screen sharing is not available on iOS." : "⚠️ Screen sharing not supported on this browser."}
                 </p>
               )}
               <button onClick={() => setShowStreamStartModal(false)} style={btn2St}>CANCEL</button>
