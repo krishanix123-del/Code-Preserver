@@ -77,8 +77,8 @@ export default function App() {
   const [audioUnlocked, setAudioUnlocked] = useState(false);
 
   const [localNicknames, setLocalNicknames] = useState<Record<string, string>>({});
-  // Fix 2: joinStreamPrompt shows notification banner only (no accept/decline)
-  const [joinStreamPrompt, setJoinStreamPrompt] = useState<{ hostPeerId: string; hostUserId: string } | null>(null);
+  // Stream start notification: show banner with Watch Now / Dismiss (no host permission needed)
+  const [joinStreamPrompt, setJoinStreamPrompt] = useState<{ hostPeerId: string; hostUserId: string; hostAvatar: string } | null>(null);
   const [incomingJoinReqs, setIncomingJoinReqs] = useState<IncomingJoinReq[]>([]);
   const [joinedStreamHostId, setJoinedStreamHostId] = useState<string | null>(null);
 
@@ -290,12 +290,12 @@ export default function App() {
       if (isStreamingRef.current) socket.emit("start-stream");
     });
 
-    socket.on("peer-started-stream", ({ peerId, userId: uid }: { peerId: string; userId: string }) => {
-      notify(`${uid} started streaming — auto-joining! 📺`, "success");
-      addMsg("⚡ SYSTEM", `${uid} started streaming — joining automatically`);
+    socket.on("peer-started-stream", ({ peerId, userId: uid, avatar }: { peerId: string; userId: string; avatar: string }) => {
+      addMsg("⚡ SYSTEM", `${uid} started streaming`);
       setMembers(p => p.map(m => m.peerId === peerId ? { ...m, isStreaming: true } : m));
-      setJoinedStreamHostId(peerId);
-      // If we have no PC with this peer yet (joined before stream started), connect now
+      // Show notification banner — member can choose to watch or dismiss (no host permission needed)
+      setJoinStreamPrompt({ hostPeerId: peerId, hostUserId: uid, hostAvatar: avatar });
+      // Ensure PC exists so tracks can flow when user clicks "Watch Now"
       if (!pcsRef.current.has(peerId)) connectToPeer(peerId, socket);
     });
 
@@ -739,18 +739,24 @@ export default function App() {
     notify("You are now LIVE! 🔴", "success");
   }
 
-  // Camera toggle — independent of stream, with adaptive constraints to prevent lag
+  // Camera toggle — only host can use; only sends to peers when streaming is active
   async function toggleWebcam() {
+    if (!iAmRoomHostRef.current && !isStreamingRef.current) {
+      notify("Only the host can use the camera", "warning"); return;
+    }
     if (isWebcamOn) {
       localStreamRef.current?.getTracks().forEach(t => t.stop());
       localStreamRef.current = null;
       if (miniVideoRef.current) miniVideoRef.current.srcObject = null;
       if (!isScreenSharingRef.current && localCenterRef.current) localCenterRef.current.srcObject = null;
-      // Replace video sender with null track so remote side doesn't freeze
-      pcsRef.current.forEach(pc => {
-        const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
-        if (videoSender) videoSender.replaceTrack(null).catch(() => {});
-      });
+      // Fix 3: If screen sharing is active, screen track is already the video sender — don't replace with null (avoids freeze)
+      // Only replace with null when NOT screen sharing
+      if (!isScreenSharingRef.current && isStreamingRef.current) {
+        pcsRef.current.forEach(pc => {
+          const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
+          if (videoSender) videoSender.replaceTrack(null).catch(() => {});
+        });
+      }
       setIsWebcamOn(false);
       notify("Camera off. Stream continues.", "info");
     } else {
@@ -768,23 +774,29 @@ export default function App() {
           localCenterRef.current.srcObject = stream;
           localCenterRef.current.play().catch(() => {});
         }
-        pcsRef.current.forEach(pc => {
-          const senders = pc.getSenders();
-          stream.getTracks().forEach(track => {
-            const existing = senders.find(s => s.track?.kind === track.kind);
-            if (existing) existing.replaceTrack(track).catch(() => {});
-            else pc.addTrack(track, stream);
+        // Only send to peers if stream is already active (Feature 2)
+        if (isStreamingRef.current) {
+          pcsRef.current.forEach(pc => {
+            const senders = pc.getSenders();
+            stream.getTracks().forEach(track => {
+              const existing = senders.find(s => s.track?.kind === track.kind);
+              if (existing) existing.replaceTrack(track).catch(() => {});
+              else pc.addTrack(track, stream);
+            });
+            setTimeout(() => applyVideoEncodingParams(pc, false), 1500);
           });
-          setTimeout(() => applyVideoEncodingParams(pc, false), 1500);
-        });
+        }
         setIsWebcamOn(true);
         notify("Camera is on 📹", "success");
       } catch { notify("Camera/microphone permission required", "error"); }
     }
   }
 
-  // Screen share toggle — does NOT end stream; handles all environments correctly
+  // Screen share toggle — only host can use; only sends to peers when streaming is active
   async function toggleScreenShare() {
+    if (!iAmRoomHostRef.current && !isStreamingRef.current) {
+      notify("Only the host can use screen share", "warning"); return;
+    }
     if (isScreenSharing) {
       screenStreamRef.current?.getTracks().forEach(t => t.stop());
       screenStreamRef.current = null;
@@ -792,17 +804,19 @@ export default function App() {
         localCenterRef.current.srcObject = localStreamRef.current;
         if (localStreamRef.current) localCenterRef.current.play().catch(() => {});
       }
-      const camTrack = localStreamRef.current?.getVideoTracks()[0] ?? null;
-      pcsRef.current.forEach(pc => {
-        const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
-        if (videoSender) videoSender.replaceTrack(camTrack).catch(() => {});
-      });
+      // Fix 3: switch back to camera track if available, otherwise null — prevents freeze
+      if (isStreamingRef.current) {
+        const camTrack = localStreamRef.current?.getVideoTracks()[0] ?? null;
+        pcsRef.current.forEach(pc => {
+          const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
+          if (videoSender) videoSender.replaceTrack(camTrack).catch(() => {});
+        });
+      }
       setIsScreenSharing(false);
       notify("Screen share stopped. Stream continues.", "info");
     } else {
       const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
       const isAndroidWebView = _isNativeApp || /wv/.test(navigator.userAgent) || (/Android/.test(navigator.userAgent) && /Version\/[\d.]+/.test(navigator.userAgent));
-      // In native WebView: open Chrome instead of showing an error
       if (isAndroidWebView && !isIOS) {
         postToNative({ type: "open_in_browser_for_screen_share", url: window.location.href });
         return;
@@ -818,6 +832,7 @@ export default function App() {
           : { video: { frameRate: { ideal: 24, max: 30 } }, audio: true };
         const screenStream = await navigator.mediaDevices.getDisplayMedia(screenConstraints);
         screenStreamRef.current = screenStream;
+        // Fix 3: attach screen BEFORE stopping camera so there's no blank frame gap
         if (localCenterRef.current) {
           localCenterRef.current.srcObject = screenStream;
           localCenterRef.current.play().catch(() => {});
@@ -827,19 +842,24 @@ export default function App() {
           miniVideoRef.current.play().catch(() => {});
         }
         const screenTrack = screenStream.getVideoTracks()[0];
-        pcsRef.current.forEach(pc => {
-          const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
-          if (videoSender) videoSender.replaceTrack(screenTrack).catch(() => {});
-          else pc.addTrack(screenTrack, screenStream);
-          const screenAudio = screenStream.getAudioTracks()[0];
-          if (screenAudio) {
-            const audioSender = pc.getSenders().find(s => s.track?.kind === "audio");
-            if (!audioSender) pc.addTrack(screenAudio, screenStream);
-          }
-          setTimeout(() => applyVideoEncodingParams(pc, true), 1500);
-        });
+        // Only send to peers if streaming is active (Feature 2)
+        if (isStreamingRef.current) {
+          pcsRef.current.forEach(pc => {
+            const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
+            // Fix 3: replaceTrack smoothly (no null gap) — replaces camera track with screen track
+            if (videoSender) videoSender.replaceTrack(screenTrack).catch(() => {});
+            else pc.addTrack(screenTrack, screenStream);
+            const screenAudio = screenStream.getAudioTracks()[0];
+            if (screenAudio) {
+              const audioSender = pc.getSenders().find(s => s.track?.kind === "audio");
+              if (!audioSender) pc.addTrack(screenAudio, screenStream);
+            }
+            setTimeout(() => applyVideoEncodingParams(pc, true), 1500);
+          });
+        }
         setIsScreenSharing(true);
         notify("Screen sharing active 🖥️", "success");
+        // When browser/OS stops screen share (e.g. user clicks "Stop sharing")
         screenTrack.onended = () => {
           screenStreamRef.current = null;
           if (localCenterRef.current) {
@@ -848,11 +868,14 @@ export default function App() {
           }
           setIsScreenSharing(false);
           notify("Screen sharing stopped. Stream continues.", "info");
-          const camTrack = localStreamRef.current?.getVideoTracks()[0];
-          if (camTrack) pcsRef.current.forEach(pc => {
-            const sender = pc.getSenders().find(s => s.track?.kind === "video");
-            if (sender) sender.replaceTrack(camTrack).catch(() => {});
-          });
+          // Fix 3: switch back to camera track without null gap
+          if (isStreamingRef.current) {
+            const camTrack = localStreamRef.current?.getVideoTracks()[0];
+            if (camTrack) pcsRef.current.forEach(pc => {
+              const sender = pc.getSenders().find(s => s.track?.kind === "video");
+              if (sender) sender.replaceTrack(camTrack).catch(() => {});
+            });
+          }
         };
       } catch (err: unknown) {
         const name = err instanceof Error ? err.name : "";
@@ -1122,18 +1145,35 @@ export default function App() {
     </>
   );
 
-  // Stream notification banner — auto-join only, no manual Join button needed
-  const streamNotifBanner = joinStreamPrompt && (
+  // Stream start notification banner: shown to all members when host starts stream
+  function handleJoinStream() {
+    if (!joinStreamPrompt) return;
+    setJoinedStreamHostId(joinStreamPrompt.hostPeerId);
+    setJoinStreamPrompt(null);
+    notify("You are now watching the stream! 📺", "success");
+    addMsg("⚡ SYSTEM", "You joined the stream.");
+  }
+
+  const streamNotifBanner = joinStreamPrompt && !iAmRoomHost && (
     <div style={{ position: "fixed", top: isMobile ? 60 : 70, left: isMobile ? 12 : "50%", right: isMobile ? 12 : "auto", transform: isMobile ? "none" : "translateX(-50%)", zIndex: 2500 }}>
-      <div style={{ background: "linear-gradient(135deg, #0a0e27, #1a2558)", padding: "12px 18px", border: "2px solid #00d4ff", borderRadius: 12, display: "flex", alignItems: "center", gap: 12, boxShadow: "0 0 30px rgba(0,212,255,0.3)", maxWidth: 420 }}>
-        <span style={{ fontSize: 22 }}>📡</span>
+      <div style={{
+        background: "linear-gradient(135deg, #0a0e27, #1a2558)",
+        padding: "14px 18px", border: "2px solid #00d4ff", borderRadius: 14,
+        display: "flex", alignItems: "center", gap: 12,
+        boxShadow: "0 0 40px rgba(0,212,255,0.4)", maxWidth: 440,
+        animation: "slideIn 0.35s ease"
+      }}>
+        <span style={{ fontSize: 28, flexShrink: 0 }}>{joinStreamPrompt.hostAvatar || "📡"}</span>
         <div style={{ flex: 1 }}>
-          <div style={{ color: "#00d4ff", fontSize: 12, fontWeight: 700 }}>📺 Stream Joined</div>
-          <div style={{ color: "#e8f0ff", fontSize: 11, marginTop: 2 }}>
-            <strong>{joinStreamPrompt.hostUserId}</strong> started streaming — you are auto-connected!
+          <div style={{ color: "#ff4444", fontSize: 12, fontWeight: 800, letterSpacing: 1 }}>🔴 LIVE STREAM STARTED</div>
+          <div style={{ color: "#e8f0ff", fontSize: 12, marginTop: 3 }}>
+            <strong style={{ color: "#00d4ff" }}>{joinStreamPrompt.hostUserId}</strong> has started streaming. Do you want to watch?
           </div>
         </div>
-        <button onClick={() => setJoinStreamPrompt(null)} style={{ padding: "7px 10px", background: "rgba(255,0,0,0.1)", color: "#ff6666", border: "1px solid #ff4444", borderRadius: 7, cursor: "pointer", fontSize: 11, flexShrink: 0 }}>✖</button>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, flexShrink: 0 }}>
+          <button onClick={handleJoinStream} style={{ padding: "7px 14px", background: "linear-gradient(135deg, #00d4ff, #0099ff)", color: "#0a0e27", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 11, fontWeight: 800 }}>▶ WATCH NOW</button>
+          <button onClick={() => setJoinStreamPrompt(null)} style={{ padding: "5px 14px", background: "rgba(255,255,255,0.05)", color: "#a0b0d0", border: "1px solid #334", borderRadius: 8, cursor: "pointer", fontSize: 10 }}>Later</button>
+        </div>
       </div>
     </div>
   );
@@ -1231,8 +1271,13 @@ export default function App() {
               {isStreaming ? "⏹ END" : "▶ STREAM"}
             </button>
           )}
-          <button onClick={toggleWebcam} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isWebcamOn ? "#00d4ff" : "#334"}`, background: isWebcamOn ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isWebcamOn ? "#00d4ff" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>📹</button>
-          <button onClick={toggleScreenShare} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isScreenSharing ? "#00d4ff" : "#334"}`, background: isScreenSharing ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isScreenSharing ? "#00d4ff" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>🖥️</button>
+          {/* Camera and screen share buttons only visible to host (Feature 2) */}
+          {iAmRoomHost && (
+            <button onClick={toggleWebcam} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isWebcamOn ? "#00d4ff" : "#334"}`, background: isWebcamOn ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isWebcamOn ? "#00d4ff" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>📹</button>
+          )}
+          {iAmRoomHost && (
+            <button onClick={toggleScreenShare} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isScreenSharing ? "#00d4ff" : "#334"}`, background: isScreenSharing ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isScreenSharing ? "#00d4ff" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>🖥️</button>
+          )}
           {(isStreaming || joinedStreamHostId) && (
             <button onClick={toggleMic} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#334"}`, background: isMuted ? "rgba(255,170,0,0.15)" : isMicOn ? "rgba(0,255,0,0.15)" : "rgba(0,0,0,0.3)", color: isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>{isMuted ? "🔇" : isMicOn ? "🎙️" : "🔇"}</button>
           )}
@@ -1399,10 +1444,13 @@ export default function App() {
           <div style={panelSt}>
             <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
               {[
-                // Fix 3: STREAM button only visible to host (canStartStream)
+                // STREAM button only visible to host
                 ...(canStartStream ? [{ icon: isStreaming ? "⏹" : "▶", label: "STREAM", active: isStreaming, onClick: handleStreamButtonClick, color: isStreaming ? "#ff4444" : "#00d4ff" }] : []),
-                { icon: "📹", label: "CAMERA", active: isWebcamOn, onClick: toggleWebcam, color: "#00d4ff" },
-                { icon: "🖥️", label: "SCREEN", active: isScreenSharing, onClick: toggleScreenShare, color: "#00d4ff" },
+                // Camera and screen buttons only visible to host (Feature 2)
+                ...(iAmRoomHost ? [
+                  { icon: "📹", label: "CAMERA", active: isWebcamOn, onClick: toggleWebcam, color: "#00d4ff" },
+                  { icon: "🖥️", label: "SCREEN", active: isScreenSharing, onClick: toggleScreenShare, color: "#00d4ff" },
+                ] : []),
                 { icon: "👥", label: "TEAM", active: false, onClick: () => setShowTeamModal(true), color: "#00d4ff" },
               ].map(btn => (
                 <div key={btn.label} onClick={btn.onClick} title={btn.label} style={{ width: 56, height: 56, borderRadius: "50%", cursor: "pointer", userSelect: "none", background: btn.active ? `linear-gradient(135deg, ${btn.color}, ${btn.color}aa)` : "rgba(0,212,255,0.1)", border: `2px solid ${btn.color}`, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", boxShadow: btn.active ? `0 0 28px ${btn.color}88` : `0 0 6px ${btn.color}22`, transition: "all .3s" }}>
