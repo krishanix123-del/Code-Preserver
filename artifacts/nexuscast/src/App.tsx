@@ -85,6 +85,11 @@ export default function App() {
   // Fix 9: stream start option modal
   const [showStreamStartModal, setShowStreamStartModal] = useState(false);
 
+  // AnyScreen mobile screen share code sharing
+  const [showAnyScreenModal, setShowAnyScreenModal] = useState(false);
+  const [anyScreenInput, setAnyScreenInput] = useState("");
+  const [anyScreenCode, setAnyScreenCode] = useState<{ code: string; hostUserId: string; hostAvatar: string } | null>(null);
+
   // Fix 3: WhatsApp-style chat popups
   const [chatPopups, setChatPopups] = useState<ChatPopup[]>([]);
   const windowFocusedRef = useRef(true);
@@ -396,6 +401,19 @@ export default function App() {
 
     socket.on("chat-message", ({ userId: sender, text }: { userId: string; text: string }) => {
       addMsg(sender, text);
+    });
+
+    // AnyScreen: host shares a mobile screen code — shown as pinned banner + chat message
+    socket.on("anyscreen-code", ({ code, hostUserId: hostUid, hostAvatar: hostAv }: { code: string; hostUserId: string; hostAvatar: string }) => {
+      setAnyScreenCode({ code, hostUserId: hostUid, hostAvatar: hostAv });
+      // Option C: auto-broadcast as highlighted chat message
+      addMsg("📱 ANYSCREEN", `Code: ${code} — Open AnyScreen app and enter this code to see the host's phone screen.`);
+      notify(`📱 AnyScreen code received: ${code}`, "info");
+    });
+
+    socket.on("anyscreen-clear", () => {
+      setAnyScreenCode(null);
+      addMsg("📱 ANYSCREEN", "AnyScreen screen sharing ended.");
     });
 
     // Fix 5: host left — all members get notified and room cleared
@@ -989,6 +1007,22 @@ export default function App() {
     setOpenMenuMember(null);
   }
 
+  function shareAnyScreenCode() {
+    const code = anyScreenInput.trim().toUpperCase();
+    if (!code) { notify("Enter the AnyScreen code first", "error"); return; }
+    if (!currentRoom || !socketRef.current) { notify("Join a room first", "error"); return; }
+    socketRef.current.emit("anyscreen-code", { code });
+    setAnyScreenInput("");
+    setShowAnyScreenModal(false);
+    notify("AnyScreen code shared with all members! 📱", "success");
+  }
+
+  function clearAnyScreenCode() {
+    if (!currentRoom || !socketRef.current) return;
+    socketRef.current.emit("anyscreen-clear");
+    setAnyScreenCode(null);
+  }
+
   function sendMsg() {
     if (!chatInput.trim()) return;
     if (currentRoom && socketRef.current) socketRef.current.emit("chat-message", { roomCode: currentRoom, userId, text: chatInput.trim() });
@@ -1142,6 +1176,32 @@ export default function App() {
           <button onClick={() => setShowChangeNameModal(null)} style={btn2St}>CANCEL</button>
         </ModalBox>
       </ModalOverlay>}
+
+      {showAnyScreenModal && <ModalOverlay onClose={() => setShowAnyScreenModal(false)}>
+        <ModalBox title="📱 SHARE ANYSCREEN CODE">
+          <div style={{ background: "rgba(0,212,255,0.06)", border: "1px solid #004d7f", borderRadius: 10, padding: "10px 14px", marginBottom: 10, fontSize: 11, color: "#a0b0d0", lineHeight: 1.7 }}>
+            <div style={{ color: "#00d4ff", fontWeight: 700, marginBottom: 4 }}>How to get your AnyScreen code:</div>
+            <div>1. Open the <strong style={{ color: "#00d4ff" }}>AnyScreen</strong> app on your phone</div>
+            <div>2. Start a session — you'll see a short code</div>
+            <div>3. Enter that code below and tap <strong style={{ color: "#00d4ff" }}>SHARE</strong></div>
+            <div style={{ marginTop: 6, color: "#ffaa00" }}>Members will get the code via a pinned banner + chat message so they can join your screen.</div>
+          </div>
+          <input
+            value={anyScreenInput}
+            onChange={e => setAnyScreenInput(e.target.value.toUpperCase())}
+            placeholder="e.g. ABC123"
+            style={{ ...inpSt, letterSpacing: 6, fontSize: 22, textAlign: "center", fontFamily: "monospace" }}
+            maxLength={12}
+            autoFocus
+            onKeyDown={e => e.key === "Enter" && shareAnyScreenCode()}
+          />
+          <button onClick={shareAnyScreenCode} style={{ ...btnSt, background: "linear-gradient(135deg, #00bb77, #007744)" }}>📤 SHARE CODE WITH ROOM</button>
+          {anyScreenCode && (
+            <button onClick={() => { clearAnyScreenCode(); setShowAnyScreenModal(false); }} style={{ ...btn2St, color: "#ff6666", borderColor: "#ff4444" }}>🗑️ REMOVE CURRENT CODE</button>
+          )}
+          <button onClick={() => setShowAnyScreenModal(false)} style={btn2St}>CANCEL</button>
+        </ModalBox>
+      </ModalOverlay>}
     </>
   );
 
@@ -1173,6 +1233,46 @@ export default function App() {
         <div style={{ display: "flex", flexDirection: "column", gap: 6, flexShrink: 0 }}>
           <button onClick={handleJoinStream} style={{ padding: "7px 14px", background: "linear-gradient(135deg, #00d4ff, #0099ff)", color: "#0a0e27", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 11, fontWeight: 800 }}>▶ WATCH NOW</button>
           <button onClick={() => setJoinStreamPrompt(null)} style={{ padding: "5px 14px", background: "rgba(255,255,255,0.05)", color: "#a0b0d0", border: "1px solid #334", borderRadius: 8, cursor: "pointer", fontSize: 10 }}>Later</button>
+        </div>
+      </div>
+    </div>
+  );
+
+  // AnyScreen pinned banner — Option A: persistent until host clears it
+  const anyScreenBanner = anyScreenCode && (
+    <div style={{
+      position: "fixed", top: isMobile ? (joinStreamPrompt ? 150 : 60) : (joinStreamPrompt ? 160 : 70),
+      left: isMobile ? 12 : "50%", right: isMobile ? 12 : "auto",
+      transform: isMobile ? "none" : "translateX(-50%)", zIndex: 2400,
+    }}>
+      <div style={{
+        background: "linear-gradient(135deg, #0a1f0e, #0d2e14)",
+        padding: "12px 16px", border: "2px solid #00cc66", borderRadius: 14,
+        display: "flex", alignItems: "center", gap: 12,
+        boxShadow: "0 0 30px rgba(0,204,102,0.35)", maxWidth: 460,
+        animation: "slideIn 0.35s ease",
+      }}>
+        <span style={{ fontSize: 26, flexShrink: 0 }}>📱</span>
+        <div style={{ flex: 1 }}>
+          <div style={{ color: "#00cc66", fontSize: 11, fontWeight: 800, letterSpacing: 1 }}>📲 ANYSCREEN MOBILE SHARE</div>
+          <div style={{ color: "#e8f0ff", fontSize: 11, marginTop: 2 }}>
+            Open <strong style={{ color: "#00cc66" }}>AnyScreen</strong> and enter this code:
+          </div>
+          <div style={{ fontFamily: "monospace", fontSize: 22, fontWeight: 900, color: "#00ff88", letterSpacing: 6, marginTop: 4 }}>
+            {anyScreenCode.code}
+          </div>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 5, flexShrink: 0 }}>
+          <button
+            onClick={() => { navigator.clipboard.writeText(anyScreenCode.code); notify("AnyScreen code copied!", "success"); }}
+            style={{ padding: "6px 12px", background: "linear-gradient(135deg, #00cc66, #009944)", color: "#050915", border: "none", borderRadius: 7, cursor: "pointer", fontSize: 11, fontWeight: 800 }}
+          >📋 COPY</button>
+          {iAmRoomHost && (
+            <button onClick={clearAnyScreenCode} style={{ padding: "4px 12px", background: "rgba(255,0,0,0.1)", color: "#ff6666", border: "1px solid #ff4444", borderRadius: 7, cursor: "pointer", fontSize: 9 }}>✖ END</button>
+          )}
+          {!iAmRoomHost && (
+            <button onClick={() => setAnyScreenCode(null)} style={{ padding: "4px 12px", background: "rgba(255,255,255,0.05)", color: "#a0b0d0", border: "1px solid #334", borderRadius: 7, cursor: "pointer", fontSize: 9 }}>✖ Hide</button>
+          )}
         </div>
       </div>
     </div>
@@ -1278,6 +1378,10 @@ export default function App() {
           {iAmRoomHost && (
             <button onClick={toggleScreenShare} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isScreenSharing ? "#00d4ff" : "#334"}`, background: isScreenSharing ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isScreenSharing ? "#00d4ff" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>🖥️</button>
           )}
+          {/* AnyScreen button — host only, mobile screen share via code */}
+          {iAmRoomHost && currentRoom && (
+            <button onClick={() => setShowAnyScreenModal(true)} title="Share AnyScreen mobile code" style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${anyScreenCode ? "#00cc66" : "#334"}`, background: anyScreenCode ? "rgba(0,204,102,0.2)" : "rgba(0,0,0,0.3)", color: anyScreenCode ? "#00cc66" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>📱</button>
+          )}
           {(isStreaming || joinedStreamHostId) && (
             <button onClick={toggleMic} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#334"}`, background: isMuted ? "rgba(255,170,0,0.15)" : isMicOn ? "rgba(0,255,0,0.15)" : "rgba(0,0,0,0.3)", color: isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>{isMuted ? "🔇" : isMicOn ? "🎙️" : "🔇"}</button>
           )}
@@ -1327,12 +1431,15 @@ export default function App() {
               <div className="chat-messages-scroll" style={{ flex: 1, overflowY: "auto", padding: 10, display: "flex", flexDirection: "column", gap: 6 }}>
                 {chatMessages.length === 0
                   ? <div style={{ color: "#a0b0d0", fontSize: 11, textAlign: "center", marginTop: 20, opacity: 0.6 }}>Chat is empty. Say something!</div>
-                  : chatMessages.map(msg => (
-                    <div key={msg.id} style={{ padding: "8px 12px", background: "rgba(0,99,255,0.1)", borderLeft: "3px solid #00d4ff", borderRadius: 8 }}>
-                      <div style={{ color: "#0099ff", fontWeight: 700, fontSize: 10 }}>{msg.sender}:</div>
-                      <div style={{ color: "#e8f0ff", marginTop: 2, wordBreak: "break-word", fontSize: 13 }}>{msg.text}</div>
-                    </div>
-                  ))}
+                  : chatMessages.map(msg => {
+                    const isAnyScreen = msg.sender === "📱 ANYSCREEN";
+                    return (
+                      <div key={msg.id} style={{ padding: "8px 12px", background: isAnyScreen ? "rgba(0,204,102,0.12)" : "rgba(0,99,255,0.1)", borderLeft: `3px solid ${isAnyScreen ? "#00cc66" : "#00d4ff"}`, borderRadius: 8 }}>
+                        <div style={{ color: isAnyScreen ? "#00cc66" : "#0099ff", fontWeight: 700, fontSize: 10 }}>{msg.sender}:</div>
+                        <div style={{ color: "#e8f0ff", marginTop: 2, wordBreak: "break-word", fontSize: 13 }}>{msg.text}</div>
+                      </div>
+                    );
+                  })}
                 <div ref={chatEndRef} />
               </div>
               <div style={{ display: "flex", overflowX: "auto", gap: 6, padding: "8px 10px", borderTop: "1px solid #004d7f", background: "rgba(0,0,0,0.3)", flexShrink: 0 }}>
@@ -1410,6 +1517,7 @@ export default function App() {
         </div>
 
         {streamNotifBanner}
+        {anyScreenBanner}
         {sharedModals}
         {notificationsUI}
         {chatPopupsUI}
@@ -1450,6 +1558,7 @@ export default function App() {
                 ...(iAmRoomHost ? [
                   { icon: "📹", label: "CAMERA", active: isWebcamOn, onClick: toggleWebcam, color: "#00d4ff" },
                   { icon: "🖥️", label: "SCREEN", active: isScreenSharing, onClick: toggleScreenShare, color: "#00d4ff" },
+                  { icon: "📱", label: "MOBILE", active: !!anyScreenCode, onClick: () => setShowAnyScreenModal(true), color: "#00cc66" },
                 ] : []),
                 { icon: "👥", label: "TEAM", active: false, onClick: () => setShowTeamModal(true), color: "#00d4ff" },
               ].map(btn => (
@@ -1562,12 +1671,15 @@ export default function App() {
             <div className="chat-messages-scroll" style={{ flex: 1, overflowY: "auto", padding: 8, display: "flex", flexDirection: "column", gap: 5, minHeight: 0 }}>
               {chatMessages.length === 0
                 ? <div style={{ color: "#a0b0d0", fontSize: 10, textAlign: "center", marginTop: 16, opacity: .5 }}>Chat is empty. Say something!</div>
-                : chatMessages.map(msg => (
-                  <div key={msg.id} style={{ padding: "5px 8px", background: "rgba(0,99,255,0.1)", borderLeft: "3px solid #00d4ff", borderRadius: 6 }}>
-                    <div style={{ color: "#0099ff", fontWeight: 700, fontSize: 9 }}>{msg.sender}:</div>
-                    <div style={{ color: "#e8f0ff", marginTop: 2, wordBreak: "break-word", fontSize: 11 }}>{msg.text}</div>
-                  </div>
-                ))}
+                : chatMessages.map(msg => {
+                  const isAnyScreen = msg.sender === "📱 ANYSCREEN";
+                  return (
+                    <div key={msg.id} style={{ padding: "5px 8px", background: isAnyScreen ? "rgba(0,204,102,0.12)" : "rgba(0,99,255,0.1)", borderLeft: `3px solid ${isAnyScreen ? "#00cc66" : "#00d4ff"}`, borderRadius: 6 }}>
+                      <div style={{ color: isAnyScreen ? "#00cc66" : "#0099ff", fontWeight: 700, fontSize: 9 }}>{msg.sender}:</div>
+                      <div style={{ color: "#e8f0ff", marginTop: 2, wordBreak: "break-word", fontSize: 11 }}>{msg.text}</div>
+                    </div>
+                  );
+                })}
               <div ref={chatEndRef} />
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 4, padding: "6px 8px", borderTop: "1px solid #004d7f", background: "rgba(0,0,0,0.2)", flexShrink: 0 }}>
@@ -1645,6 +1757,8 @@ export default function App() {
       )}
 
       {streamNotifBanner}
+      {anyScreenBanner}
+      {incomingReqsUI}
       {sharedModals}
       {notificationsUI}
       {chatPopupsUI}
