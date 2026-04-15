@@ -90,6 +90,10 @@ export default function App() {
   const [anyScreenInput, setAnyScreenInput] = useState("");
   const [anyScreenCode, setAnyScreenCode] = useState<{ code: string; hostUserId: string; hostAvatar: string } | null>(null);
 
+  // Member camera: members (non-hosts) can turn on their camera visible to the host
+  const [memberCamStreams, setMemberCamStreams] = useState<{ peerId: string; stream: MediaStream; userId: string; avatar: string }[]>([]);
+  const memberCamPeersRef = useRef<Set<string>>(new Set());
+
   // Fix 3: WhatsApp-style chat popups
   const [chatPopups, setChatPopups] = useState<ChatPopup[]>([]);
   const windowFocusedRef = useRef(true);
@@ -416,6 +420,22 @@ export default function App() {
       addMsg("📱 ANYSCREEN", "AnyScreen screen sharing ended.");
     });
 
+    // Member camera events: non-host members turning camera on/off
+    socket.on("member-cam-on", ({ peerId, userId: uid, avatar }: { peerId: string; userId: string; avatar: string }) => {
+      memberCamPeersRef.current.add(peerId);
+      // Host initiates P2P to receive the member's camera stream
+      if (iAmRoomHostRef.current) {
+        connectToPeer(peerId, socket);
+        notify(`${uid} turned on their camera 📹`, "info");
+      }
+      setMemberCamStreams(p => p.find(r => r.peerId === peerId) ? p : [...p, { peerId, stream: null as unknown as MediaStream, userId: uid, avatar }]);
+    });
+
+    socket.on("member-cam-off", ({ peerId }: { peerId: string }) => {
+      memberCamPeersRef.current.delete(peerId);
+      setMemberCamStreams(p => p.filter(r => r.peerId !== peerId));
+    });
+
     // Fix 5: host left — all members get notified and room cleared
     socket.on("host-left-room", ({ hostUserId }: { hostUserId: string }) => {
       notify(`🏠 Host (${hostUserId}) left. Room closed.`, "warning");
@@ -523,6 +543,11 @@ export default function App() {
     pc.ontrack = e => {
       const stream = e.streams?.[0];
       if (!stream) return;
+      // If this is a member camera stream (tracked by host), route to memberCamStreams instead of main grid
+      if (iAmRoomHostRef.current && memberCamPeersRef.current.has(peerId)) {
+        setMemberCamStreams(p => p.map(r => r.peerId === peerId ? { ...r, stream } : r));
+        return;
+      }
       setRemoteStreams(p => {
         const exists = p.find(r => r.peerId === peerId);
         return exists ? p.map(r => r.peerId === peerId ? { peerId, stream } : r) : [...p, { peerId, stream }];
@@ -604,6 +629,8 @@ export default function App() {
     setRemoteStreams(p => p.filter(r => r.peerId !== peerId));
     setMembers(p => p.filter(m => m.peerId !== peerId));
     setFocusedStream(p => p?.peerId === peerId ? null : p);
+    memberCamPeersRef.current.delete(peerId);
+    setMemberCamStreams(p => p.filter(r => r.peerId !== peerId));
   }
 
   // Fix 9+4: Stream button handler — show option modal on start, end stream without leaving room
@@ -757,11 +784,8 @@ export default function App() {
     notify("You are now LIVE! 🔴", "success");
   }
 
-  // Camera toggle — only host can use; only sends to peers when streaming is active
+  // Camera toggle — all members can use; non-hosts send stream to host miniplayer
   async function toggleWebcam() {
-    if (!iAmRoomHostRef.current && !isStreamingRef.current) {
-      notify("Only the host can use the camera", "warning"); return;
-    }
     if (isWebcamOn) {
       localStreamRef.current?.getTracks().forEach(t => t.stop());
       localStreamRef.current = null;
@@ -769,14 +793,18 @@ export default function App() {
       if (!isScreenSharingRef.current && localCenterRef.current) localCenterRef.current.srcObject = null;
       // Fix 3: If screen sharing is active, screen track is already the video sender — don't replace with null (avoids freeze)
       // Only replace with null when NOT screen sharing
-      if (!isScreenSharingRef.current && isStreamingRef.current) {
+      if (!isScreenSharingRef.current) {
         pcsRef.current.forEach(pc => {
           const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
           if (videoSender) videoSender.replaceTrack(null).catch(() => {});
         });
       }
       setIsWebcamOn(false);
-      notify("Camera off. Stream continues.", "info");
+      // Non-host members: notify peers that camera is off
+      if (!iAmRoomHostRef.current) {
+        socketRef.current?.emit("member-cam-off");
+      }
+      notify("Camera off", "info");
     } else {
       try {
         const isMob = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
@@ -792,8 +820,8 @@ export default function App() {
           localCenterRef.current.srcObject = stream;
           localCenterRef.current.play().catch(() => {});
         }
-        // Only send to peers if stream is already active (Feature 2)
-        if (isStreamingRef.current) {
+        // Host: only push when streaming. Non-host members: always push so host can receive camera
+        if (isStreamingRef.current || !iAmRoomHostRef.current) {
           pcsRef.current.forEach(pc => {
             const senders = pc.getSenders();
             stream.getTracks().forEach(track => {
@@ -801,8 +829,12 @@ export default function App() {
               if (existing) existing.replaceTrack(track).catch(() => {});
               else pc.addTrack(track, stream);
             });
-            setTimeout(() => applyVideoEncodingParams(pc, false), 1500);
+            if (iAmRoomHostRef.current) setTimeout(() => applyVideoEncodingParams(pc, false), 1500);
           });
+        }
+        // Non-host members: tell host to initiate P2P to receive camera
+        if (!iAmRoomHostRef.current) {
+          socketRef.current?.emit("member-cam-on");
         }
         setIsWebcamOn(true);
         notify("Camera is on 📹", "success");
@@ -810,10 +842,10 @@ export default function App() {
     }
   }
 
-  // Screen share toggle — only host can use; only sends to peers when streaming is active
+  // Screen share toggle — strictly host-only
   async function toggleScreenShare() {
-    if (!iAmRoomHostRef.current && !isStreamingRef.current) {
-      notify("Only the host can use screen share", "warning"); return;
+    if (!iAmRoomHostRef.current) {
+      notify("Only the host can share their screen", "warning"); return;
     }
     if (isScreenSharing) {
       screenStreamRef.current?.getTracks().forEach(t => t.stop());
@@ -1371,10 +1403,8 @@ export default function App() {
               {isStreaming ? "⏹ END" : "▶ STREAM"}
             </button>
           )}
-          {/* Camera and screen share buttons only visible to host (Feature 2) */}
-          {iAmRoomHost && (
-            <button onClick={toggleWebcam} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isWebcamOn ? "#00d4ff" : "#334"}`, background: isWebcamOn ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isWebcamOn ? "#00d4ff" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>📹</button>
-          )}
+          {/* Camera: all members can turn on; Screen share: host only */}
+          <button onClick={toggleWebcam} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isWebcamOn ? "#00d4ff" : "#334"}`, background: isWebcamOn ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isWebcamOn ? "#00d4ff" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>📹</button>
           {iAmRoomHost && (
             <button onClick={toggleScreenShare} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isScreenSharing ? "#00d4ff" : "#334"}`, background: isScreenSharing ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isScreenSharing ? "#00d4ff" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>🖥️</button>
           )}
@@ -1554,9 +1584,9 @@ export default function App() {
               {[
                 // STREAM button only visible to host
                 ...(canStartStream ? [{ icon: isStreaming ? "⏹" : "▶", label: "STREAM", active: isStreaming, onClick: handleStreamButtonClick, color: isStreaming ? "#ff4444" : "#00d4ff" }] : []),
-                // Camera and screen buttons only visible to host (Feature 2)
+                // Camera: all members; Screen + AnyScreen: host only
+                { icon: "📹", label: "CAMERA", active: isWebcamOn, onClick: toggleWebcam, color: "#00d4ff" },
                 ...(iAmRoomHost ? [
-                  { icon: "📹", label: "CAMERA", active: isWebcamOn, onClick: toggleWebcam, color: "#00d4ff" },
                   { icon: "🖥️", label: "SCREEN", active: isScreenSharing, onClick: toggleScreenShare, color: "#00d4ff" },
                   { icon: "📱", label: "MOBILE", active: !!anyScreenCode, onClick: () => setShowAnyScreenModal(true), color: "#00cc66" },
                 ] : []),
@@ -1775,6 +1805,25 @@ function RemoteVideoEl({ stream, peerId, videoRefs, small }: { stream: MediaStre
     return () => { videoRefs.current.delete(peerId); };
   }, [stream, peerId]);
   return <video ref={ref} autoPlay playsInline style={{ width: "100%", height: "100%", objectFit: small ? "cover" : "contain", position: small ? "relative" : "absolute", inset: 0, background: "#000" }} />;
+}
+
+function MemberCamVideoEl({ stream, userId, avatar }: { stream: MediaStream | null; userId: string; avatar: string }) {
+  const ref = useRef<HTMLVideoElement>(null);
+  useEffect(() => {
+    if (!ref.current || !stream) return;
+    if (ref.current.srcObject !== stream) { ref.current.srcObject = stream; ref.current.play().catch(() => {}); }
+  }, [stream]);
+  return (
+    <div style={{ width: 140, background: "#0a0e27", border: "2px solid #00d4ff55", borderRadius: 10, overflow: "hidden", boxShadow: "0 0 14px rgba(0,212,255,0.25)", flexShrink: 0 }}>
+      <div style={{ background: "rgba(0,212,255,0.1)", padding: "3px 8px", fontSize: 9, color: "#00d4ff", fontWeight: 700, display: "flex", alignItems: "center", gap: 4 }}>
+        <span>{avatar}</span><span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{userId}</span>
+      </div>
+      {stream
+        ? <video ref={ref} autoPlay playsInline muted style={{ width: "100%", height: 100, objectFit: "cover", display: "block", background: "#000" }} />
+        : <div style={{ width: "100%", height: 100, display: "flex", alignItems: "center", justifyContent: "center", color: "#334", fontSize: 24 }}>📹</div>
+      }
+    </div>
+  );
 }
 
 function ModalOverlay({ children, onClose }: { children: React.ReactNode; onClose: () => void }) {

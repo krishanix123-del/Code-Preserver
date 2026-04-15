@@ -160,6 +160,20 @@ export function attachSignaling(httpServer: HttpServer) {
       io.to(currentRoom).emit("anyscreen-clear");
     });
 
+    socket.on("member-cam-on", () => {
+      if (!currentRoom) return;
+      const room = rooms.get(currentRoom);
+      if (!room) return;
+      socket.to(currentRoom).emit("member-cam-on", {
+        peerId: socket.id, userId: userMeta.userId, avatar: userMeta.avatar,
+      });
+    });
+
+    socket.on("member-cam-off", () => {
+      if (!currentRoom) return;
+      socket.to(currentRoom).emit("member-cam-off", { peerId: socket.id });
+    });
+
     socket.on("chat-message", ({ roomCode, userId, text }: { roomCode: string; userId: string; text: string }) => {
       io.to(roomCode).emit("chat-message", { from: socket.id, userId, text, timestamp: Date.now() });
     });
