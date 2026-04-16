@@ -1,0 +1,49 @@
+LiveKit is a high-performance, open-source WebRTC engine designed to handle real-time video, audio, and data. Unlike traditional "streaming" (like YouTube), which has a delay of several seconds, LiveKit is instant (sub-200ms lag), making it perfect for your Nexuscast gaming project.
+
+Here is a detailed breakdown of how LiveKit functions and how you can integrate it into your specific room-based system.
+
+1. The Core Architecture (SFU)
+LiveKit uses a Selective Forwarding Unit (SFU). In a typical group call, if you have 5 people, your phone would usually have to send 4 separate streams (one to each person). This would crash an Android phone running a heavy game.
+
+With LiveKit:
+
+The Host (Gamer) sends only one high-quality stream to the LiveKit Server.
+
+The Server then "forwards" that single stream to all members in the room.
+
+Result: The gamer's phone saves battery and data, and the members see the screen in high definition.
+
+2. How it Works with Nexuscast (The Workflow)
+To make Nexuscast work with a "Room Code" and "No-Exit" screen sharing, you follow these four steps:
+
+Step A: Room Creation (Backend)
+When a user clicks "Create Room" on your Replit site, your Node.js backend uses the livekit-server-sdk to create a virtual space.
+
+Room Code: You can use the LiveKit RoomName as your room code (e.g., "GAMER-123").
+
+Token Generation: Your server generates a unique Access Token for the host and each member. This token contains their permissions (e.g., only the host can "Publish" a screen).
+
+Step B: The Android "Streamer" App
+Since Android browsers can't share screens in the background, you build a small native app.
+
+Connect: The app joins the room using the Room Name and Token.
+
+Capture: It calls room.localParticipant.setScreenShareEnabled(true).
+
+Foreground Service: LiveKit handles the Android "Media Projection" permission, allowing the screen to be captured even while the user is inside a game like PUBG or Free Fire.
+
+Step C: The Web Viewer (Nexuscast Site)
+Your members are on your Replit website. They don't need to do anything once they enter the code.
+
+Auto-Discovery: The LiveKit Web SDK listens for new "Tracks."
+
+Rendering: As soon as the Android app starts sharing, an event triggers on the website:
+
+JavaScript
+room.on(TrackEvent.TrackSubscribed, (track, publication, participant) => {
+  if (track.kind === "video") {
+    // This instantly attaches the game stream to your UI
+    const element = track.attach();
+    document.getElementById('video-container').appendChild(element);
+  }
+});

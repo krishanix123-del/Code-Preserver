@@ -272,12 +272,13 @@ export default function App() {
       setIAmRoomHost(iAmHost);
       peers.forEach(({ peerId, userId: uid, avatar, isStreaming: streaming, isRoomHost }) => {
         setMembers(p => p.find(m => m.peerId === peerId) ? p : [...p, { peerId, userId: uid, avatar, isFav: false, isStreaming: streaming, isRoomHost }]);
-        // Always connect to every existing peer so the host can push video later via renegotiation
-        // (if they aren't streaming yet the onnegotiationneeded handler will push tracks when they start)
+        // Always connect so the host can push video later via renegotiation
         connectToPeer(peerId, socket);
         if (streaming) {
-          notify(`${uid} is streaming — auto-joining!`, "info");
-          addMsg("⚡ SYSTEM", `${uid} is streaming — joining automatically`);
+          // Show join/skip prompt — member decides whether to watch the active stream
+          setJoinStreamPrompt({ hostPeerId: peerId, hostUserId: uid });
+          addMsg("⚡ SYSTEM", `${uid} is streaming — click Join Stream to watch!`);
+          notify(`📡 ${uid} is live in this room!`, "info");
         }
       });
     });
@@ -291,11 +292,12 @@ export default function App() {
     });
 
     socket.on("peer-started-stream", ({ peerId, userId: uid }: { peerId: string; userId: string }) => {
-      notify(`${uid} started streaming — auto-joining! 📺`, "success");
-      addMsg("⚡ SYSTEM", `${uid} started streaming — joining automatically`);
       setMembers(p => p.map(m => m.peerId === peerId ? { ...m, isStreaming: true } : m));
-      setJoinedStreamHostId(peerId);
-      // If we have no PC with this peer yet (joined before stream started), connect now
+      // Show join/skip prompt — do NOT auto-join; member decides
+      setJoinStreamPrompt({ hostPeerId: peerId, hostUserId: uid });
+      addMsg("⚡ SYSTEM", `${uid} started streaming — click Join Stream to watch!`);
+      notify(`📡 ${uid} started streaming!`, "info");
+      // Establish WebRTC connection now so tracks are ready when they choose to join
       if (!pcsRef.current.has(peerId)) connectToPeer(peerId, socket);
     });
 
@@ -694,7 +696,8 @@ export default function App() {
           }
           const screenVideoTrack = screenStream.getVideoTracks()[0];
           pcsRef.current.forEach(pc => {
-            const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
+            // Find active video sender OR a null-track sender (camera was turned off earlier)
+            const videoSender = pc.getSenders().find(s => s.track?.kind === "video") ?? pc.getSenders().find(s => s.track === null);
             if (videoSender) videoSender.replaceTrack(screenVideoTrack).catch(() => {});
             else pc.addTrack(screenVideoTrack, screenStream);
             const screenAudio = screenStream.getAudioTracks()[0];
@@ -710,16 +713,23 @@ export default function App() {
           // Fix 1: when browser stops screen share, stream continues
           screenVideoTrack.onended = () => {
             screenStreamRef.current = null;
-            if (localCenterRef.current) localCenterRef.current.srcObject = localStreamRef.current;
+            if (localCenterRef.current) {
+              if (localStreamRef.current) {
+                localCenterRef.current.srcObject = localStreamRef.current;
+                localCenterRef.current.play().catch(() => {});
+              } else {
+                localCenterRef.current.pause();
+                localCenterRef.current.srcObject = null;
+                localCenterRef.current.load();
+              }
+            }
             setIsScreenSharing(false);
             notify("Screen sharing stopped. Stream continues.", "info");
-            if (localStreamRef.current) {
-              const camTrack = localStreamRef.current.getVideoTracks()[0];
-              if (camTrack) pcsRef.current.forEach(pc => {
-                const sender = pc.getSenders().find(s => s.track?.kind === "video");
-                if (sender) sender.replaceTrack(camTrack).catch(() => {});
-              });
-            }
+            const camTrack = localStreamRef.current?.getVideoTracks()[0] ?? null;
+            pcsRef.current.forEach(pc => {
+              const sender = pc.getSenders().find(s => s.track?.kind === "video") ?? pc.getSenders().find(s => s.track === null);
+              if (sender) sender.replaceTrack(camTrack).catch(() => {});
+            });
           };
         } catch (err: unknown) {
           const name = err instanceof Error ? err.name : "";
@@ -744,8 +754,17 @@ export default function App() {
     if (isWebcamOn) {
       localStreamRef.current?.getTracks().forEach(t => t.stop());
       localStreamRef.current = null;
-      if (miniVideoRef.current) miniVideoRef.current.srcObject = null;
-      if (!isScreenSharingRef.current && localCenterRef.current) localCenterRef.current.srcObject = null;
+      // Pause BEFORE clearing srcObject to prevent frozen-frame artifacts
+      if (miniVideoRef.current) {
+        miniVideoRef.current.pause();
+        miniVideoRef.current.srcObject = null;
+        miniVideoRef.current.load();
+      }
+      if (!isScreenSharingRef.current && localCenterRef.current) {
+        localCenterRef.current.pause();
+        localCenterRef.current.srcObject = null;
+        localCenterRef.current.load();
+      }
       // Replace video sender with null track so remote side doesn't freeze
       pcsRef.current.forEach(pc => {
         const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
@@ -789,12 +808,18 @@ export default function App() {
       screenStreamRef.current?.getTracks().forEach(t => t.stop());
       screenStreamRef.current = null;
       if (localCenterRef.current) {
-        localCenterRef.current.srcObject = localStreamRef.current;
-        if (localStreamRef.current) localCenterRef.current.play().catch(() => {});
+        if (localStreamRef.current) {
+          localCenterRef.current.srcObject = localStreamRef.current;
+          localCenterRef.current.play().catch(() => {});
+        } else {
+          localCenterRef.current.pause();
+          localCenterRef.current.srcObject = null;
+          localCenterRef.current.load();
+        }
       }
       const camTrack = localStreamRef.current?.getVideoTracks()[0] ?? null;
       pcsRef.current.forEach(pc => {
-        const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
+        const videoSender = pc.getSenders().find(s => s.track?.kind === "video") ?? pc.getSenders().find(s => s.track === null);
         if (videoSender) videoSender.replaceTrack(camTrack).catch(() => {});
       });
       setIsScreenSharing(false);
@@ -828,7 +853,8 @@ export default function App() {
         }
         const screenTrack = screenStream.getVideoTracks()[0];
         pcsRef.current.forEach(pc => {
-          const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
+          // Find active video sender OR a null-track sender (camera was turned off earlier)
+          const videoSender = pc.getSenders().find(s => s.track?.kind === "video") ?? pc.getSenders().find(s => s.track === null);
           if (videoSender) videoSender.replaceTrack(screenTrack).catch(() => {});
           else pc.addTrack(screenTrack, screenStream);
           const screenAudio = screenStream.getAudioTracks()[0];
@@ -843,14 +869,20 @@ export default function App() {
         screenTrack.onended = () => {
           screenStreamRef.current = null;
           if (localCenterRef.current) {
-            localCenterRef.current.srcObject = localStreamRef.current;
-            if (localStreamRef.current) localCenterRef.current.play().catch(() => {});
+            if (localStreamRef.current) {
+              localCenterRef.current.srcObject = localStreamRef.current;
+              localCenterRef.current.play().catch(() => {});
+            } else {
+              localCenterRef.current.pause();
+              localCenterRef.current.srcObject = null;
+              localCenterRef.current.load();
+            }
           }
           setIsScreenSharing(false);
           notify("Screen sharing stopped. Stream continues.", "info");
-          const camTrack = localStreamRef.current?.getVideoTracks()[0];
-          if (camTrack) pcsRef.current.forEach(pc => {
-            const sender = pc.getSenders().find(s => s.track?.kind === "video");
+          const camTrack = localStreamRef.current?.getVideoTracks()[0] ?? null;
+          pcsRef.current.forEach(pc => {
+            const sender = pc.getSenders().find(s => s.track?.kind === "video") ?? pc.getSenders().find(s => s.track === null);
             if (sender) sender.replaceTrack(camTrack).catch(() => {});
           });
         };
@@ -929,10 +961,11 @@ export default function App() {
     setIncomingJoinReqs(p => p.filter(r => r.from !== req.from));
   }
 
-  function requestJoinStream() {
-    if (!joinStreamPrompt) return;
-    socketRef.current?.emit("join-stream-request", { hostPeerId: joinStreamPrompt.hostPeerId });
-    notify("Join request sent!", "info");
+  function requestJoinStream(overridePeerId?: string) {
+    const hostPeerId = overridePeerId ?? joinStreamPrompt?.hostPeerId;
+    if (!hostPeerId) return;
+    socketRef.current?.emit("join-stream-request", { hostPeerId });
+    notify("Joining stream...", "info");
     setJoinStreamPrompt(null);
   }
 
@@ -1007,7 +1040,12 @@ export default function App() {
   const canStartStream = iAmRoomHost || isStreaming;
   // If any other member is streaming, host should still see the button (to start their own or end theirs)
   const showLocalCenter = (isStreaming || isWebcamOn || isScreenSharing) && !focusedStream && remoteStreams.length === 0;
-  const showRemoteCenter = !!focusedStream || remoteStreams.length > 0;
+  // Members only see the remote stream after they've chosen to join it
+  const hasJoinedStream = iAmRoomHost || joinedStreamHostId !== null;
+  const showRemoteCenter = (!!focusedStream || remoteStreams.length > 0) && hasJoinedStream;
+  // Streaming peer detected but current user hasn't joined yet
+  const streamingPeer = members.find(m => m.isStreaming && m.peerId !== "me");
+  const canWatchStream = !hasJoinedStream && !!streamingPeer;
   const notifColor = (t: string) => t === "success" ? "#00ff44" : t === "error" ? "#ff4444" : t === "warning" ? "#ffaa00" : "#00d4ff";
   const miniStyle: React.CSSProperties = miniPos.x < 0 ? { position: "fixed", bottom: 18, right: 18 } : { position: "fixed", left: miniPos.x, top: miniPos.y };
 
@@ -1122,18 +1160,21 @@ export default function App() {
     </>
   );
 
-  // Stream notification banner — auto-join only, no manual Join button needed
-  const streamNotifBanner = joinStreamPrompt && (
+  // Stream notification banner — shows join/skip choice to every member when host goes live
+  const streamNotifBanner = joinStreamPrompt && !joinedStreamHostId && (
     <div style={{ position: "fixed", top: isMobile ? 60 : 70, left: isMobile ? 12 : "50%", right: isMobile ? 12 : "auto", transform: isMobile ? "none" : "translateX(-50%)", zIndex: 2500 }}>
-      <div style={{ background: "linear-gradient(135deg, #0a0e27, #1a2558)", padding: "12px 18px", border: "2px solid #00d4ff", borderRadius: 12, display: "flex", alignItems: "center", gap: 12, boxShadow: "0 0 30px rgba(0,212,255,0.3)", maxWidth: 420 }}>
-        <span style={{ fontSize: 22 }}>📡</span>
+      <div style={{ background: "linear-gradient(135deg, #0a0e27ee, #1a2558ee)", padding: "14px 18px", border: "2px solid #ff4444", borderRadius: 14, display: "flex", alignItems: "center", gap: 12, boxShadow: "0 0 36px rgba(255,60,60,0.35)", maxWidth: 440, backdropFilter: "blur(8px)" }}>
+        <span style={{ fontSize: 26, animation: "statusBlink 1s infinite" }}>🔴</span>
         <div style={{ flex: 1 }}>
-          <div style={{ color: "#00d4ff", fontSize: 12, fontWeight: 700 }}>📺 Stream Joined</div>
-          <div style={{ color: "#e8f0ff", fontSize: 11, marginTop: 2 }}>
-            <strong>{joinStreamPrompt.hostUserId}</strong> started streaming — you are auto-connected!
+          <div style={{ color: "#ff4444", fontSize: 13, fontWeight: 800, letterSpacing: 1 }}>HOST IS LIVE!</div>
+          <div style={{ color: "#e8f0ff", fontSize: 11, marginTop: 3 }}>
+            <strong style={{ color: "#00d4ff" }}>{joinStreamPrompt.hostUserId}</strong> started streaming. Do you want to join?
           </div>
         </div>
-        <button onClick={() => setJoinStreamPrompt(null)} style={{ padding: "7px 10px", background: "rgba(255,0,0,0.1)", color: "#ff6666", border: "1px solid #ff4444", borderRadius: 7, cursor: "pointer", fontSize: 11, flexShrink: 0 }}>✖</button>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, flexShrink: 0 }}>
+          <button onClick={requestJoinStream} style={{ padding: "7px 14px", background: "linear-gradient(135deg, #00d4ff, #0099ff)", color: "#0a0e27", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 11, fontWeight: 800 }}>▶ JOIN</button>
+          <button onClick={() => setJoinStreamPrompt(null)} style={{ padding: "7px 10px", background: "rgba(255,0,0,0.1)", color: "#ff6666", border: "1px solid #ff4444", borderRadius: 8, cursor: "pointer", fontSize: 11 }}>✖ Skip</button>
+        </div>
       </div>
     </div>
   );
@@ -1207,9 +1248,22 @@ export default function App() {
                 : null
           )}
           {!showLocalCenter && !showRemoteCenter && (
-            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 8 }}>
-              <div style={{ fontSize: 40, opacity: 0.5 }}>🎮</div>
-              <div style={{ fontSize: 12, color: "#00d4ff" }}>Tap STREAM to go live</div>
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 10 }}>
+              {canWatchStream ? (
+                <>
+                  <div style={{ fontSize: 34, animation: "statusBlink 1.2s infinite" }}>📡</div>
+                  <div style={{ fontSize: 12, color: "#ff4444", fontWeight: 700 }}>🔴 {streamingPeer!.userId} is LIVE!</div>
+                  <button onClick={() => requestJoinStream(streamingPeer!.peerId)}
+                    style={{ padding: "8px 20px", background: "linear-gradient(135deg, #00d4ff, #0099ff)", color: "#0a0e27", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 12, fontWeight: 800 }}>
+                    ▶ Watch Stream
+                  </button>
+                </>
+              ) : (
+                <>
+                  <div style={{ fontSize: 40, opacity: 0.5 }}>🎮</div>
+                  <div style={{ fontSize: 12, color: "#00d4ff" }}>Tap STREAM to go live</div>
+                </>
+              )}
             </div>
           )}
           {isStreaming && <div style={{ position: "absolute", top: 8, right: 8, background: "rgba(255,0,0,0.25)", padding: "3px 8px", borderRadius: 12, fontSize: 9, fontWeight: 700, color: "#ff4444", border: "1px solid #ff4444", animation: "statusBlink 1s infinite" }}>● LIVE</div>}
@@ -1481,9 +1535,23 @@ export default function App() {
 
             {!showLocalCenter && !showRemoteCenter && (
               <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12, textAlign: "center" }}>
-                <div className="bounce-pulse" style={{ fontSize: 56, opacity: 0.5 }}>🎮</div>
-                <h3 style={{ fontSize: 15, color: "#00d4ff" }}>Ready to Stream</h3>
-                <p style={{ fontSize: 11, color: "#a0b0d0", maxWidth: 280 }}>Click <strong style={{ color: "#00d4ff" }}>STREAM</strong> to go live · <strong style={{ color: "#00d4ff" }}>SCREEN</strong> to share your screen</p>
+                {canWatchStream ? (
+                  <>
+                    <div style={{ fontSize: 48, animation: "statusBlink 1.2s infinite" }}>📡</div>
+                    <h3 style={{ fontSize: 15, color: "#ff4444", margin: 0 }}>🔴 {streamingPeer!.userId} is LIVE!</h3>
+                    <p style={{ fontSize: 11, color: "#a0b0d0", maxWidth: 280, margin: 0 }}>The host started streaming. Join to watch!</p>
+                    <button onClick={() => requestJoinStream(streamingPeer!.peerId)}
+                      style={{ padding: "11px 28px", background: "linear-gradient(135deg, #00d4ff, #0099ff)", color: "#0a0e27", border: "none", borderRadius: 10, cursor: "pointer", fontSize: 14, fontWeight: 800, boxShadow: "0 0 20px rgba(0,212,255,0.4)" }}>
+                      ▶ Watch Stream
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <div className="bounce-pulse" style={{ fontSize: 56, opacity: 0.5 }}>🎮</div>
+                    <h3 style={{ fontSize: 15, color: "#00d4ff" }}>Ready to Stream</h3>
+                    <p style={{ fontSize: 11, color: "#a0b0d0", maxWidth: 280 }}>Click <strong style={{ color: "#00d4ff" }}>STREAM</strong> to go live · <strong style={{ color: "#00d4ff" }}>SCREEN</strong> to share your screen</p>
+                  </>
+                )}
               </div>
             )}
 
