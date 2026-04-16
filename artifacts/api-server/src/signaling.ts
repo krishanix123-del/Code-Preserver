@@ -11,7 +11,7 @@ interface MemberMeta {
 interface RoomInfo {
   members: Map<string, MemberMeta>;
   hostSocketId: string;
-  hostUserId: string; // Fix 6: track host by userId so reconnect restores host status
+  hostUserId: string;
 }
 
 const rooms = new Map<string, RoomInfo>();
@@ -48,7 +48,6 @@ export function attachSignaling(httpServer: HttpServer) {
       if (isNewRoom) {
         rooms.set(roomCode, { members: new Map(), hostSocketId: socket.id, hostUserId: userId });
       } else {
-        // Fix 6: if this user was the original host, restore their host socket ID
         const room = rooms.get(roomCode)!;
         if (room.hostUserId === userId) {
           room.hostSocketId = socket.id;
@@ -81,7 +80,6 @@ export function attachSignaling(httpServer: HttpServer) {
       if (!currentRoom) return;
       const room = rooms.get(currentRoom);
       if (!room) return;
-      // Fix 3: only host can mark as streaming on server
       if (socket.id !== room.hostSocketId) return;
       const m = room.members.get(socket.id);
       if (m) { m.isStreaming = true; userMeta.isStreaming = true; }
@@ -101,11 +99,8 @@ export function attachSignaling(httpServer: HttpServer) {
       io.to(currentRoom).emit("members-update", membersList(room));
     });
 
-    // Fix 5: auto-accept join requests — no host approval needed
     socket.on("join-stream-request", ({ hostPeerId }: { hostPeerId: string }) => {
-      // Immediately send back stream-join-accepted to the requester
       socket.emit("stream-join-accepted", { hostPeerId });
-      // Notify the host that this member joined
       io.to(hostPeerId).emit("stream-member-joined", { userId: userMeta.userId, avatar: userMeta.avatar });
     });
 
@@ -113,7 +108,6 @@ export function attachSignaling(httpServer: HttpServer) {
       if (!currentRoom) return;
       const room = rooms.get(currentRoom);
       if (!room) return;
-      // Fix 4: only host can kick
       if (socket.id !== room.hostSocketId) return;
       const targetMeta = room.members.get(targetPeerId);
       if (!targetMeta) return;
@@ -128,7 +122,6 @@ export function attachSignaling(httpServer: HttpServer) {
       if (!currentRoom) return;
       const room = rooms.get(currentRoom);
       if (!room) return;
-      // Fix 4: only host can mute
       if (socket.id !== room.hostSocketId) return;
       io.to(targetPeerId).emit("you-are-muted", { byUserId: userMeta.userId, durationMs: 5000 });
     });
@@ -139,16 +132,6 @@ export function attachSignaling(httpServer: HttpServer) {
 
     socket.on("chat-message", ({ roomCode, userId, text }: { roomCode: string; userId: string; text: string }) => {
       io.to(roomCode).emit("chat-message", { from: socket.id, userId, text, timestamp: Date.now() });
-    });
-
-    socket.on("offer", ({ to, offer }: { to: string; offer: RTCSessionDescriptionInit }) => {
-      socket.to(to).emit("offer", { from: socket.id, offer });
-    });
-    socket.on("answer", ({ to, answer }: { to: string; answer: RTCSessionDescriptionInit }) => {
-      socket.to(to).emit("answer", { from: socket.id, answer });
-    });
-    socket.on("ice-candidate", ({ to, candidate }: { to: string; candidate: RTCIceCandidateInit }) => {
-      socket.to(to).emit("ice-candidate", { from: socket.id, candidate });
     });
 
     socket.on("leave-room", () => {
