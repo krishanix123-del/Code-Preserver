@@ -137,43 +137,6 @@ export function attachSignaling(httpServer: HttpServer) {
       io.to(targetPeerId).emit("your-name-changed", { byUserId: userMeta.userId, newName });
     });
 
-    // AnyScreen mobile screen share code — host broadcasts to all room members
-    socket.on("anyscreen-code", ({ code }: { code: string }) => {
-      if (!currentRoom) return;
-      const room = rooms.get(currentRoom);
-      if (!room) return;
-      if (socket.id !== room.hostSocketId) return; // only host can share
-      // Broadcast to all members (including host themselves to confirm)
-      io.to(currentRoom).emit("anyscreen-code", {
-        code,
-        hostUserId: userMeta.userId,
-        hostAvatar: userMeta.avatar,
-      });
-      logger.info({ roomCode: currentRoom, code }, "AnyScreen code shared by host");
-    });
-
-    socket.on("anyscreen-clear", () => {
-      if (!currentRoom) return;
-      const room = rooms.get(currentRoom);
-      if (!room) return;
-      if (socket.id !== room.hostSocketId) return;
-      io.to(currentRoom).emit("anyscreen-clear");
-    });
-
-    socket.on("member-cam-on", () => {
-      if (!currentRoom) return;
-      const room = rooms.get(currentRoom);
-      if (!room) return;
-      socket.to(currentRoom).emit("member-cam-on", {
-        peerId: socket.id, userId: userMeta.userId, avatar: userMeta.avatar,
-      });
-    });
-
-    socket.on("member-cam-off", () => {
-      if (!currentRoom) return;
-      socket.to(currentRoom).emit("member-cam-off", { peerId: socket.id });
-    });
-
     socket.on("chat-message", ({ roomCode, userId, text }: { roomCode: string; userId: string; text: string }) => {
       io.to(roomCode).emit("chat-message", { from: socket.id, userId, text, timestamp: Date.now() });
     });

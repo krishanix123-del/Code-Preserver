@@ -77,22 +77,13 @@ export default function App() {
   const [audioUnlocked, setAudioUnlocked] = useState(false);
 
   const [localNicknames, setLocalNicknames] = useState<Record<string, string>>({});
-  // Stream start notification: show banner with Watch Now / Dismiss (no host permission needed)
-  const [joinStreamPrompt, setJoinStreamPrompt] = useState<{ hostPeerId: string; hostUserId: string; hostAvatar: string } | null>(null);
+  // Fix 2: joinStreamPrompt shows notification banner only (no accept/decline)
+  const [joinStreamPrompt, setJoinStreamPrompt] = useState<{ hostPeerId: string; hostUserId: string } | null>(null);
   const [incomingJoinReqs, setIncomingJoinReqs] = useState<IncomingJoinReq[]>([]);
   const [joinedStreamHostId, setJoinedStreamHostId] = useState<string | null>(null);
 
   // Fix 9: stream start option modal
   const [showStreamStartModal, setShowStreamStartModal] = useState(false);
-
-  // AnyScreen mobile screen share code sharing
-  const [showAnyScreenModal, setShowAnyScreenModal] = useState(false);
-  const [anyScreenInput, setAnyScreenInput] = useState("");
-  const [anyScreenCode, setAnyScreenCode] = useState<{ code: string; hostUserId: string; hostAvatar: string } | null>(null);
-
-  // Member camera: members (non-hosts) can turn on their camera visible to the host
-  const [memberCamStreams, setMemberCamStreams] = useState<{ peerId: string; stream: MediaStream; userId: string; avatar: string }[]>([]);
-  const memberCamPeersRef = useRef<Set<string>>(new Set());
 
   // Fix 3: WhatsApp-style chat popups
   const [chatPopups, setChatPopups] = useState<ChatPopup[]>([]);
@@ -299,12 +290,12 @@ export default function App() {
       if (isStreamingRef.current) socket.emit("start-stream");
     });
 
-    socket.on("peer-started-stream", ({ peerId, userId: uid, avatar }: { peerId: string; userId: string; avatar: string }) => {
-      addMsg("⚡ SYSTEM", `${uid} started streaming`);
+    socket.on("peer-started-stream", ({ peerId, userId: uid }: { peerId: string; userId: string }) => {
+      notify(`${uid} started streaming — auto-joining! 📺`, "success");
+      addMsg("⚡ SYSTEM", `${uid} started streaming — joining automatically`);
       setMembers(p => p.map(m => m.peerId === peerId ? { ...m, isStreaming: true } : m));
-      // Show notification banner — member can choose to watch or dismiss (no host permission needed)
-      setJoinStreamPrompt({ hostPeerId: peerId, hostUserId: uid, hostAvatar: avatar });
-      // Ensure PC exists so tracks can flow when user clicks "Watch Now"
+      setJoinedStreamHostId(peerId);
+      // If we have no PC with this peer yet (joined before stream started), connect now
       if (!pcsRef.current.has(peerId)) connectToPeer(peerId, socket);
     });
 
@@ -405,35 +396,6 @@ export default function App() {
 
     socket.on("chat-message", ({ userId: sender, text }: { userId: string; text: string }) => {
       addMsg(sender, text);
-    });
-
-    // AnyScreen: host shares a mobile screen code — shown as pinned banner + chat message
-    socket.on("anyscreen-code", ({ code, hostUserId: hostUid, hostAvatar: hostAv }: { code: string; hostUserId: string; hostAvatar: string }) => {
-      setAnyScreenCode({ code, hostUserId: hostUid, hostAvatar: hostAv });
-      // Option C: auto-broadcast as highlighted chat message
-      addMsg("📱 ANYSCREEN", `Code: ${code} — Open AnyScreen app and enter this code to see the host's phone screen.`);
-      notify(`📱 AnyScreen code received: ${code}`, "info");
-    });
-
-    socket.on("anyscreen-clear", () => {
-      setAnyScreenCode(null);
-      addMsg("📱 ANYSCREEN", "AnyScreen screen sharing ended.");
-    });
-
-    // Member camera events: non-host members turning camera on/off
-    socket.on("member-cam-on", ({ peerId, userId: uid, avatar }: { peerId: string; userId: string; avatar: string }) => {
-      memberCamPeersRef.current.add(peerId);
-      // Host initiates P2P to receive the member's camera stream
-      if (iAmRoomHostRef.current) {
-        connectToPeer(peerId, socket);
-        notify(`${uid} turned on their camera 📹`, "info");
-      }
-      setMemberCamStreams(p => p.find(r => r.peerId === peerId) ? p : [...p, { peerId, stream: null as unknown as MediaStream, userId: uid, avatar }]);
-    });
-
-    socket.on("member-cam-off", ({ peerId }: { peerId: string }) => {
-      memberCamPeersRef.current.delete(peerId);
-      setMemberCamStreams(p => p.filter(r => r.peerId !== peerId));
     });
 
     // Fix 5: host left — all members get notified and room cleared
@@ -543,11 +505,6 @@ export default function App() {
     pc.ontrack = e => {
       const stream = e.streams?.[0];
       if (!stream) return;
-      // If this is a member camera stream (tracked by host), route to memberCamStreams instead of main grid
-      if (iAmRoomHostRef.current && memberCamPeersRef.current.has(peerId)) {
-        setMemberCamStreams(p => p.map(r => r.peerId === peerId ? { ...r, stream } : r));
-        return;
-      }
       setRemoteStreams(p => {
         const exists = p.find(r => r.peerId === peerId);
         return exists ? p.map(r => r.peerId === peerId ? { peerId, stream } : r) : [...p, { peerId, stream }];
@@ -629,8 +586,6 @@ export default function App() {
     setRemoteStreams(p => p.filter(r => r.peerId !== peerId));
     setMembers(p => p.filter(m => m.peerId !== peerId));
     setFocusedStream(p => p?.peerId === peerId ? null : p);
-    memberCamPeersRef.current.delete(peerId);
-    setMemberCamStreams(p => p.filter(r => r.peerId !== peerId));
   }
 
   // Fix 9+4: Stream button handler — show option modal on start, end stream without leaving room
@@ -784,27 +739,20 @@ export default function App() {
     notify("You are now LIVE! 🔴", "success");
   }
 
-  // Camera toggle — all members can use; non-hosts send stream to host miniplayer
+  // Camera toggle — independent of stream, with adaptive constraints to prevent lag
   async function toggleWebcam() {
     if (isWebcamOn) {
       localStreamRef.current?.getTracks().forEach(t => t.stop());
       localStreamRef.current = null;
       if (miniVideoRef.current) miniVideoRef.current.srcObject = null;
       if (!isScreenSharingRef.current && localCenterRef.current) localCenterRef.current.srcObject = null;
-      // Fix 3: If screen sharing is active, screen track is already the video sender — don't replace with null (avoids freeze)
-      // Only replace with null when NOT screen sharing
-      if (!isScreenSharingRef.current) {
-        pcsRef.current.forEach(pc => {
-          const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
-          if (videoSender) videoSender.replaceTrack(null).catch(() => {});
-        });
-      }
+      // Replace video sender with null track so remote side doesn't freeze
+      pcsRef.current.forEach(pc => {
+        const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
+        if (videoSender) videoSender.replaceTrack(null).catch(() => {});
+      });
       setIsWebcamOn(false);
-      // Non-host members: notify peers that camera is off
-      if (!iAmRoomHostRef.current) {
-        socketRef.current?.emit("member-cam-off");
-      }
-      notify("Camera off", "info");
+      notify("Camera off. Stream continues.", "info");
     } else {
       try {
         const isMob = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
@@ -820,33 +768,23 @@ export default function App() {
           localCenterRef.current.srcObject = stream;
           localCenterRef.current.play().catch(() => {});
         }
-        // Host: only push when streaming. Non-host members: always push so host can receive camera
-        if (isStreamingRef.current || !iAmRoomHostRef.current) {
-          pcsRef.current.forEach(pc => {
-            const senders = pc.getSenders();
-            stream.getTracks().forEach(track => {
-              const existing = senders.find(s => s.track?.kind === track.kind);
-              if (existing) existing.replaceTrack(track).catch(() => {});
-              else pc.addTrack(track, stream);
-            });
-            if (iAmRoomHostRef.current) setTimeout(() => applyVideoEncodingParams(pc, false), 1500);
+        pcsRef.current.forEach(pc => {
+          const senders = pc.getSenders();
+          stream.getTracks().forEach(track => {
+            const existing = senders.find(s => s.track?.kind === track.kind);
+            if (existing) existing.replaceTrack(track).catch(() => {});
+            else pc.addTrack(track, stream);
           });
-        }
-        // Non-host members: tell host to initiate P2P to receive camera
-        if (!iAmRoomHostRef.current) {
-          socketRef.current?.emit("member-cam-on");
-        }
+          setTimeout(() => applyVideoEncodingParams(pc, false), 1500);
+        });
         setIsWebcamOn(true);
         notify("Camera is on 📹", "success");
       } catch { notify("Camera/microphone permission required", "error"); }
     }
   }
 
-  // Screen share toggle — strictly host-only
+  // Screen share toggle — does NOT end stream; handles all environments correctly
   async function toggleScreenShare() {
-    if (!iAmRoomHostRef.current) {
-      notify("Only the host can share their screen", "warning"); return;
-    }
     if (isScreenSharing) {
       screenStreamRef.current?.getTracks().forEach(t => t.stop());
       screenStreamRef.current = null;
@@ -854,19 +792,17 @@ export default function App() {
         localCenterRef.current.srcObject = localStreamRef.current;
         if (localStreamRef.current) localCenterRef.current.play().catch(() => {});
       }
-      // Fix 3: switch back to camera track if available, otherwise null — prevents freeze
-      if (isStreamingRef.current) {
-        const camTrack = localStreamRef.current?.getVideoTracks()[0] ?? null;
-        pcsRef.current.forEach(pc => {
-          const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
-          if (videoSender) videoSender.replaceTrack(camTrack).catch(() => {});
-        });
-      }
+      const camTrack = localStreamRef.current?.getVideoTracks()[0] ?? null;
+      pcsRef.current.forEach(pc => {
+        const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
+        if (videoSender) videoSender.replaceTrack(camTrack).catch(() => {});
+      });
       setIsScreenSharing(false);
       notify("Screen share stopped. Stream continues.", "info");
     } else {
       const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
       const isAndroidWebView = _isNativeApp || /wv/.test(navigator.userAgent) || (/Android/.test(navigator.userAgent) && /Version\/[\d.]+/.test(navigator.userAgent));
+      // In native WebView: open Chrome instead of showing an error
       if (isAndroidWebView && !isIOS) {
         postToNative({ type: "open_in_browser_for_screen_share", url: window.location.href });
         return;
@@ -882,7 +818,6 @@ export default function App() {
           : { video: { frameRate: { ideal: 24, max: 30 } }, audio: true };
         const screenStream = await navigator.mediaDevices.getDisplayMedia(screenConstraints);
         screenStreamRef.current = screenStream;
-        // Fix 3: attach screen BEFORE stopping camera so there's no blank frame gap
         if (localCenterRef.current) {
           localCenterRef.current.srcObject = screenStream;
           localCenterRef.current.play().catch(() => {});
@@ -892,24 +827,19 @@ export default function App() {
           miniVideoRef.current.play().catch(() => {});
         }
         const screenTrack = screenStream.getVideoTracks()[0];
-        // Only send to peers if streaming is active (Feature 2)
-        if (isStreamingRef.current) {
-          pcsRef.current.forEach(pc => {
-            const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
-            // Fix 3: replaceTrack smoothly (no null gap) — replaces camera track with screen track
-            if (videoSender) videoSender.replaceTrack(screenTrack).catch(() => {});
-            else pc.addTrack(screenTrack, screenStream);
-            const screenAudio = screenStream.getAudioTracks()[0];
-            if (screenAudio) {
-              const audioSender = pc.getSenders().find(s => s.track?.kind === "audio");
-              if (!audioSender) pc.addTrack(screenAudio, screenStream);
-            }
-            setTimeout(() => applyVideoEncodingParams(pc, true), 1500);
-          });
-        }
+        pcsRef.current.forEach(pc => {
+          const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
+          if (videoSender) videoSender.replaceTrack(screenTrack).catch(() => {});
+          else pc.addTrack(screenTrack, screenStream);
+          const screenAudio = screenStream.getAudioTracks()[0];
+          if (screenAudio) {
+            const audioSender = pc.getSenders().find(s => s.track?.kind === "audio");
+            if (!audioSender) pc.addTrack(screenAudio, screenStream);
+          }
+          setTimeout(() => applyVideoEncodingParams(pc, true), 1500);
+        });
         setIsScreenSharing(true);
         notify("Screen sharing active 🖥️", "success");
-        // When browser/OS stops screen share (e.g. user clicks "Stop sharing")
         screenTrack.onended = () => {
           screenStreamRef.current = null;
           if (localCenterRef.current) {
@@ -918,14 +848,11 @@ export default function App() {
           }
           setIsScreenSharing(false);
           notify("Screen sharing stopped. Stream continues.", "info");
-          // Fix 3: switch back to camera track without null gap
-          if (isStreamingRef.current) {
-            const camTrack = localStreamRef.current?.getVideoTracks()[0];
-            if (camTrack) pcsRef.current.forEach(pc => {
-              const sender = pc.getSenders().find(s => s.track?.kind === "video");
-              if (sender) sender.replaceTrack(camTrack).catch(() => {});
-            });
-          }
+          const camTrack = localStreamRef.current?.getVideoTracks()[0];
+          if (camTrack) pcsRef.current.forEach(pc => {
+            const sender = pc.getSenders().find(s => s.track?.kind === "video");
+            if (sender) sender.replaceTrack(camTrack).catch(() => {});
+          });
         };
       } catch (err: unknown) {
         const name = err instanceof Error ? err.name : "";
@@ -1037,22 +964,6 @@ export default function App() {
   function toggleFav(peerId: string) {
     setMembers(p => p.map(m => m.peerId === peerId ? { ...m, isFav: !m.isFav } : m));
     setOpenMenuMember(null);
-  }
-
-  function shareAnyScreenCode() {
-    const code = anyScreenInput.trim().toUpperCase();
-    if (!code) { notify("Enter the AnyScreen code first", "error"); return; }
-    if (!currentRoom || !socketRef.current) { notify("Join a room first", "error"); return; }
-    socketRef.current.emit("anyscreen-code", { code });
-    setAnyScreenInput("");
-    setShowAnyScreenModal(false);
-    notify("AnyScreen code shared with all members! 📱", "success");
-  }
-
-  function clearAnyScreenCode() {
-    if (!currentRoom || !socketRef.current) return;
-    socketRef.current.emit("anyscreen-clear");
-    setAnyScreenCode(null);
   }
 
   function sendMsg() {
@@ -1208,104 +1119,21 @@ export default function App() {
           <button onClick={() => setShowChangeNameModal(null)} style={btn2St}>CANCEL</button>
         </ModalBox>
       </ModalOverlay>}
-
-      {showAnyScreenModal && <ModalOverlay onClose={() => setShowAnyScreenModal(false)}>
-        <ModalBox title="📱 SHARE ANYSCREEN CODE">
-          <div style={{ background: "rgba(0,212,255,0.06)", border: "1px solid #004d7f", borderRadius: 10, padding: "10px 14px", marginBottom: 10, fontSize: 11, color: "#a0b0d0", lineHeight: 1.7 }}>
-            <div style={{ color: "#00d4ff", fontWeight: 700, marginBottom: 4 }}>How to get your AnyScreen code:</div>
-            <div>1. Open the <strong style={{ color: "#00d4ff" }}>AnyScreen</strong> app on your phone</div>
-            <div>2. Start a session — you'll see a short code</div>
-            <div>3. Enter that code below and tap <strong style={{ color: "#00d4ff" }}>SHARE</strong></div>
-            <div style={{ marginTop: 6, color: "#ffaa00" }}>Members will get the code via a pinned banner + chat message so they can join your screen.</div>
-          </div>
-          <input
-            value={anyScreenInput}
-            onChange={e => setAnyScreenInput(e.target.value.toUpperCase())}
-            placeholder="e.g. ABC123"
-            style={{ ...inpSt, letterSpacing: 6, fontSize: 22, textAlign: "center", fontFamily: "monospace" }}
-            maxLength={12}
-            autoFocus
-            onKeyDown={e => e.key === "Enter" && shareAnyScreenCode()}
-          />
-          <button onClick={shareAnyScreenCode} style={{ ...btnSt, background: "linear-gradient(135deg, #00bb77, #007744)" }}>📤 SHARE CODE WITH ROOM</button>
-          {anyScreenCode && (
-            <button onClick={() => { clearAnyScreenCode(); setShowAnyScreenModal(false); }} style={{ ...btn2St, color: "#ff6666", borderColor: "#ff4444" }}>🗑️ REMOVE CURRENT CODE</button>
-          )}
-          <button onClick={() => setShowAnyScreenModal(false)} style={btn2St}>CANCEL</button>
-        </ModalBox>
-      </ModalOverlay>}
     </>
   );
 
-  // Stream start notification banner: shown to all members when host starts stream
-  function handleJoinStream() {
-    if (!joinStreamPrompt) return;
-    setJoinedStreamHostId(joinStreamPrompt.hostPeerId);
-    setJoinStreamPrompt(null);
-    notify("You are now watching the stream! 📺", "success");
-    addMsg("⚡ SYSTEM", "You joined the stream.");
-  }
-
-  const streamNotifBanner = joinStreamPrompt && !iAmRoomHost && (
+  // Stream notification banner — auto-join only, no manual Join button needed
+  const streamNotifBanner = joinStreamPrompt && (
     <div style={{ position: "fixed", top: isMobile ? 60 : 70, left: isMobile ? 12 : "50%", right: isMobile ? 12 : "auto", transform: isMobile ? "none" : "translateX(-50%)", zIndex: 2500 }}>
-      <div style={{
-        background: "linear-gradient(135deg, #0a0e27, #1a2558)",
-        padding: "14px 18px", border: "2px solid #00d4ff", borderRadius: 14,
-        display: "flex", alignItems: "center", gap: 12,
-        boxShadow: "0 0 40px rgba(0,212,255,0.4)", maxWidth: 440,
-        animation: "slideIn 0.35s ease"
-      }}>
-        <span style={{ fontSize: 28, flexShrink: 0 }}>{joinStreamPrompt.hostAvatar || "📡"}</span>
+      <div style={{ background: "linear-gradient(135deg, #0a0e27, #1a2558)", padding: "12px 18px", border: "2px solid #00d4ff", borderRadius: 12, display: "flex", alignItems: "center", gap: 12, boxShadow: "0 0 30px rgba(0,212,255,0.3)", maxWidth: 420 }}>
+        <span style={{ fontSize: 22 }}>📡</span>
         <div style={{ flex: 1 }}>
-          <div style={{ color: "#ff4444", fontSize: 12, fontWeight: 800, letterSpacing: 1 }}>🔴 LIVE STREAM STARTED</div>
-          <div style={{ color: "#e8f0ff", fontSize: 12, marginTop: 3 }}>
-            <strong style={{ color: "#00d4ff" }}>{joinStreamPrompt.hostUserId}</strong> has started streaming. Do you want to watch?
-          </div>
-        </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 6, flexShrink: 0 }}>
-          <button onClick={handleJoinStream} style={{ padding: "7px 14px", background: "linear-gradient(135deg, #00d4ff, #0099ff)", color: "#0a0e27", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 11, fontWeight: 800 }}>▶ WATCH NOW</button>
-          <button onClick={() => setJoinStreamPrompt(null)} style={{ padding: "5px 14px", background: "rgba(255,255,255,0.05)", color: "#a0b0d0", border: "1px solid #334", borderRadius: 8, cursor: "pointer", fontSize: 10 }}>Later</button>
-        </div>
-      </div>
-    </div>
-  );
-
-  // AnyScreen pinned banner — Option A: persistent until host clears it
-  const anyScreenBanner = anyScreenCode && (
-    <div style={{
-      position: "fixed", top: isMobile ? (joinStreamPrompt ? 150 : 60) : (joinStreamPrompt ? 160 : 70),
-      left: isMobile ? 12 : "50%", right: isMobile ? 12 : "auto",
-      transform: isMobile ? "none" : "translateX(-50%)", zIndex: 2400,
-    }}>
-      <div style={{
-        background: "linear-gradient(135deg, #0a1f0e, #0d2e14)",
-        padding: "12px 16px", border: "2px solid #00cc66", borderRadius: 14,
-        display: "flex", alignItems: "center", gap: 12,
-        boxShadow: "0 0 30px rgba(0,204,102,0.35)", maxWidth: 460,
-        animation: "slideIn 0.35s ease",
-      }}>
-        <span style={{ fontSize: 26, flexShrink: 0 }}>📱</span>
-        <div style={{ flex: 1 }}>
-          <div style={{ color: "#00cc66", fontSize: 11, fontWeight: 800, letterSpacing: 1 }}>📲 ANYSCREEN MOBILE SHARE</div>
+          <div style={{ color: "#00d4ff", fontSize: 12, fontWeight: 700 }}>📺 Stream Joined</div>
           <div style={{ color: "#e8f0ff", fontSize: 11, marginTop: 2 }}>
-            Open <strong style={{ color: "#00cc66" }}>AnyScreen</strong> and enter this code:
-          </div>
-          <div style={{ fontFamily: "monospace", fontSize: 22, fontWeight: 900, color: "#00ff88", letterSpacing: 6, marginTop: 4 }}>
-            {anyScreenCode.code}
+            <strong>{joinStreamPrompt.hostUserId}</strong> started streaming — you are auto-connected!
           </div>
         </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 5, flexShrink: 0 }}>
-          <button
-            onClick={() => { navigator.clipboard.writeText(anyScreenCode.code); notify("AnyScreen code copied!", "success"); }}
-            style={{ padding: "6px 12px", background: "linear-gradient(135deg, #00cc66, #009944)", color: "#050915", border: "none", borderRadius: 7, cursor: "pointer", fontSize: 11, fontWeight: 800 }}
-          >📋 COPY</button>
-          {iAmRoomHost && (
-            <button onClick={clearAnyScreenCode} style={{ padding: "4px 12px", background: "rgba(255,0,0,0.1)", color: "#ff6666", border: "1px solid #ff4444", borderRadius: 7, cursor: "pointer", fontSize: 9 }}>✖ END</button>
-          )}
-          {!iAmRoomHost && (
-            <button onClick={() => setAnyScreenCode(null)} style={{ padding: "4px 12px", background: "rgba(255,255,255,0.05)", color: "#a0b0d0", border: "1px solid #334", borderRadius: 7, cursor: "pointer", fontSize: 9 }}>✖ Hide</button>
-          )}
-        </div>
+        <button onClick={() => setJoinStreamPrompt(null)} style={{ padding: "7px 10px", background: "rgba(255,0,0,0.1)", color: "#ff6666", border: "1px solid #ff4444", borderRadius: 7, cursor: "pointer", fontSize: 11, flexShrink: 0 }}>✖</button>
       </div>
     </div>
   );
@@ -1403,15 +1231,8 @@ export default function App() {
               {isStreaming ? "⏹ END" : "▶ STREAM"}
             </button>
           )}
-          {/* Camera: all members can turn on; Screen share: host only */}
           <button onClick={toggleWebcam} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isWebcamOn ? "#00d4ff" : "#334"}`, background: isWebcamOn ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isWebcamOn ? "#00d4ff" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>📹</button>
-          {iAmRoomHost && (
-            <button onClick={toggleScreenShare} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isScreenSharing ? "#00d4ff" : "#334"}`, background: isScreenSharing ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isScreenSharing ? "#00d4ff" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>🖥️</button>
-          )}
-          {/* AnyScreen button — host only, mobile screen share via code */}
-          {iAmRoomHost && currentRoom && (
-            <button onClick={() => setShowAnyScreenModal(true)} title="Share AnyScreen mobile code" style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${anyScreenCode ? "#00cc66" : "#334"}`, background: anyScreenCode ? "rgba(0,204,102,0.2)" : "rgba(0,0,0,0.3)", color: anyScreenCode ? "#00cc66" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>📱</button>
-          )}
+          <button onClick={toggleScreenShare} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isScreenSharing ? "#00d4ff" : "#334"}`, background: isScreenSharing ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isScreenSharing ? "#00d4ff" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>🖥️</button>
           {(isStreaming || joinedStreamHostId) && (
             <button onClick={toggleMic} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#334"}`, background: isMuted ? "rgba(255,170,0,0.15)" : isMicOn ? "rgba(0,255,0,0.15)" : "rgba(0,0,0,0.3)", color: isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>{isMuted ? "🔇" : isMicOn ? "🎙️" : "🔇"}</button>
           )}
@@ -1461,15 +1282,12 @@ export default function App() {
               <div className="chat-messages-scroll" style={{ flex: 1, overflowY: "auto", padding: 10, display: "flex", flexDirection: "column", gap: 6 }}>
                 {chatMessages.length === 0
                   ? <div style={{ color: "#a0b0d0", fontSize: 11, textAlign: "center", marginTop: 20, opacity: 0.6 }}>Chat is empty. Say something!</div>
-                  : chatMessages.map(msg => {
-                    const isAnyScreen = msg.sender === "📱 ANYSCREEN";
-                    return (
-                      <div key={msg.id} style={{ padding: "8px 12px", background: isAnyScreen ? "rgba(0,204,102,0.12)" : "rgba(0,99,255,0.1)", borderLeft: `3px solid ${isAnyScreen ? "#00cc66" : "#00d4ff"}`, borderRadius: 8 }}>
-                        <div style={{ color: isAnyScreen ? "#00cc66" : "#0099ff", fontWeight: 700, fontSize: 10 }}>{msg.sender}:</div>
-                        <div style={{ color: "#e8f0ff", marginTop: 2, wordBreak: "break-word", fontSize: 13 }}>{msg.text}</div>
-                      </div>
-                    );
-                  })}
+                  : chatMessages.map(msg => (
+                    <div key={msg.id} style={{ padding: "8px 12px", background: "rgba(0,99,255,0.1)", borderLeft: "3px solid #00d4ff", borderRadius: 8 }}>
+                      <div style={{ color: "#0099ff", fontWeight: 700, fontSize: 10 }}>{msg.sender}:</div>
+                      <div style={{ color: "#e8f0ff", marginTop: 2, wordBreak: "break-word", fontSize: 13 }}>{msg.text}</div>
+                    </div>
+                  ))}
                 <div ref={chatEndRef} />
               </div>
               <div style={{ display: "flex", overflowX: "auto", gap: 6, padding: "8px 10px", borderTop: "1px solid #004d7f", background: "rgba(0,0,0,0.3)", flexShrink: 0 }}>
@@ -1547,7 +1365,6 @@ export default function App() {
         </div>
 
         {streamNotifBanner}
-        {anyScreenBanner}
         {sharedModals}
         {notificationsUI}
         {chatPopupsUI}
@@ -1582,14 +1399,10 @@ export default function App() {
           <div style={panelSt}>
             <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
               {[
-                // STREAM button only visible to host
+                // Fix 3: STREAM button only visible to host (canStartStream)
                 ...(canStartStream ? [{ icon: isStreaming ? "⏹" : "▶", label: "STREAM", active: isStreaming, onClick: handleStreamButtonClick, color: isStreaming ? "#ff4444" : "#00d4ff" }] : []),
-                // Camera: all members; Screen + AnyScreen: host only
                 { icon: "📹", label: "CAMERA", active: isWebcamOn, onClick: toggleWebcam, color: "#00d4ff" },
-                ...(iAmRoomHost ? [
-                  { icon: "🖥️", label: "SCREEN", active: isScreenSharing, onClick: toggleScreenShare, color: "#00d4ff" },
-                  { icon: "📱", label: "MOBILE", active: !!anyScreenCode, onClick: () => setShowAnyScreenModal(true), color: "#00cc66" },
-                ] : []),
+                { icon: "🖥️", label: "SCREEN", active: isScreenSharing, onClick: toggleScreenShare, color: "#00d4ff" },
                 { icon: "👥", label: "TEAM", active: false, onClick: () => setShowTeamModal(true), color: "#00d4ff" },
               ].map(btn => (
                 <div key={btn.label} onClick={btn.onClick} title={btn.label} style={{ width: 56, height: 56, borderRadius: "50%", cursor: "pointer", userSelect: "none", background: btn.active ? `linear-gradient(135deg, ${btn.color}, ${btn.color}aa)` : "rgba(0,212,255,0.1)", border: `2px solid ${btn.color}`, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", boxShadow: btn.active ? `0 0 28px ${btn.color}88` : `0 0 6px ${btn.color}22`, transition: "all .3s" }}>
@@ -1701,15 +1514,12 @@ export default function App() {
             <div className="chat-messages-scroll" style={{ flex: 1, overflowY: "auto", padding: 8, display: "flex", flexDirection: "column", gap: 5, minHeight: 0 }}>
               {chatMessages.length === 0
                 ? <div style={{ color: "#a0b0d0", fontSize: 10, textAlign: "center", marginTop: 16, opacity: .5 }}>Chat is empty. Say something!</div>
-                : chatMessages.map(msg => {
-                  const isAnyScreen = msg.sender === "📱 ANYSCREEN";
-                  return (
-                    <div key={msg.id} style={{ padding: "5px 8px", background: isAnyScreen ? "rgba(0,204,102,0.12)" : "rgba(0,99,255,0.1)", borderLeft: `3px solid ${isAnyScreen ? "#00cc66" : "#00d4ff"}`, borderRadius: 6 }}>
-                      <div style={{ color: isAnyScreen ? "#00cc66" : "#0099ff", fontWeight: 700, fontSize: 9 }}>{msg.sender}:</div>
-                      <div style={{ color: "#e8f0ff", marginTop: 2, wordBreak: "break-word", fontSize: 11 }}>{msg.text}</div>
-                    </div>
-                  );
-                })}
+                : chatMessages.map(msg => (
+                  <div key={msg.id} style={{ padding: "5px 8px", background: "rgba(0,99,255,0.1)", borderLeft: "3px solid #00d4ff", borderRadius: 6 }}>
+                    <div style={{ color: "#0099ff", fontWeight: 700, fontSize: 9 }}>{msg.sender}:</div>
+                    <div style={{ color: "#e8f0ff", marginTop: 2, wordBreak: "break-word", fontSize: 11 }}>{msg.text}</div>
+                  </div>
+                ))}
               <div ref={chatEndRef} />
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 4, padding: "6px 8px", borderTop: "1px solid #004d7f", background: "rgba(0,0,0,0.2)", flexShrink: 0 }}>
@@ -1787,8 +1597,6 @@ export default function App() {
       )}
 
       {streamNotifBanner}
-      {anyScreenBanner}
-      {incomingReqsUI}
       {sharedModals}
       {notificationsUI}
       {chatPopupsUI}
@@ -1805,25 +1613,6 @@ function RemoteVideoEl({ stream, peerId, videoRefs, small }: { stream: MediaStre
     return () => { videoRefs.current.delete(peerId); };
   }, [stream, peerId]);
   return <video ref={ref} autoPlay playsInline style={{ width: "100%", height: "100%", objectFit: small ? "cover" : "contain", position: small ? "relative" : "absolute", inset: 0, background: "#000" }} />;
-}
-
-function MemberCamVideoEl({ stream, userId, avatar }: { stream: MediaStream | null; userId: string; avatar: string }) {
-  const ref = useRef<HTMLVideoElement>(null);
-  useEffect(() => {
-    if (!ref.current || !stream) return;
-    if (ref.current.srcObject !== stream) { ref.current.srcObject = stream; ref.current.play().catch(() => {}); }
-  }, [stream]);
-  return (
-    <div style={{ width: 140, background: "#0a0e27", border: "2px solid #00d4ff55", borderRadius: 10, overflow: "hidden", boxShadow: "0 0 14px rgba(0,212,255,0.25)", flexShrink: 0 }}>
-      <div style={{ background: "rgba(0,212,255,0.1)", padding: "3px 8px", fontSize: 9, color: "#00d4ff", fontWeight: 700, display: "flex", alignItems: "center", gap: 4 }}>
-        <span>{avatar}</span><span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{userId}</span>
-      </div>
-      {stream
-        ? <video ref={ref} autoPlay playsInline muted style={{ width: "100%", height: 100, objectFit: "cover", display: "block", background: "#000" }} />
-        : <div style={{ width: "100%", height: 100, display: "flex", alignItems: "center", justifyContent: "center", color: "#334", fontSize: 24 }}>📹</div>
-      }
-    </div>
-  );
 }
 
 function ModalOverlay({ children, onClose }: { children: React.ReactNode; onClose: () => void }) {

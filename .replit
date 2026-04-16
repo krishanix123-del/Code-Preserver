@@ -30,10 +30,6 @@ args = "Start Backend"
 task = "workflow.run"
 args = "Start application"
 
-[[workflows.workflow.tasks]]
-task = "workflow.run"
-args = "Start Mobile"
-
 [[workflows.workflow]]
 name = "Start Backend"
 author = "agent"
@@ -57,18 +53,6 @@ waitForPort = 19783
 
 [workflows.workflow.metadata]
 outputType = "webview"
-
-[[workflows.workflow]]
-name = "Start Mobile"
-author = "agent"
-
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "PORT=18940 BASE_PATH=/nexuscast-mobile/ pnpm --filter @workspace/nexuscast-mobile run dev"
-waitForPort = 18940
-
-[workflows.workflow.metadata]
-outputType = "console"
 
 [agent]
 stack = "PNPM_WORKSPACE"
