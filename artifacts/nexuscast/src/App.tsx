@@ -505,6 +505,12 @@ export default function App() {
     }
   }
 
+  // Phones do not support browser screen-sharing (no getDisplayMedia on iOS, and Android browsers/WebViews don't expose it for capturing the device screen). Detect once.
+  const isMobileDevice = useMemo(() => {
+    const ua = navigator.userAgent || "";
+    return _isNativeApp || /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
+  }, []);
+
   // Screen share toggle — does NOT end stream
   async function toggleScreenShare() {
     if (isScreenSharing) {
@@ -514,15 +520,8 @@ export default function App() {
       } catch (e) { console.error("screen off:", e); }
       return;
     }
-    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
-    const isAndroidWebView = _isNativeApp || /wv/.test(navigator.userAgent) || (/Android/.test(navigator.userAgent) && /Version\/[\d.]+/.test(navigator.userAgent));
-    if (isAndroidWebView && !isIOS) {
-      postToNative({ type: "open_in_browser_for_screen_share", url: window.location.href });
-      return;
-    }
-    if (!navigator.mediaDevices?.getDisplayMedia || isIOS) {
-      notify(isIOS ? "Screen sharing is not available on iOS. Use Camera instead."
-                   : "Screen sharing is not supported on this browser. Try Chrome or Firefox on desktop.", "error");
+    if (isMobileDevice || !navigator.mediaDevices?.getDisplayMedia) {
+      notify("Screen sharing only works on a desktop browser (Chrome / Edge / Firefox / Safari). Use the camera here, or share your screen from a laptop in this same room.", "warning");
       return;
     }
     try {
@@ -931,7 +930,7 @@ export default function App() {
             </button>
           )}
           <button onClick={toggleWebcam} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isWebcamOn ? "#00d4ff" : "#334"}`, background: isWebcamOn ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isWebcamOn ? "#00d4ff" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>📹</button>
-          <button onClick={toggleScreenShare} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isScreenSharing ? "#00d4ff" : "#334"}`, background: isScreenSharing ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isScreenSharing ? "#00d4ff" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>🖥️</button>
+          <button onClick={toggleScreenShare} title={isMobileDevice ? "Screen share is desktop-only" : "Share your screen"} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isScreenSharing ? "#00d4ff" : "#334"}`, background: isScreenSharing ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isScreenSharing ? "#00d4ff" : (isMobileDevice ? "#445" : "#667"), fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", opacity: isMobileDevice ? 0.45 : 1, position: "relative" }}>🖥️{isMobileDevice && <span style={{ position: "absolute", top: -3, right: -3, fontSize: 10, color: "#a0b0d0", background: "#0a0e27", borderRadius: "50%", width: 14, height: 14, display: "flex", alignItems: "center", justifyContent: "center", border: "1px solid #334" }}>💻</span>}</button>
           {(isStreaming || joinedStreamHostId) && (
             <button onClick={toggleMic} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#334"}`, background: isMuted ? "rgba(255,170,0,0.15)" : isMicOn ? "rgba(0,255,0,0.15)" : "rgba(0,0,0,0.3)", color: isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>{isMuted ? "🔇" : isMicOn ? "🎙️" : "🔇"}</button>
           )}
@@ -1101,7 +1100,7 @@ export default function App() {
                 // Fix 3: STREAM button only visible to host (canStartStream)
                 ...(canStartStream ? [{ icon: isStreaming ? "⏹" : "▶", label: "STREAM", active: isStreaming, onClick: handleStreamButtonClick, color: isStreaming ? "#ff4444" : "#00d4ff" }] : []),
                 { icon: "📹", label: "CAMERA", active: isWebcamOn, onClick: toggleWebcam, color: "#00d4ff" },
-                { icon: "🖥️", label: "SCREEN", active: isScreenSharing, onClick: toggleScreenShare, color: "#00d4ff" },
+                { icon: "🖥️", label: isMobileDevice ? "DESKTOP" : "SCREEN", active: isScreenSharing, onClick: toggleScreenShare, color: isMobileDevice ? "#667" : "#00d4ff", disabled: isMobileDevice },
                 { icon: "👥", label: "TEAM", active: false, onClick: () => setShowTeamModal(true), color: "#00d4ff" },
               ].map(btn => (
                 <div key={btn.label} onClick={btn.onClick} title={btn.label} style={{ width: 56, height: 56, borderRadius: "50%", cursor: "pointer", userSelect: "none", background: btn.active ? `linear-gradient(135deg, ${btn.color}, ${btn.color}aa)` : "rgba(0,212,255,0.1)", border: `2px solid ${btn.color}`, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", boxShadow: btn.active ? `0 0 28px ${btn.color}88` : `0 0 6px ${btn.color}22`, transition: "all .3s" }}>
