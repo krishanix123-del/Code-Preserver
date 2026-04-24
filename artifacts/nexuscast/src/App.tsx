@@ -73,6 +73,7 @@ export default function App() {
     isCameraOn: isWebcamOn,
     isScreenOn: isScreenSharing,
     isMicOn,
+    qualities,
   } = lk;
 
   // Map LiveKit identity (= userId) → MediaStream for the focused viewer
@@ -906,6 +907,11 @@ export default function App() {
             </div>
           )}
           {isStreaming && <div style={{ position: "absolute", top: 8, right: 8, background: "rgba(255,0,0,0.25)", padding: "3px 8px", borderRadius: 12, fontSize: 9, fontWeight: 700, color: "#ff4444", border: "1px solid #ff4444", animation: "statusBlink 1s infinite" }}>● LIVE</div>}
+          {(showLocalCenter || showRemoteCenter) && (() => {
+            const tileIdent = showLocalCenter ? userId : (focusedStream?.peerId ?? remoteStreams[0]?.peerId);
+            const tileLabel = showLocalCenter ? "You" : tileIdent;
+            return tileIdent ? <QualityDot quality={qualities[tileIdent] as NetQ | undefined} label={tileLabel} style={{ top: 8, left: 8 }} /> : null;
+          })()}
           {!audioUnlocked && remoteStreams.length > 0 && (
             <div onClick={unlockAudio} style={{ position: "absolute", bottom: 8, left: "50%", transform: "translateX(-50%)", background: "rgba(0,212,255,0.2)", border: "1px solid #00d4ff", borderRadius: 16, padding: "6px 16px", fontSize: 10, color: "#00d4ff" }}>🔊 Tap to enable audio</div>
           )}
@@ -1168,6 +1174,12 @@ export default function App() {
                   : null
             )}
 
+            {(showLocalCenter || showRemoteCenter) && (() => {
+              const tileIdent = showLocalCenter ? userId : (focusedStream?.peerId ?? remoteStreams[0]?.peerId);
+              const tileLabel = showLocalCenter ? "You" : tileIdent;
+              return tileIdent ? <QualityDot quality={qualities[tileIdent] as NetQ | undefined} label={tileLabel} style={{ top: 10, left: 140 }} /> : null;
+            })()}
+
             {!audioUnlocked && remoteStreams.length > 0 && (
               <div onClick={unlockAudio} style={{ position: "absolute", bottom: 60, left: "50%", transform: "translateX(-50%)", background: "rgba(0,212,255,0.2)", border: "1px solid #00d4ff", borderRadius: 20, padding: "8px 20px", cursor: "pointer", fontSize: 11, color: "#00d4ff", zIndex: 20 }}>🔊 Click to enable audio</div>
             )}
@@ -1307,6 +1319,20 @@ export default function App() {
       {sharedModals}
       {notificationsUI}
       {chatPopupsUI}
+    </div>
+  );
+}
+
+type NetQ = "excellent" | "good" | "poor" | "lost" | "unknown";
+function QualityDot({ quality, label, style }: { quality: NetQ | undefined; label?: string; style?: React.CSSProperties }) {
+  const q = quality ?? "unknown";
+  const colorMap: Record<NetQ, string> = { excellent: "#22c55e", good: "#84cc16", poor: "#f59e0b", lost: "#ef4444", unknown: "#94a3b8" };
+  const labelMap: Record<NetQ, string> = { excellent: "Excellent", good: "Good", poor: "Poor", lost: "Reconnecting", unknown: "—" };
+  const c = colorMap[q];
+  return (
+    <div title={`Network: ${labelMap[q]}`} style={{ position: "absolute", display: "inline-flex", alignItems: "center", gap: 5, background: "rgba(0,14,39,0.85)", border: `1px solid ${c}66`, padding: "3px 8px", borderRadius: 12, fontSize: 9, fontWeight: 700, color: c, zIndex: 16, pointerEvents: "none", ...(style ?? {}) }}>
+      <span style={{ width: 7, height: 7, borderRadius: "50%", background: c, boxShadow: `0 0 6px ${c}` }} />
+      {label && <span style={{ color: "#cfd8e8", fontWeight: 600, fontSize: 9 }}>{label}</span>}
     </div>
   );
 }

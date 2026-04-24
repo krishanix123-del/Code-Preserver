@@ -4,14 +4,27 @@ import {
   RoomEvent,
   Track,
   ConnectionState,
+  ConnectionQuality,
   VideoPresets,
   ScreenSharePresets,
   type RemoteTrack,
   type RemoteTrackPublication,
   type RemoteParticipant,
+  type Participant,
 } from "livekit-client";
 
 export type RemoteSource = "camera" | "screen";
+export type NetQuality = "excellent" | "good" | "poor" | "lost" | "unknown";
+
+function mapQuality(q: ConnectionQuality): NetQuality {
+  switch (q) {
+    case ConnectionQuality.Excellent: return "excellent";
+    case ConnectionQuality.Good: return "good";
+    case ConnectionQuality.Poor: return "poor";
+    case ConnectionQuality.Lost: return "lost";
+    default: return "unknown";
+  }
+}
 
 export interface RemoteVideoTrack {
   identity: string;
@@ -34,6 +47,7 @@ export function useLiveKit() {
   const [isCameraOn, setIsCameraOn] = useState(false);
   const [isScreenOn, setIsScreenOn] = useState(false);
   const [isMicOn, setIsMicOn] = useState(false);
+  const [qualities, setQualities] = useState<Record<string, NetQuality>>({});
 
   const updateLocalStreams = useCallback(() => {
     const room = roomRef.current;
@@ -112,6 +126,21 @@ export function useLiveKit() {
       setRemoteVideos((prev) =>
         prev.filter((r) => r.identity !== participant.identity),
       );
+      setQualities((prev) => {
+        const next = { ...prev };
+        delete next[participant.identity];
+        return next;
+      });
+    },
+    [],
+  );
+
+  const handleQualityChanged = useCallback(
+    (quality: ConnectionQuality, participant: Participant) => {
+      setQualities((prev) => ({
+        ...prev,
+        [participant.identity]: mapQuality(quality),
+      }));
     },
     [],
   );
@@ -131,6 +160,7 @@ export function useLiveKit() {
     setIsScreenOn(false);
     setIsMicOn(false);
     setRemoteVideos([]);
+    setQualities({});
   }, []);
 
   const connect = useCallback(
@@ -168,6 +198,7 @@ export function useLiveKit() {
       room.on(RoomEvent.ParticipantDisconnected, handleParticipantDisconnected);
       room.on(RoomEvent.LocalTrackPublished, updateLocalStreams);
       room.on(RoomEvent.LocalTrackUnpublished, updateLocalStreams);
+      room.on(RoomEvent.ConnectionQualityChanged, handleQualityChanged);
       room.on(RoomEvent.ConnectionStateChanged, (state: ConnectionState) => {
         setConnected(state === ConnectionState.Connected);
       });
@@ -179,14 +210,22 @@ export function useLiveKit() {
         setIsCameraOn(false);
         setIsScreenOn(false);
         setIsMicOn(false);
+        setQualities({});
       });
 
       await room.connect(url, token, { autoSubscribe: true });
       roomRef.current = room;
       setConnected(true);
 
-      // Hydrate already-subscribed tracks (if any)
+      // Seed local quality
+      setQualities((prev) => ({
+        ...prev,
+        [room.localParticipant.identity]: mapQuality(room.localParticipant.connectionQuality),
+      }));
+
+      // Hydrate already-subscribed tracks + qualities (if any)
       room.remoteParticipants.forEach((p) => {
+        setQualities((prev) => ({ ...prev, [p.identity]: mapQuality(p.connectionQuality) }));
         p.videoTrackPublications.forEach((pub) => {
           if (pub.track) handleTrackSubscribed(pub.track, pub, p);
         });
@@ -199,6 +238,7 @@ export function useLiveKit() {
       handleTrackSubscribed,
       handleTrackUnsubscribed,
       handleParticipantDisconnected,
+      handleQualityChanged,
       updateLocalStreams,
     ],
   );
@@ -289,5 +329,6 @@ export function useLiveKit() {
     isCameraOn,
     isScreenOn,
     isMicOn,
+    qualities,
   };
 }
