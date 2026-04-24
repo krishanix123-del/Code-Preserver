@@ -25,3 +25,21 @@ pnpm workspace monorepo using TypeScript. Each package manages its own dependenc
 - `pnpm --filter @workspace/api-server run dev` — run API server locally
 
 See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details.
+
+## NexusCast App
+
+Room-based video/screen-share/chat app under `artifacts/nexuscast` (web), `artifacts/nexuscast-mobile` (Expo WebView shell), with signaling backend at `artifacts/api-server`.
+
+### Media architecture: LiveKit SFU
+
+Media (camera, screen share, mic) goes through a LiveKit Cloud SFU instead of a custom WebRTC mesh. This eliminates the N×N peer connection load and gives reliable mobile screen-share with simulcast + adaptive stream.
+
+- **Server creds (Replit Secrets)**: `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`
+- **Token endpoint**: `GET /api/livekit/config` and `GET /api/livekit/token?room=...&identity=...&name=...` — mints a 6h `roomJoin` token with publish + subscribe.
+- **Backend route**: `artifacts/api-server/src/routes/livekit.ts` (uses `livekit-server-sdk`)
+- **Frontend hook**: `artifacts/nexuscast/src/lib/livekit.ts` — `useLiveKit()` exposes `connect/disconnect/setCamera/setScreen/setMic`, `localCameraStream`, `localScreenStream`, `remoteVideos[{identity, source, stream}]`, `isCameraOn/isScreenOn/isMicOn`. Configured with adaptiveStream + dynacast + simulcast (h180/h360/h720 VP8) and screenShare h720fps15 → h1080fps15.
+- **Identity convention**: LiveKit `identity` = app `userId` (so remote tracks line up with `members[].userId` from the socket presence list).
+
+### Signaling (socket.io, unchanged)
+
+`artifacts/api-server/src/signaling.ts` still handles room presence, host transfer, kick, mute, chat, name-change, and join-stream-request flows over socket.io. The old `offer`/`answer`/`ice-candidate` socket forwarders were removed — LiveKit handles all WebRTC negotiation.
