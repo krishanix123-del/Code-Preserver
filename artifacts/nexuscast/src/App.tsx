@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { io, Socket } from "socket.io-client";
 import QRCode from "qrcode";
-import { useLiveKit } from "./lib/livekit";
 
 const AVATARS = ["👤", "👨", "🧑", "👦", "👩", "👧", "👸", "🧔", "👱", "🦸", "🧙", "🤖"];
 
@@ -27,6 +26,20 @@ const QUICK_MSGS = [
   { label: "✅ Clear", text: "All clear ✅" },
 ];
 
+const RTC_CONFIG: RTCConfiguration = {
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+    { urls: "stun:stun2.l.google.com:19302" },
+    { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
+    { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
+    { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
+  ],
+  iceCandidatePoolSize: 10,
+  bundlePolicy: "max-bundle",
+  rtcpMuxPolicy: "require",
+};
+
 interface ChatMessage { id: number; sender: string; text: string; }
 interface Member { peerId: string; userId: string; avatar: string; isFav: boolean; isStreaming: boolean; isRoomHost: boolean; }
 interface RemoteStream { peerId: string; stream: MediaStream; }
@@ -44,7 +57,9 @@ let _msgId = 0, _notifId = 0, _popupId = 0;
 
 export default function App() {
   const [isStreaming, setIsStreaming] = useState(false);
-  // isWebcamOn / isScreenSharing / isMicOn are sourced from the LiveKit hook below
+  const [isWebcamOn, setIsWebcamOn] = useState(false);
+  const [isScreenSharing, setIsScreenSharing] = useState(false);
+  const [isMicOn, setIsMicOn] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [streamSec, setStreamSec] = useState(0);
   const [currentRoom, setCurrentRoom] = useState<string | null>(null);
@@ -55,50 +70,11 @@ export default function App() {
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [members, setMembers] = useState<Member[]>([]);
+  const [remoteStreams, setRemoteStreams] = useState<RemoteStream[]>([]);
+  const [focusedStream, setFocusedStream] = useState<RemoteStream | null>(null);
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [isConnected, setIsConnected] = useState(false);
   const [audioUnlocked, setAudioUnlocked] = useState(false);
-
-  // LiveKit media layer: SFU-backed publish/subscribe (replaces P2P mesh)
-  const lk = useLiveKit();
-  const {
-    connect: lkConnect,
-    disconnect: lkDisconnect,
-    setCamera: lkSetCamera,
-    setScreen: lkSetScreen,
-    setMic: lkSetMic,
-    localCameraStream,
-    localScreenStream,
-    remoteVideos,
-    isCameraOn: isWebcamOn,
-    isScreenOn: isScreenSharing,
-    isMicOn,
-    qualities,
-  } = lk;
-
-  // Map LiveKit identity (= userId) → MediaStream for the focused viewer
-  // remoteStreams here are derived from LiveKit's remoteVideos and use identity as the key
-  const remoteStreams: RemoteStream[] = useMemo(
-    () => remoteVideos.map(rv => ({ peerId: rv.identity, stream: rv.stream })),
-    [remoteVideos],
-  );
-
-  const [focusedIdentity, setFocusedIdentity] = useState<string | null>(null);
-  const focusedStream: RemoteStream | null = useMemo(() => {
-    // Prefer screen share over camera for the same identity
-    if (focusedIdentity) {
-      const screen = remoteVideos.find(r => r.identity === focusedIdentity && r.source === "screen");
-      const cam = remoteVideos.find(r => r.identity === focusedIdentity && r.source === "camera");
-      const pick = screen ?? cam;
-      if (pick) return { peerId: pick.identity, stream: pick.stream };
-    }
-    if (remoteVideos.length > 0) {
-      const screen = remoteVideos.find(r => r.source === "screen");
-      const pick = screen ?? remoteVideos[0];
-      return { peerId: pick.identity, stream: pick.stream };
-    }
-    return null;
-  }, [focusedIdentity, remoteVideos]);
 
   const [localNicknames, setLocalNicknames] = useState<Record<string, string>>({});
   // Fix 2: joinStreamPrompt shows notification banner only (no accept/decline)
@@ -116,6 +92,8 @@ export default function App() {
   const [showTeamModal, setShowTeamModal] = useState(false);
   const [showJoinModal, setShowJoinModal] = useState(false);
   const [showShareModal, setShowShareModal] = useState(false);
+  // Modal that asks the host whether to share the screen WITH audio (system/tab audio) or WITHOUT audio
+  const [showScreenAudioModal, setShowScreenAudioModal] = useState(false);
   const [showEditIdModal, setShowEditIdModal] = useState(false);
   const [showAvatarModal, setShowAvatarModal] = useState(false);
   const [showChangeNameModal, setShowChangeNameModal] = useState<{ peerId: string } | null>(null);
@@ -136,8 +114,12 @@ export default function App() {
 
   const streamTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const screenStreamRef = useRef<MediaStream | null>(null);
+  const audioStreamRef = useRef<MediaStream | null>(null); // room mic (mesh audio)
   const miniVideoRef = useRef<HTMLVideoElement>(null);
   const localCenterRef = useRef<HTMLVideoElement>(null);
+  const pcsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const socketRef = useRef<Socket | null>(null);
   const remoteVideoRefs = useRef<Map<string, HTMLVideoElement>>(new Map());
 
@@ -146,6 +128,8 @@ export default function App() {
   const isStreamingRef = useRef(isStreaming);
   const currentRoomRef = useRef(currentRoom);
   const iAmRoomHostRef = useRef(iAmRoomHost);
+  const isScreenSharingRef = useRef(isScreenSharing);
+  const isWebcamOnRef = useRef(isWebcamOn);
 
   const notify = useCallback((message: string, type: Notification["type"] = "info") => {
     const id = ++_notifId;
@@ -179,36 +163,13 @@ export default function App() {
     };
   }, []);
 
-  // Sync local camera stream into the mini PIP whenever it changes (screen-sharing-with-camera)
+  // Sync camera stream into miniVideoRef whenever screen sharing turns on with camera active
   useEffect(() => {
-    if (isWebcamOn && isScreenSharing && miniVideoRef.current && localCameraStream) {
-      if (miniVideoRef.current.srcObject !== localCameraStream) {
-        miniVideoRef.current.srcObject = localCameraStream;
-      }
+    if (isWebcamOn && isScreenSharing && miniVideoRef.current && localStreamRef.current) {
+      miniVideoRef.current.srcObject = localStreamRef.current;
       miniVideoRef.current.play().catch(() => {});
     }
-  }, [isWebcamOn, isScreenSharing, localCameraStream]);
-
-  // Sync local center video: prefer screen share, fall back to camera, only when no remote is shown
-  useEffect(() => {
-    const el = localCenterRef.current;
-    if (!el) return;
-    const showLocal = (isWebcamOn || isScreenSharing) && remoteVideos.length === 0;
-    if (!showLocal) {
-      if (el.srcObject) {
-        el.pause();
-        el.srcObject = null;
-        el.load();
-      }
-      return;
-    }
-    const stream = isScreenSharing ? localScreenStream : localCameraStream;
-    if (!stream) return;
-    if (el.srcObject !== stream) {
-      el.srcObject = stream;
-    }
-    el.play().catch(() => {});
-  }, [isWebcamOn, isScreenSharing, localCameraStream, localScreenStream, remoteVideos.length]);
+  }, [isWebcamOn, isScreenSharing]);
 
   // Fix 8: mobile detection
   useEffect(() => {
@@ -224,6 +185,8 @@ export default function App() {
   useEffect(() => { isStreamingRef.current = isStreaming; }, [isStreaming]);
   useEffect(() => { currentRoomRef.current = currentRoom; }, [currentRoom]);
   useEffect(() => { iAmRoomHostRef.current = iAmRoomHost; }, [iAmRoomHost]);
+  useEffect(() => { isScreenSharingRef.current = isScreenSharing; }, [isScreenSharing]);
+  useEffect(() => { isWebcamOnRef.current = isWebcamOn; }, [isWebcamOn]);
 
   // Generate QR code whenever shareCode changes
   useEffect(() => {
@@ -311,6 +274,8 @@ export default function App() {
       setIAmRoomHost(iAmHost);
       peers.forEach(({ peerId, userId: uid, avatar, isStreaming: streaming, isRoomHost }) => {
         setMembers(p => p.find(m => m.peerId === peerId) ? p : [...p, { peerId, userId: uid, avatar, isFav: false, isStreaming: streaming, isRoomHost }]);
+        // Always connect so the host can push video later via renegotiation
+        connectToPeer(peerId, socket);
         if (streaming) {
           // Show join/skip prompt — member decides whether to watch the active stream
           setJoinStreamPrompt({ hostPeerId: peerId, hostUserId: uid });
@@ -324,7 +289,7 @@ export default function App() {
       notify(`${uid} joined the room`, "info");
       addMsg("⚡ SYSTEM", `${uid} joined`);
       setMembers(p => p.find(m => m.peerId === peerId) ? p : [...p, { peerId, userId: uid, avatar, isFav: false, isStreaming: false, isRoomHost }]);
-      // If we're already streaming, notify the new peer (LiveKit auto-delivers media)
+      // Don't initiate — the new peer sends offers to existing peers; just notify if we're streaming
       if (isStreamingRef.current) socket.emit("start-stream");
     });
 
@@ -334,14 +299,18 @@ export default function App() {
       setJoinStreamPrompt({ hostPeerId: peerId, hostUserId: uid });
       addMsg("⚡ SYSTEM", `${uid} started streaming — click Join Stream to watch!`);
       notify(`📡 ${uid} started streaming!`, "info");
+      // Establish WebRTC connection now so tracks are ready when they choose to join
+      if (!pcsRef.current.has(peerId)) connectToPeer(peerId, socket);
     });
 
     socket.on("peer-stopped-stream", ({ peerId }: { peerId: string }) => {
       setMembers(p => p.map(m => m.peerId === peerId ? { ...m, isStreaming: false } : m));
       setJoinStreamPrompt(null);
-      // Find userId for this peer to clear focused identity if it matched
-      const stoppedUserId = members.find(m => m.peerId === peerId)?.userId;
-      if (stoppedUserId) setFocusedIdentity(prev => prev === stoppedUserId ? null : prev);
+      // Fix 7: clear remote video immediately so no frozen frame
+      const vid = remoteVideoRefs.current.get(peerId);
+      if (vid) { vid.pause(); vid.srcObject = null; }
+      setRemoteStreams(p => p.filter(r => r.peerId !== peerId));
+      setFocusedStream(p => p?.peerId === peerId ? null : p);
       notify("Streamer stopped sharing.", "info");
     });
 
@@ -355,7 +324,7 @@ export default function App() {
       addMsg("⚡ SYSTEM", "You joined the stream!");
       setJoinedStreamHostId(hostPeerId);
       setJoinStreamPrompt(null);
-      // LiveKit subscriptions are automatic; once we render the video element, adaptive stream pulls frames
+      if (!pcsRef.current.has(hostPeerId)) connectToPeer(hostPeerId, socket);
     });
 
     socket.on("stream-join-declined", () => {
@@ -372,16 +341,18 @@ export default function App() {
     socket.on("you-were-kicked", ({ byUserId }: { byUserId: string }) => {
       notify(`🚫 You have been removed from the room by ${byUserId}`, "error");
       addMsg("⚡ SYSTEM", `You were removed from the room by ${byUserId}`);
-      lkDisconnect().catch(() => {});
-      setFocusedIdentity(null); setMembers([]);
+      pcsRef.current.forEach(pc => pc.close());
+      pcsRef.current.clear();
+      setRemoteStreams([]); setFocusedStream(null); setMembers([]);
       setCurrentRoom(null); setJoinedStreamHostId(null); setIAmRoomHost(false);
       if (_isNativeApp) postToNative({ type: "leave_room" });
     });
 
     socket.on("you-are-muted", ({ byUserId, durationMs }: { byUserId: string; durationMs: number }) => {
       notify(`🔇 You were muted by ${byUserId} for ${durationMs / 1000} seconds`, "warning");
-      setIsMuted(true);
-      lkSetMic(false).catch(() => {});
+      setIsMuted(true); setIsMicOn(false);
+      localStreamRef.current?.getAudioTracks().forEach(t => { t.enabled = false; });
+      audioStreamRef.current?.getAudioTracks().forEach(t => { t.enabled = false; });
       setTimeout(() => { setIsMuted(false); notify("You can now unmute yourself", "info"); }, durationMs);
     });
 
@@ -390,11 +361,33 @@ export default function App() {
       addMsg("⚡ SYSTEM", `Your Name Is Being Changed By The Host to "${newName}"`);
     });
 
+    socket.on("offer", async ({ from, offer }: { from: string; offer: RTCSessionDescriptionInit }) => {
+      initRoomAudio().catch(() => {}); // start mic in background, don't block answer
+      const pc = getOrCreatePC(from, socket);
+      try {
+        await pc.setRemoteDescription(new RTCSessionDescription(offer));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        socket.emit("answer", { to: from, answer });
+      } catch (err) { console.error("offer err:", err); }
+    });
+
+    socket.on("answer", async ({ from, answer }: { from: string; answer: RTCSessionDescriptionInit }) => {
+      const pc = pcsRef.current.get(from);
+      if (!pc) return;
+      try { await pc.setRemoteDescription(new RTCSessionDescription(answer)); } catch { }
+    });
+
+    socket.on("ice-candidate", async ({ from, candidate }: { from: string; candidate: RTCIceCandidateInit }) => {
+      const pc = pcsRef.current.get(from);
+      if (!pc || !candidate) return;
+      try { await pc.addIceCandidate(new RTCIceCandidate(candidate)); } catch { }
+    });
+
     socket.on("peer-left", ({ peerId, userId: uid }: { peerId: string; userId: string }) => {
       notify(`${uid} left`, "info");
       addMsg("⚡ SYSTEM", `${uid} left the room`);
-      setMembers(p => p.filter(m => m.peerId !== peerId));
-      setFocusedIdentity(prev => prev === uid ? null : prev);
+      removePeer(peerId);
     });
 
     socket.on("members-update", (list: { peerId: string; userId: string; avatar: string; isStreaming: boolean; isRoomHost: boolean }[]) => {
@@ -413,49 +406,257 @@ export default function App() {
     socket.on("host-left-room", ({ hostUserId }: { hostUserId: string }) => {
       notify(`🏠 Host (${hostUserId}) left. Room closed.`, "warning");
       addMsg("⚡ SYSTEM", `Host (${hostUserId}) has left. Room dissolved.`);
-      lkDisconnect().catch(() => {});
-      setFocusedIdentity(null); setMembers([]);
+      pcsRef.current.forEach(pc => pc.close());
+      pcsRef.current.clear();
+      setRemoteStreams([]); setFocusedStream(null); setMembers([]);
       setCurrentRoom(null); setJoinedStreamHostId(null);
       setJoinStreamPrompt(null); setIAmRoomHost(false);
       if (_isNativeApp) postToNative({ type: "leave_room" });
     });
 
     return () => {
+      pcsRef.current.forEach(pc => pc.close());
+      pcsRef.current.clear();
+      audioStreamRef.current?.getTracks().forEach(t => t.stop());
+      audioStreamRef.current = null;
       socket.disconnect();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Stream button handler — show option modal on start, end stream without leaving room
+  // Adaptive encoding: lower bitrate on mobile, separate caps for camera vs screen share
+  function applyVideoEncodingParams(pc: RTCPeerConnection, isScreenShare = false) {
+    const isMob = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+    // Mobile: camera 600 Kbps / screen 900 Kbps | Desktop: camera 1200 Kbps / screen 2000 Kbps
+    const maxBitrate = isScreenShare
+      ? (isMob ? 900_000 : 2_000_000)
+      : (isMob ? 600_000 : 1_200_000);
+    const maxFramerate = isScreenShare
+      ? (isMob ? 15 : 24)
+      : (isMob ? 24 : 30);
+
+    pc.getSenders().forEach(async sender => {
+      if (sender.track?.kind === "video") {
+        try {
+          const params = sender.getParameters();
+          if (!params.encodings || params.encodings.length === 0) {
+            params.encodings = [{}];
+          }
+          params.encodings[0].maxBitrate = maxBitrate;
+          params.encodings[0].maxFramerate = maxFramerate;
+          params.encodings[0].degradationPreference = "maintain-framerate";
+          await sender.setParameters(params);
+        } catch {}
+      }
+    });
+  }
+
+  function attachStreamToVideo(peerId: string, stream: MediaStream) {
+    const vid = remoteVideoRefs.current.get(peerId);
+    if (!vid) return;
+    if (vid.srcObject !== stream) {
+      vid.srcObject = stream;
+    }
+    const tryPlay = (attempt = 0) => {
+      vid.play().catch(() => {
+        if (attempt < 5) setTimeout(() => tryPlay(attempt + 1), 500);
+      });
+    };
+    tryPlay();
+    // Retry if video stays black (no video data yet)
+    setTimeout(() => {
+      if (vid.videoWidth === 0 && vid.srcObject === stream) {
+        vid.srcObject = null;
+        vid.srcObject = stream;
+        vid.play().catch(() => {});
+      }
+    }, 2000);
+  }
+
+  async function initRoomAudio() {
+    if (audioStreamRef.current) return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      stream.getAudioTracks().forEach(t => { t.enabled = false; }); // default muted until user enables
+      audioStreamRef.current = stream;
+    } catch { /* mic not available */ }
+  }
+
+  function getOrCreatePC(peerId: string, socket: Socket): RTCPeerConnection {
+    if (pcsRef.current.has(peerId)) return pcsRef.current.get(peerId)!;
+    const pc = new RTCPeerConnection(RTC_CONFIG);
+    pcsRef.current.set(peerId, pc);
+
+    // Add room audio track (mesh voice)
+    if (audioStreamRef.current) {
+      audioStreamRef.current.getAudioTracks().forEach(t => pc.addTrack(t, audioStreamRef.current!));
+    }
+    // Add local stream audio/video if streaming
+    if (localStreamRef.current) {
+      if (!isScreenSharingRef.current) {
+        localStreamRef.current.getVideoTracks().forEach(t => pc.addTrack(t, localStreamRef.current!));
+      }
+      // Don't add audio from localStream — audioStreamRef handles it
+    }
+    if (isScreenSharingRef.current && screenStreamRef.current) {
+      screenStreamRef.current.getVideoTracks().forEach(t => pc.addTrack(t, screenStreamRef.current!));
+      screenStreamRef.current.getAudioTracks().forEach(t => pc.addTrack(t, screenStreamRef.current!));
+    }
+
+    pc.onicecandidate = e => {
+      if (e.candidate) socket.emit("ice-candidate", { to: peerId, candidate: e.candidate.toJSON() });
+    };
+
+    pc.ontrack = e => {
+      const stream = e.streams?.[0];
+      if (!stream) return;
+      setRemoteStreams(p => {
+        const exists = p.find(r => r.peerId === peerId);
+        return exists ? p.map(r => r.peerId === peerId ? { peerId, stream } : r) : [...p, { peerId, stream }];
+      });
+      setFocusedStream(prev => prev?.peerId === peerId ? { peerId, stream } : prev ?? { peerId, stream });
+      attachStreamToVideo(peerId, stream);
+      // Also listen for new tracks added later (e.g., screen share added mid-stream)
+      stream.onaddtrack = () => attachStreamToVideo(peerId, stream);
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      if (pc.iceConnectionState === "disconnected") {
+        // Give it 4s to recover, then restart ICE
+        setTimeout(() => {
+          if (pc.iceConnectionState === "disconnected" || pc.iceConnectionState === "failed") {
+            try { pc.restartIce(); } catch {}
+          }
+        }, 4000);
+      }
+      if (pc.iceConnectionState === "failed") {
+        try { pc.restartIce(); } catch {}
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === "connected") {
+        // Detect whether this PC is carrying screen share or camera
+        applyVideoEncodingParams(pc, isScreenSharingRef.current);
+      }
+      if (pc.connectionState === "failed") {
+        try { pc.restartIce(); } catch {}
+        setTimeout(() => {
+          if (pc.connectionState === "failed") {
+            try { pc.restartIce(); } catch {}
+          }
+        }, 5000);
+      }
+    };
+
+    // CRITICAL: renegotiate when tracks are added/removed after connection.
+    // Debounce 150ms to batch simultaneous addTrack calls (video+audio) into ONE offer.
+    let _negotiationTimer: ReturnType<typeof setTimeout> | null = null;
+    pc.onnegotiationneeded = () => {
+      if (!currentRoomRef.current) return;
+      if (_negotiationTimer) clearTimeout(_negotiationTimer);
+      _negotiationTimer = setTimeout(async () => {
+        if (pc.signalingState !== "stable") return; // avoid collisions
+        try {
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          socket.emit("offer", { to: peerId, offer });
+        } catch {}
+      }, 150);
+    };
+
+    return pc;
+  }
+
+  // connectToPeer: initiator side — we create the offer (for all peers)
+  async function connectToPeer(peerId: string, socket: Socket) {
+    if (pcsRef.current.has(peerId)) return;
+    // Fire mic init in background — don't block connection on permission prompt
+    initRoomAudio().catch(() => {});
+    const pc = getOrCreatePC(peerId, socket);
+    try {
+      const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+      await pc.setLocalDescription(offer);
+      socket.emit("offer", { to: peerId, offer });
+    } catch (err) { console.error("connectToPeer:", err); }
+  }
+
+  function removePeer(peerId: string) {
+    const pc = pcsRef.current.get(peerId);
+    if (pc) { pc.close(); pcsRef.current.delete(peerId); }
+    // Fix 1/7: clear video srcObject to prevent frozen/black frame ghost
+    const vid = remoteVideoRefs.current.get(peerId);
+    if (vid) { vid.pause(); vid.srcObject = null; }
+    remoteVideoRefs.current.delete(peerId);
+    setRemoteStreams(p => p.filter(r => r.peerId !== peerId));
+    setMembers(p => p.filter(m => m.peerId !== peerId));
+    setFocusedStream(p => p?.peerId === peerId ? null : p);
+  }
+
+  // Fix 9+4: Stream button handler — show option modal on start, end stream without leaving room
   function handleStreamButtonClick() {
     if (isStreaming) endStreamOnly();
     else setShowStreamStartModal(true);
   }
 
-  // End stream but STAY in room — unpublish all media via LiveKit; participant remains connected
-  async function endStreamOnly() {
-    try {
-      await Promise.all([lkSetCamera(false), lkSetScreen(false), lkSetMic(false)]);
-    } catch (e) { console.error("endStreamOnly:", e); }
+  // Fix 2/4/7: End stream but STAY in room — keep PCs alive, just stop tracks
+  function endStreamOnly() {
+    // Stop all local media tracks
+    localStreamRef.current?.getTracks().forEach(t => t.stop());
+    localStreamRef.current = null;
+    screenStreamRef.current?.getTracks().forEach(t => t.stop());
+    screenStreamRef.current = null;
+    if (miniVideoRef.current) miniVideoRef.current.srcObject = null;
+    if (localCenterRef.current) localCenterRef.current.srcObject = null;
+    // Signal stop to server BEFORE touching PCs
     if (currentRoomRef.current) socketRef.current?.emit("stop-stream");
-    setIsStreaming(false);
+    // Remove all senders from PCs but keep connections alive (fixes auto-leaving & frozen frames)
+    pcsRef.current.forEach(pc => {
+      pc.getSenders().forEach(sender => {
+        try { pc.removeTrack(sender); } catch {}
+      });
+    });
+    setIsStreaming(false); setIsWebcamOn(false); setIsScreenSharing(false); setIsMicOn(false);
     addMsg("⚡ SYSTEM", "Stream ended. You are still in the room.");
     notify("Stream ended. Still in room.", "info");
   }
 
-  // Start stream with chosen option using LiveKit publish
+  // Fix 9: Start stream with chosen option; Fix 6: attach video BEFORE setting state
   async function startStreamWithOption(option: StreamStartOption) {
     setShowStreamStartModal(false);
     if (!option) return;
-
     let cameraStarted = false;
     let screenStarted = false;
 
     if (option === "camera" || option === "both") {
       try {
-        await lkSetCamera(true);
-        await lkSetMic(true);
+        const isMob = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+        // Cap resolution & fps upfront — prevents the browser encoding at 4K/60fps and causing lag
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: isMob
+            ? { width: { ideal: 640, max: 1280 }, height: { ideal: 480, max: 720 }, frameRate: { ideal: 24, max: 30 } }
+            : { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } },
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
+        localStreamRef.current = stream;
+        // Fix 6: attach FIRST, then update state
+        if (miniVideoRef.current) { miniVideoRef.current.srcObject = stream; miniVideoRef.current.play().catch(() => {}); }
+        if (localCenterRef.current && !isScreenSharingRef.current) {
+          localCenterRef.current.srcObject = stream;
+          localCenterRef.current.play().catch(() => {});
+        }
+        // Send to existing peers; apply encoding caps after a short delay (browser needs ICE first)
+        pcsRef.current.forEach(pc => {
+          const senders = pc.getSenders();
+          stream.getTracks().forEach(track => {
+            const existing = senders.find(s => s.track?.kind === track.kind);
+            if (existing) existing.replaceTrack(track).catch(() => {});
+            else pc.addTrack(track, stream);
+          });
+          setTimeout(() => applyVideoEncodingParams(pc, false), 1500);
+        });
         cameraStarted = true;
+        setIsWebcamOn(true);
+        setIsMicOn(true);
       } catch {
         notify("Camera/microphone permission required", "error");
         if (option !== "both") return;
@@ -467,16 +668,71 @@ export default function App() {
       const isAndroidWebView = _isNativeApp || /wv/.test(navigator.userAgent) || (/Android/.test(navigator.userAgent) && /Version\/[\d.]+/.test(navigator.userAgent));
       if (!navigator.mediaDevices?.getDisplayMedia || isIOS || isAndroidWebView) {
         if (isAndroidWebView && !isIOS) {
+          // Tell the native app to open this room in Chrome where getDisplayMedia works
           postToNative({ type: "open_in_browser_for_screen_share", url: window.location.href });
         } else {
-          notify(isIOS ? "Screen sharing is not available on iOS. Use Camera instead."
-                       : "Screen sharing is not supported on this browser. Try Chrome or Firefox on desktop.", "error");
+          const msg = isIOS
+            ? "Screen sharing is not available on iOS. Use Camera instead."
+            : "Screen sharing is not supported on this browser. Try Chrome or Firefox on desktop.";
+          notify(msg, "error");
         }
         if (!cameraStarted) return;
       } else {
         try {
-          await lkSetScreen(true);
+          const isMob = /Android|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+          // Screen share: 15fps on mobile (screen barely changes), 24fps on desktop to save bandwidth
+          const screenConstraints: DisplayMediaStreamOptions = isMob
+            ? { video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 15, max: 15 } } }
+            : { video: { frameRate: { ideal: 24, max: 30 } }, audio: true };
+          const screenStream = await navigator.mediaDevices.getDisplayMedia(screenConstraints);
+          screenStreamRef.current = screenStream;
+          // Fix 6: attach FIRST before state update
+          if (localCenterRef.current) {
+            localCenterRef.current.srcObject = screenStream;
+            localCenterRef.current.play().catch(() => {});
+          }
+          // Attach camera to mini player if camera is also active
+          if (cameraStarted && localStreamRef.current && miniVideoRef.current) {
+            miniVideoRef.current.srcObject = localStreamRef.current;
+            miniVideoRef.current.play().catch(() => {});
+          }
+          const screenVideoTrack = screenStream.getVideoTracks()[0];
+          pcsRef.current.forEach(pc => {
+            // Find active video sender OR a null-track sender (camera was turned off earlier)
+            const videoSender = pc.getSenders().find(s => s.track?.kind === "video") ?? pc.getSenders().find(s => s.track === null);
+            if (videoSender) videoSender.replaceTrack(screenVideoTrack).catch(() => {});
+            else pc.addTrack(screenVideoTrack, screenStream);
+            const screenAudio = screenStream.getAudioTracks()[0];
+            if (screenAudio) {
+              const audioSender = pc.getSenders().find(s => s.track?.kind === "audio");
+              if (!audioSender) pc.addTrack(screenAudio, screenStream);
+            }
+            // Apply screen share encoding caps (lower fps cap, higher bitrate than camera)
+            setTimeout(() => applyVideoEncodingParams(pc, true), 1500);
+          });
           screenStarted = true;
+          setIsScreenSharing(true);
+          // Fix 1: when browser stops screen share, stream continues
+          screenVideoTrack.onended = () => {
+            screenStreamRef.current = null;
+            if (localCenterRef.current) {
+              if (localStreamRef.current) {
+                localCenterRef.current.srcObject = localStreamRef.current;
+                localCenterRef.current.play().catch(() => {});
+              } else {
+                localCenterRef.current.pause();
+                localCenterRef.current.srcObject = null;
+                localCenterRef.current.load();
+              }
+            }
+            setIsScreenSharing(false);
+            notify("Screen sharing stopped. Stream continues.", "info");
+            const camTrack = localStreamRef.current?.getVideoTracks()[0] ?? null;
+            pcsRef.current.forEach(pc => {
+              const sender = pc.getSenders().find(s => s.track?.kind === "video") ?? pc.getSenders().find(s => s.track === null);
+              if (sender) sender.replaceTrack(camTrack).catch(() => {});
+            });
+          };
         } catch (err: unknown) {
           const name = err instanceof Error ? err.name : "";
           if (name === "NotAllowedError") notify("Screen sharing permission denied.", "error");
@@ -488,45 +744,154 @@ export default function App() {
     }
 
     if (!cameraStarted && !screenStarted) return;
+    // Fix 6: state update AFTER media attached
     setIsStreaming(true);
     if (currentRoomRef.current) socketRef.current?.emit("start-stream");
     addMsg("⚡ SYSTEM", `Stream started${currentRoomRef.current ? ` in room ${currentRoomRef.current}` : " (local)"}`);
     notify("You are now LIVE! 🔴", "success");
   }
 
-  // Camera toggle — independent of stream
+  // Camera toggle — independent of stream, with adaptive constraints to prevent lag
   async function toggleWebcam() {
-    try {
-      const next = !isWebcamOn;
-      await lkSetCamera(next);
-      notify(next ? "Camera is on 📹" : "Camera off. Stream continues.", next ? "success" : "info");
-    } catch {
-      notify("Camera/microphone permission required", "error");
+    if (isWebcamOn) {
+      localStreamRef.current?.getTracks().forEach(t => t.stop());
+      localStreamRef.current = null;
+      // Pause BEFORE clearing srcObject to prevent frozen-frame artifacts
+      if (miniVideoRef.current) {
+        miniVideoRef.current.pause();
+        miniVideoRef.current.srcObject = null;
+        miniVideoRef.current.load();
+      }
+      if (!isScreenSharingRef.current && localCenterRef.current) {
+        localCenterRef.current.pause();
+        localCenterRef.current.srcObject = null;
+        localCenterRef.current.load();
+      }
+      // Replace video sender with null track so remote side doesn't freeze
+      pcsRef.current.forEach(pc => {
+        const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
+        if (videoSender) videoSender.replaceTrack(null).catch(() => {});
+      });
+      setIsWebcamOn(false);
+      notify("Camera off. Stream continues.", "info");
+    } else {
+      try {
+        const isMob = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: isMob
+            ? { width: { ideal: 640, max: 1280 }, height: { ideal: 480, max: 720 }, frameRate: { ideal: 24, max: 30 } }
+            : { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } },
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
+        localStreamRef.current = stream;
+        if (miniVideoRef.current) { miniVideoRef.current.srcObject = stream; miniVideoRef.current.play().catch(() => {}); }
+        if (!isScreenSharingRef.current && localCenterRef.current) {
+          localCenterRef.current.srcObject = stream;
+          localCenterRef.current.play().catch(() => {});
+        }
+        pcsRef.current.forEach(pc => {
+          const senders = pc.getSenders();
+          stream.getTracks().forEach(track => {
+            const existing = senders.find(s => s.track?.kind === track.kind);
+            if (existing) existing.replaceTrack(track).catch(() => {});
+            else pc.addTrack(track, stream);
+          });
+          setTimeout(() => applyVideoEncodingParams(pc, false), 1500);
+        });
+        setIsWebcamOn(true);
+        notify("Camera is on 📹", "success");
+      } catch { notify("Camera/microphone permission required", "error"); }
     }
   }
 
-  // Phones do not support browser screen-sharing (no getDisplayMedia on iOS, and Android browsers/WebViews don't expose it for capturing the device screen). Detect once.
+  // Phones can't capture their own screen from the browser/WebView (no getDisplayMedia for the device screen on iOS or Android Chrome / WebView).
   const isMobileDevice = useMemo(() => {
     const ua = navigator.userAgent || "";
     return _isNativeApp || /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
   }, []);
 
-  // Screen share toggle — does NOT end stream
-  async function toggleScreenShare() {
+  // Screen share toggle — does NOT end stream. When turning ON, opens a modal so the host can pick "with audio" or "without audio" first.
+  function toggleScreenShare() {
     if (isScreenSharing) {
-      try {
-        await lkSetScreen(false);
-        notify("Screen share stopped. Stream continues.", "info");
-      } catch (e) { console.error("screen off:", e); }
+      stopScreenShareInternal();
       return;
     }
     if (isMobileDevice || !navigator.mediaDevices?.getDisplayMedia) {
       notify("Screen sharing only works on a desktop browser (Chrome / Edge / Firefox / Safari). Use the camera here, or share your screen from a laptop in this same room.", "warning");
       return;
     }
+    setShowScreenAudioModal(true);
+  }
+
+  function stopScreenShareInternal() {
+    screenStreamRef.current?.getTracks().forEach(t => t.stop());
+    screenStreamRef.current = null;
+    if (localCenterRef.current) {
+      if (localStreamRef.current) {
+        localCenterRef.current.srcObject = localStreamRef.current;
+        localCenterRef.current.play().catch(() => {});
+      } else {
+        localCenterRef.current.pause();
+        localCenterRef.current.srcObject = null;
+        localCenterRef.current.load();
+      }
+    }
+    const camTrack = localStreamRef.current?.getVideoTracks()[0] ?? null;
+    const camAudio = localStreamRef.current?.getAudioTracks()[0] ?? audioStreamRef.current?.getAudioTracks()[0] ?? null;
+    pcsRef.current.forEach(pc => {
+      const videoSender = pc.getSenders().find(s => s.track?.kind === "video") ?? pc.getSenders().find(s => s.track === null);
+      if (videoSender) videoSender.replaceTrack(camTrack).catch(() => {});
+      // Restore the mic audio track (in case we replaced it with system/screen audio)
+      const audioSender = pc.getSenders().find(s => s.track?.kind === "audio");
+      if (audioSender && camAudio) audioSender.replaceTrack(camAudio).catch(() => {});
+    });
+    setIsScreenSharing(false);
+    notify("Screen share stopped. Stream continues.", "info");
+  }
+
+  // Called from the with/without audio modal
+  async function startScreenShareWithAudio(withAudio: boolean) {
+    setShowScreenAudioModal(false);
     try {
-      await lkSetScreen(true);
-      notify("Screen sharing active 🖥️", "success");
+      const screenConstraints: DisplayMediaStreamOptions = {
+        video: { frameRate: { ideal: 24, max: 30 } },
+        audio: withAudio,
+      };
+      const screenStream = await navigator.mediaDevices.getDisplayMedia(screenConstraints);
+      screenStreamRef.current = screenStream;
+      if (localCenterRef.current) {
+        localCenterRef.current.srcObject = screenStream;
+        localCenterRef.current.play().catch(() => {});
+      }
+      if (localStreamRef.current && miniVideoRef.current) {
+        miniVideoRef.current.srcObject = localStreamRef.current;
+        miniVideoRef.current.play().catch(() => {});
+      }
+      const screenTrack = screenStream.getVideoTracks()[0];
+      const screenAudio = withAudio ? screenStream.getAudioTracks()[0] : null;
+
+      pcsRef.current.forEach(pc => {
+        const videoSender = pc.getSenders().find(s => s.track?.kind === "video") ?? pc.getSenders().find(s => s.track === null);
+        if (videoSender) videoSender.replaceTrack(screenTrack).catch(() => {});
+        else pc.addTrack(screenTrack, screenStream);
+        if (screenAudio) {
+          // Prefer to send the captured screen/system audio over the mic
+          const audioSender = pc.getSenders().find(s => s.track?.kind === "audio");
+          if (audioSender) audioSender.replaceTrack(screenAudio).catch(() => {});
+          else pc.addTrack(screenAudio, screenStream);
+        }
+        setTimeout(() => applyVideoEncodingParams(pc, true), 1500);
+      });
+
+      setIsScreenSharing(true);
+      if (withAudio && !screenAudio) {
+        notify("Screen shared 🖥️ — but your browser/source didn't share audio. Tip: in Chrome pick a Tab and tick 'Share tab audio'.", "warning");
+      } else {
+        notify(withAudio ? "Screen + audio sharing active 🔊🖥️" : "Screen sharing active 🖥️", "success");
+      }
+
+      screenTrack.onended = () => stopScreenShareInternal();
+      if (screenAudio) screenAudio.onended = () => { /* video track usually ends with it */ };
     } catch (err: unknown) {
       const name = err instanceof Error ? err.name : "";
       if (name === "NotAllowedError") notify("Screen sharing permission denied.", "error");
@@ -535,29 +900,28 @@ export default function App() {
     }
   }
 
-  async function toggleMic() {
+  function toggleMic() {
     if (isMuted) { notify("You are muted by host. Please wait.", "warning"); return; }
-    try {
-      const next = !isMicOn;
-      await lkSetMic(next);
-      notify(next ? "Mic ON 🎙️" : "Mic muted 🔇", "info");
-    } catch { notify("Microphone permission required", "error"); }
+    // Use audioStreamRef (room audio mesh) — fallback to localStreamRef
+    const stream = audioStreamRef.current || localStreamRef.current;
+    if (!stream) { notify("No microphone available", "error"); return; }
+    const audioTrack = stream.getAudioTracks()[0];
+    if (!audioTrack) { notify("No microphone found", "error"); return; }
+    const next = !isMicOn;
+    audioTrack.enabled = next;
+    // Also toggle localStream audio if available
+    localStreamRef.current?.getAudioTracks().forEach(t => { t.enabled = next; });
+    setIsMicOn(next);
+    notify(next ? "Mic ON 🎙️" : "Mic muted 🔇", "info");
   }
 
-  async function joinRoomOnServer(roomCode: string) {
+  function joinRoomOnServer(roomCode: string) {
     setCurrentRoom(roomCode);
     setMembers([{ peerId: "me", userId: userIdRef.current, avatar: userAvatarRef.current, isFav: false, isStreaming: isStreamingRef.current, isRoomHost: false }]);
     socketRef.current?.emit("join-room", { roomCode, userId: userIdRef.current, avatar: userAvatarRef.current });
     if (isStreamingRef.current) socketRef.current?.emit("start-stream");
     addMsg("⚡ SYSTEM", `Joined room: ${roomCode}`);
     notify(`Joined room ${roomCode}`, "success");
-    // Connect to LiveKit room (SFU) for media — chat/host stays on socket.io
-    try {
-      await lkConnect({ roomCode, identity: userIdRef.current, name: userIdRef.current });
-    } catch (e) {
-      console.error("LiveKit connect failed:", e);
-      notify("Media connection failed — chat will work but video won't", "error");
-    }
   }
 
   function createRoom() {
@@ -579,10 +943,13 @@ export default function App() {
   // Fix 5: Leave room — server emits host-left-room to all members
   function deleteRoom() {
     socketRef.current?.emit("leave-room");
-    lkDisconnect().catch(() => {});
-    setIsStreaming(false);
-    setFocusedIdentity(null); setMembers([]);
+    pcsRef.current.forEach(pc => pc.close()); pcsRef.current.clear();
+    // Stop room audio stream so mic is released
+    audioStreamRef.current?.getTracks().forEach(t => t.stop());
+    audioStreamRef.current = null;
+    setRemoteStreams([]); setFocusedStream(null); setMembers([]);
     setCurrentRoom(null); setJoinedStreamHostId(null); setIAmRoomHost(false);
+    setIsMicOn(false);
     addMsg("⚡ SYSTEM", "Left room.");
     notify("Left the room", "info");
     if (_isNativeApp) postToNative({ type: "leave_room" });
@@ -609,8 +976,7 @@ export default function App() {
 
   function kickMember(peerId: string) {
     socketRef.current?.emit("kick-member", { targetPeerId: peerId });
-    setMembers(p => p.filter(m => m.peerId !== peerId));
-    setOpenMenuMember(null); notify("Member removed", "info");
+    removePeer(peerId); setOpenMenuMember(null); notify("Member removed", "info");
   }
 
   function muteMember(peerId: string) {
@@ -729,6 +1095,24 @@ export default function App() {
         );
       })()}
 
+      {showScreenAudioModal && <ModalOverlay onClose={() => setShowScreenAudioModal(false)}>
+        <ModalBox title="🖥️ SHARE YOUR SCREEN">
+          <div style={{ fontSize: 12, color: "#a0b0d0", marginBottom: 14, lineHeight: 1.5, textAlign: "center" }}>
+            Do you want to share the audio that's playing on your screen along with the video?
+          </div>
+          <button onClick={() => startScreenShareWithAudio(true)} style={{ ...btnSt, display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
+            <span style={{ fontSize: 20 }}>🔊🖥️</span> Share with audio
+          </button>
+          <div style={{ fontSize: 10, color: "#7a8aa0", margin: "4px 0 10px", textAlign: "center", lineHeight: 1.4 }}>
+            Captures sound from a Chrome tab or system audio. In the next dialog pick a <b>Tab</b> and tick <b>"Share tab audio"</b> for best results.
+          </div>
+          <button onClick={() => startScreenShareWithAudio(false)} style={{ ...btnSt, display: "flex", alignItems: "center", justifyContent: "center", gap: 10, background: "rgba(0,212,255,0.1)" }}>
+            <span style={{ fontSize: 20 }}>🔇🖥️</span> Share without audio
+          </button>
+          <button onClick={() => setShowScreenAudioModal(false)} style={btn2St}>CANCEL</button>
+        </ModalBox>
+      </ModalOverlay>}
+
       {showTeamModal && <ModalOverlay onClose={() => setShowTeamModal(false)}>
         <ModalBox title="👥 TEAM">
           <button onClick={createRoom} style={btnSt}>➕ CREATE ROOM</button>
@@ -811,7 +1195,7 @@ export default function App() {
           </div>
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 6, flexShrink: 0 }}>
-          <button onClick={() => requestJoinStream()} style={{ padding: "7px 14px", background: "linear-gradient(135deg, #00d4ff, #0099ff)", color: "#0a0e27", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 11, fontWeight: 800 }}>▶ JOIN</button>
+          <button onClick={requestJoinStream} style={{ padding: "7px 14px", background: "linear-gradient(135deg, #00d4ff, #0099ff)", color: "#0a0e27", border: "none", borderRadius: 8, cursor: "pointer", fontSize: 11, fontWeight: 800 }}>▶ JOIN</button>
           <button onClick={() => setJoinStreamPrompt(null)} style={{ padding: "7px 10px", background: "rgba(255,0,0,0.1)", color: "#ff6666", border: "1px solid #ff4444", borderRadius: 8, cursor: "pointer", fontSize: 11 }}>✖ Skip</button>
         </div>
       </div>
@@ -906,11 +1290,6 @@ export default function App() {
             </div>
           )}
           {isStreaming && <div style={{ position: "absolute", top: 8, right: 8, background: "rgba(255,0,0,0.25)", padding: "3px 8px", borderRadius: 12, fontSize: 9, fontWeight: 700, color: "#ff4444", border: "1px solid #ff4444", animation: "statusBlink 1s infinite" }}>● LIVE</div>}
-          {(showLocalCenter || showRemoteCenter) && (() => {
-            const tileIdent = showLocalCenter ? userId : (focusedStream?.peerId ?? remoteStreams[0]?.peerId);
-            const tileLabel = showLocalCenter ? "You" : tileIdent;
-            return tileIdent ? <QualityDot quality={qualities[tileIdent] as NetQ | undefined} label={tileLabel} style={{ top: 8, left: 8 }} /> : null;
-          })()}
           {!audioUnlocked && remoteStreams.length > 0 && (
             <div onClick={unlockAudio} style={{ position: "absolute", bottom: 8, left: "50%", transform: "translateX(-50%)", background: "rgba(0,212,255,0.2)", border: "1px solid #00d4ff", borderRadius: 16, padding: "6px 16px", fontSize: 10, color: "#00d4ff" }}>🔊 Tap to enable audio</div>
           )}
@@ -1100,7 +1479,7 @@ export default function App() {
                 // Fix 3: STREAM button only visible to host (canStartStream)
                 ...(canStartStream ? [{ icon: isStreaming ? "⏹" : "▶", label: "STREAM", active: isStreaming, onClick: handleStreamButtonClick, color: isStreaming ? "#ff4444" : "#00d4ff" }] : []),
                 { icon: "📹", label: "CAMERA", active: isWebcamOn, onClick: toggleWebcam, color: "#00d4ff" },
-                { icon: "🖥️", label: isMobileDevice ? "DESKTOP" : "SCREEN", active: isScreenSharing, onClick: toggleScreenShare, color: isMobileDevice ? "#667" : "#00d4ff", disabled: isMobileDevice },
+                { icon: "🖥️", label: "SCREEN", active: isScreenSharing, onClick: toggleScreenShare, color: "#00d4ff" },
                 { icon: "👥", label: "TEAM", active: false, onClick: () => setShowTeamModal(true), color: "#00d4ff" },
               ].map(btn => (
                 <div key={btn.label} onClick={btn.onClick} title={btn.label} style={{ width: 56, height: 56, borderRadius: "50%", cursor: "pointer", userSelect: "none", background: btn.active ? `linear-gradient(135deg, ${btn.color}, ${btn.color}aa)` : "rgba(0,212,255,0.1)", border: `2px solid ${btn.color}`, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", boxShadow: btn.active ? `0 0 28px ${btn.color}88` : `0 0 6px ${btn.color}22`, transition: "all .3s" }}>
@@ -1172,12 +1551,6 @@ export default function App() {
                   ? <RemoteVideoEl key={remoteStreams[0].peerId} stream={remoteStreams[0].stream} peerId={remoteStreams[0].peerId} videoRefs={remoteVideoRefs} />
                   : null
             )}
-
-            {(showLocalCenter || showRemoteCenter) && (() => {
-              const tileIdent = showLocalCenter ? userId : (focusedStream?.peerId ?? remoteStreams[0]?.peerId);
-              const tileLabel = showLocalCenter ? "You" : tileIdent;
-              return tileIdent ? <QualityDot quality={qualities[tileIdent] as NetQ | undefined} label={tileLabel} style={{ top: 10, left: 140 }} /> : null;
-            })()}
 
             {!audioUnlocked && remoteStreams.length > 0 && (
               <div onClick={unlockAudio} style={{ position: "absolute", bottom: 60, left: "50%", transform: "translateX(-50%)", background: "rgba(0,212,255,0.2)", border: "1px solid #00d4ff", borderRadius: 20, padding: "8px 20px", cursor: "pointer", fontSize: 11, color: "#00d4ff", zIndex: 20 }}>🔊 Click to enable audio</div>
@@ -1318,20 +1691,6 @@ export default function App() {
       {sharedModals}
       {notificationsUI}
       {chatPopupsUI}
-    </div>
-  );
-}
-
-type NetQ = "excellent" | "good" | "poor" | "lost" | "unknown";
-function QualityDot({ quality, label, style }: { quality: NetQ | undefined; label?: string; style?: React.CSSProperties }) {
-  const q = quality ?? "unknown";
-  const colorMap: Record<NetQ, string> = { excellent: "#22c55e", good: "#84cc16", poor: "#f59e0b", lost: "#ef4444", unknown: "#94a3b8" };
-  const labelMap: Record<NetQ, string> = { excellent: "Excellent", good: "Good", poor: "Poor", lost: "Reconnecting", unknown: "—" };
-  const c = colorMap[q];
-  return (
-    <div title={`Network: ${labelMap[q]}`} style={{ position: "absolute", display: "inline-flex", alignItems: "center", gap: 5, background: "rgba(0,14,39,0.85)", border: `1px solid ${c}66`, padding: "3px 8px", borderRadius: 12, fontSize: 9, fontWeight: 700, color: c, zIndex: 16, pointerEvents: "none", ...(style ?? {}) }}>
-      <span style={{ width: 7, height: 7, borderRadius: "50%", background: c, boxShadow: `0 0 6px ${c}` }} />
-      {label && <span style={{ color: "#cfd8e8", fontWeight: 600, fontSize: 9 }}>{label}</span>}
     </div>
   );
 }

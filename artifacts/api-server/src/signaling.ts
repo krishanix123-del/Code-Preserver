@@ -141,7 +141,15 @@ export function attachSignaling(httpServer: HttpServer) {
       io.to(roomCode).emit("chat-message", { from: socket.id, userId, text, timestamp: Date.now() });
     });
 
-    // WebRTC offer/answer/ice signaling is handled by LiveKit SFU now — no socket forwarders needed
+    socket.on("offer", ({ to, offer }: { to: string; offer: RTCSessionDescriptionInit }) => {
+      socket.to(to).emit("offer", { from: socket.id, offer });
+    });
+    socket.on("answer", ({ to, answer }: { to: string; answer: RTCSessionDescriptionInit }) => {
+      socket.to(to).emit("answer", { from: socket.id, answer });
+    });
+    socket.on("ice-candidate", ({ to, candidate }: { to: string; candidate: RTCIceCandidateInit }) => {
+      socket.to(to).emit("ice-candidate", { from: socket.id, candidate });
+    });
 
     socket.on("leave-room", () => {
       if (currentRoom) { handleLeave(socket, currentRoom, io, rooms, userMeta); currentRoom = null; }
