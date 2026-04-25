@@ -41,7 +41,7 @@ const RTC_CONFIG: RTCConfiguration = {
 };
 
 interface ChatMessage { id: number; sender: string; text: string; }
-interface Member { peerId: string; userId: string; avatar: string; isFav: boolean; isStreaming: boolean; isRoomHost: boolean; }
+interface Member { peerId: string; userId: string; avatar: string; isFav: boolean; isStreaming: boolean; isRoomHost: boolean; connected?: boolean; }
 interface RemoteStream { peerId: string; stream: MediaStream; }
 interface Notification { id: number; message: string; type: "success" | "error" | "info" | "warning"; }
 interface IncomingJoinReq { from: string; userId: string; avatar: string; }
@@ -255,7 +255,7 @@ export default function App() {
           if (roomParam && roomParam.length >= 4) {
             const code = roomParam.toUpperCase();
             setCurrentRoom(code);
-            setMembers([{ peerId: "me", userId: userIdRef.current, avatar: userAvatarRef.current, isFav: false, isStreaming: false, isRoomHost: false }]);
+            setMembers([{ peerId: "me", userId: userIdRef.current, avatar: userAvatarRef.current, isFav: false, isStreaming: false, isRoomHost: false, connected: true }]);
             socket.emit("join-room", { roomCode: code, userId: userIdRef.current, avatar: userAvatarRef.current });
             addMsg("⚡ SYSTEM", `Auto-joined room: ${code}`);
             notify(`Joined room ${code}`, "success");
@@ -270,13 +270,13 @@ export default function App() {
       else notify("Connection lost. Reconnecting...", "warning");
     });
 
-    socket.on("room-joined", ({ peers, iAmRoomHost: iAmHost }: { peers: { peerId: string; userId: string; avatar: string; isStreaming: boolean; isRoomHost: boolean }[]; iAmRoomHost: boolean; }) => {
+    socket.on("room-joined", ({ peers, iAmRoomHost: iAmHost }: { peers: { peerId: string; userId: string; avatar: string; isStreaming: boolean; isRoomHost: boolean; connected?: boolean }[]; iAmRoomHost: boolean; }) => {
       setIAmRoomHost(iAmHost);
-      peers.forEach(({ peerId, userId: uid, avatar, isStreaming: streaming, isRoomHost }) => {
-        setMembers(p => p.find(m => m.peerId === peerId) ? p : [...p, { peerId, userId: uid, avatar, isFav: false, isStreaming: streaming, isRoomHost }]);
+      peers.forEach(({ peerId, userId: uid, avatar, isStreaming: streaming, isRoomHost, connected }) => {
+        setMembers(p => p.find(m => m.peerId === peerId) ? p : [...p, { peerId, userId: uid, avatar, isFav: false, isStreaming: streaming, isRoomHost, connected: connected !== false }]);
         // Always connect so the host can push video later via renegotiation
-        connectToPeer(peerId, socket);
-        if (streaming) {
+        if (connected !== false) connectToPeer(peerId, socket);
+        if (streaming && connected !== false) {
           // Show join/skip prompt — member decides whether to watch the active stream
           setJoinStreamPrompt({ hostPeerId: peerId, hostUserId: uid });
           addMsg("⚡ SYSTEM", `${uid} is streaming — click Join Stream to watch!`);
@@ -285,12 +285,42 @@ export default function App() {
       });
     });
 
-    socket.on("peer-joined", ({ peerId, userId: uid, avatar, isRoomHost }: { peerId: string; userId: string; avatar: string; isRoomHost: boolean }) => {
-      notify(`${uid} joined the room`, "info");
-      addMsg("⚡ SYSTEM", `${uid} joined`);
-      setMembers(p => p.find(m => m.peerId === peerId) ? p : [...p, { peerId, userId: uid, avatar, isFav: false, isStreaming: false, isRoomHost }]);
+    socket.on("peer-joined", ({ peerId, userId: uid, avatar, isRoomHost, reconnected }: { peerId: string; userId: string; avatar: string; isRoomHost: boolean; reconnected?: boolean }) => {
+      notify(reconnected ? `${uid} reconnected` : `${uid} joined the room`, "info");
+      addMsg("⚡ SYSTEM", reconnected ? `${uid} reconnected` : `${uid} joined`);
+      // If this is a reconnect, the server already removed the old peerId entry from the room state
+      // and emitted peer-left{silent:true} with the old peerId — so any stale entry with the same
+      // userId here should be replaced by the fresh one (new peerId, marked connected).
+      setMembers(p => {
+        const filtered = p.filter(m => m.peerId !== peerId && m.userId !== uid);
+        const myEntry = p.find(m => m.peerId === "me");
+        const others = filtered.filter(m => m.peerId !== "me");
+        return [
+          ...(myEntry ? [myEntry] : []),
+          ...others,
+          { peerId, userId: uid, avatar, isFav: false, isStreaming: false, isRoomHost, connected: true },
+        ];
+      });
       // Don't initiate — the new peer sends offers to existing peers; just notify if we're streaming
       if (isStreamingRef.current) socket.emit("start-stream");
+    });
+
+    // Soft drop: peer's socket died but the server keeps them in the room as offline.
+    // Tear down our RTCPeerConnection to that dead peerId; the user stays in the members list.
+    socket.on("peer-disconnected", ({ peerId, userId: uid }: { peerId: string; userId: string }) => {
+      addMsg("⚡ SYSTEM", `${uid} went offline`);
+      const pc = pcsRef.current.get(peerId);
+      if (pc) { try { pc.close(); } catch {} pcsRef.current.delete(peerId); }
+      const vid = remoteVideoRefs.current.get(peerId);
+      if (vid) { vid.pause(); vid.srcObject = null; }
+      remoteVideoRefs.current.delete(peerId);
+      setRemoteStreams(p => p.filter(r => r.peerId !== peerId));
+      setFocusedStream(p => p?.peerId === peerId ? null : p);
+      // If we were watching this peer's stream, clear the join state
+      setJoinedStreamHostId(prev => prev === peerId ? null : prev);
+      setJoinStreamPrompt(prev => prev?.hostPeerId === peerId ? null : prev);
+      // Mark the member as offline (DO NOT remove from list)
+      setMembers(p => p.map(m => m.peerId === peerId ? { ...m, connected: false, isStreaming: false } : m));
     });
 
     socket.on("peer-started-stream", ({ peerId, userId: uid }: { peerId: string; userId: string }) => {
@@ -384,17 +414,28 @@ export default function App() {
       try { await pc.addIceCandidate(new RTCIceCandidate(candidate)); } catch { }
     });
 
-    socket.on("peer-left", ({ peerId, userId: uid }: { peerId: string; userId: string }) => {
-      notify(`${uid} left`, "info");
-      addMsg("⚡ SYSTEM", `${uid} left the room`);
+    socket.on("peer-left", ({ peerId, userId: uid, silent }: { peerId: string; userId: string; silent?: boolean }) => {
+      if (!silent) {
+        notify(`${uid} left`, "info");
+        addMsg("⚡ SYSTEM", `${uid} left the room`);
+      }
       removePeer(peerId);
     });
 
-    socket.on("members-update", (list: { peerId: string; userId: string; avatar: string; isStreaming: boolean; isRoomHost: boolean }[]) => {
+    socket.on("members-update", (list: { peerId: string; userId: string; avatar: string; isStreaming: boolean; isRoomHost: boolean; connected?: boolean }[]) => {
       setMembers(prev => {
         const myEntry = prev.find(m => m.peerId === "me");
-        const updated = list.filter(p => p.peerId !== socket.id).map(p => ({ ...p, isFav: prev.find(m => m.peerId === p.peerId)?.isFav ?? false }));
-        return myEntry ? [myEntry, ...updated] : updated;
+        const updated = list.filter(p => p.peerId !== socket.id).map(p => ({
+          ...p,
+          isFav: prev.find(m => m.peerId === p.peerId)?.isFav ?? false,
+          connected: p.connected !== false,
+        }));
+        // Update my own connected flag based on what the server says about my socket id
+        const myServerEntry = list.find(p => p.peerId === socket.id);
+        const meUpdated = myEntry && myServerEntry
+          ? { ...myEntry, connected: myServerEntry.connected !== false, isStreaming: myServerEntry.isStreaming, isRoomHost: myServerEntry.isRoomHost }
+          : myEntry;
+        return meUpdated ? [meUpdated, ...updated] : updated;
       });
     });
 
@@ -751,8 +792,19 @@ export default function App() {
     notify("You are now LIVE! 🔴", "success");
   }
 
+  // While the room host is actively streaming, members can't push their own camera/screen
+  // out into the room — only the host's broadcast plays. This keeps the room single-source.
+  function hostIsActivelyStreaming(): boolean {
+    if (iAmRoomHostRef.current) return false; // The host themselves is allowed to do anything
+    return members.some(m => m.peerId !== "me" && m.isRoomHost && m.isStreaming && m.connected !== false);
+  }
+
   // Camera toggle — independent of stream, with adaptive constraints to prevent lag
   async function toggleWebcam() {
+    if (!isWebcamOn && hostIsActivelyStreaming()) {
+      notify("The host is streaming — only the host can broadcast right now.", "warning");
+      return;
+    }
     if (isWebcamOn) {
       localStreamRef.current?.getTracks().forEach(t => t.stop());
       localStreamRef.current = null;
@@ -814,6 +866,10 @@ export default function App() {
   function toggleScreenShare() {
     if (isScreenSharing) {
       stopScreenShareInternal();
+      return;
+    }
+    if (hostIsActivelyStreaming()) {
+      notify("The host is streaming — only the host can share their screen right now.", "warning");
       return;
     }
     if (isMobileDevice || !navigator.mediaDevices?.getDisplayMedia) {
@@ -917,7 +973,7 @@ export default function App() {
 
   function joinRoomOnServer(roomCode: string) {
     setCurrentRoom(roomCode);
-    setMembers([{ peerId: "me", userId: userIdRef.current, avatar: userAvatarRef.current, isFav: false, isStreaming: isStreamingRef.current, isRoomHost: false }]);
+    setMembers([{ peerId: "me", userId: userIdRef.current, avatar: userAvatarRef.current, isFav: false, isStreaming: isStreamingRef.current, isRoomHost: false, connected: true }]);
     socketRef.current?.emit("join-room", { roomCode, userId: userIdRef.current, avatar: userAvatarRef.current });
     if (isStreamingRef.current) socketRef.current?.emit("start-stream");
     addMsg("⚡ SYSTEM", `Joined room: ${roomCode}`);
@@ -940,18 +996,31 @@ export default function App() {
     setJoinCodeInput(""); setShowJoinModal(false); setShowTeamModal(false);
   }
 
-  // Fix 5: Leave room — server emits host-left-room to all members
+  // Host: delete the entire room (kicks everyone out). Member: just leave the room yourself.
+  // Either action requires explicit confirmation — disconnects & refreshes don't trigger it.
   function deleteRoom() {
-    socketRef.current?.emit("leave-room");
+    const amHost = iAmRoomHostRef.current;
+    const msg = amHost
+      ? "Delete this room? Every member will be kicked out and the room will be closed."
+      : "Leave this room? You can rejoin later with the same code.";
+    if (!window.confirm(msg)) return;
+    if (amHost) {
+      socketRef.current?.emit("delete-room");
+    } else {
+      socketRef.current?.emit("leave-room");
+    }
     pcsRef.current.forEach(pc => pc.close()); pcsRef.current.clear();
     // Stop room audio stream so mic is released
     audioStreamRef.current?.getTracks().forEach(t => t.stop());
     audioStreamRef.current = null;
+    // Also stop local camera/screen if still active
+    localStreamRef.current?.getTracks().forEach(t => t.stop()); localStreamRef.current = null;
+    screenStreamRef.current?.getTracks().forEach(t => t.stop()); screenStreamRef.current = null;
     setRemoteStreams([]); setFocusedStream(null); setMembers([]);
     setCurrentRoom(null); setJoinedStreamHostId(null); setIAmRoomHost(false);
-    setIsMicOn(false);
-    addMsg("⚡ SYSTEM", "Left room.");
-    notify("Left the room", "info");
+    setIsMicOn(false); setIsWebcamOn(false); setIsScreenSharing(false); setIsStreaming(false);
+    addMsg("⚡ SYSTEM", amHost ? "You deleted the room." : "You left the room.");
+    notify(amHost ? "Room deleted" : "Left the room", "info");
     if (_isNativeApp) postToNative({ type: "leave_room" });
   }
 
@@ -1323,7 +1392,7 @@ export default function App() {
           <button onClick={() => setShowJoinModal(true)} style={{ padding: "5px 10px", background: "rgba(0,212,255,0.15)", border: "1px solid #00d4ff", color: "#00d4ff", borderRadius: 7, fontSize: 10, fontWeight: 600, cursor: "pointer" }}>JOIN</button>
           {currentRoom && <>
             <button onClick={copyRoomCode} style={{ padding: "5px 8px", background: "rgba(0,212,255,0.1)", border: "1px solid #004d7f", color: "#a0b0d0", borderRadius: 7, fontSize: 10, cursor: "pointer" }}>📋</button>
-            <button onClick={deleteRoom} style={{ padding: "5px 8px", background: "rgba(255,0,0,0.1)", border: "1px solid #ff4444", color: "#ff6666", borderRadius: 7, fontSize: 10, cursor: "pointer" }}>🚪</button>
+            <button onClick={deleteRoom} title={iAmRoomHost ? "Delete the room (kicks everyone out)" : "Leave the room"} style={{ padding: "5px 8px", background: iAmRoomHost ? "rgba(255,0,0,0.2)" : "rgba(255,0,0,0.1)", border: `1px solid ${iAmRoomHost ? "#ff4444" : "#ff8888"}`, color: iAmRoomHost ? "#ff4444" : "#ff6666", borderRadius: 7, fontSize: 10, cursor: "pointer", fontWeight: iAmRoomHost ? 700 : 400 }}>{iAmRoomHost ? "🗑️" : "🚪"}</button>
           </>}
         </div>
 
@@ -1389,20 +1458,21 @@ export default function App() {
                 : sortedMembers.map(member => {
                   const isMe = member.peerId === "me";
                   const isHost = isMe ? iAmRoomHost : member.isRoomHost;
+                  const online = isMe ? isConnected : member.connected !== false;
                   return (
-                    <div key={member.peerId} style={{ background: isMe ? "rgba(0,212,255,0.08)" : "rgba(0,99,255,0.06)", border: `1px solid ${isMe ? "#00d4ff44" : "#004d7f"}`, borderRadius: 10, padding: "10px 14px", display: "flex", alignItems: "center", gap: 10 }}>
-                      <div style={{ width: 36, height: 36, borderRadius: "50%", background: "linear-gradient(135deg, #00d4ff, #0099ff)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, flexShrink: 0, position: "relative" }}>
+                    <div key={member.peerId} style={{ background: isMe ? "rgba(0,212,255,0.08)" : "rgba(0,99,255,0.06)", border: `1px solid ${isMe ? "#00d4ff44" : "#004d7f"}`, borderRadius: 10, padding: "10px 14px", display: "flex", alignItems: "center", gap: 10, opacity: online ? 1 : 0.55 }}>
+                      <div style={{ width: 36, height: 36, borderRadius: "50%", background: "linear-gradient(135deg, #00d4ff, #0099ff)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, flexShrink: 0, position: "relative", filter: online ? "none" : "grayscale(0.7)" }}>
                         {member.avatar}
-                        <div style={{ position: "absolute", bottom: -2, right: -2, width: 9, height: 9, borderRadius: "50%", background: "#00ff00", border: "2px solid #050915" }} />
+                        <div style={{ position: "absolute", bottom: -2, right: -2, width: 9, height: 9, borderRadius: "50%", background: online ? "#00ff00" : "#888", border: "2px solid #050915" }} />
                       </div>
                       <div style={{ flex: 1, minWidth: 0 }}>
                         <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                           <span style={{ fontSize: 13, fontWeight: 700, color: isMe ? "#00d4ff" : "#e8f0ff" }}>{displayName(member)}</span>
                           <span style={{ fontSize: 9, padding: "1px 6px", borderRadius: 4, fontWeight: 700, background: isHost ? "rgba(255,165,0,0.2)" : "rgba(0,212,255,0.12)", color: isHost ? "#ffaa00" : "#00d4ff", border: `1px solid ${isHost ? "#ffaa00" : "#00d4ff"}` }}>{isHost ? "HOST" : "MBR"}</span>
-                          {member.isStreaming && !isMe && <span style={{ fontSize: 9, color: "#ff4444" }}>🔴</span>}
+                          {member.isStreaming && !isMe && online && <span style={{ fontSize: 9, color: "#ff4444" }}>🔴</span>}
                           {member.isFav && !isMe && <span>❤️</span>}
                         </div>
-                        <div style={{ fontSize: 10, color: "#00ff00" }}>● online</div>
+                        <div style={{ fontSize: 10, color: online ? "#00ff00" : "#999" }}>● {online ? "online" : "offline"}</div>
                       </div>
                       {!isMe && (
                         <div style={{ position: "relative" }} onClick={e => e.stopPropagation()}>
@@ -1519,7 +1589,7 @@ export default function App() {
             {currentRoom && (
               <div style={{ display: "flex", gap: 6 }}>
                 <button onClick={copyRoomCode} style={{ ...roomBtnSt, fontSize: 10 }}>📋 COPY</button>
-                <button onClick={deleteRoom} style={{ ...roomBtnSt, border: "1px solid #ff4444", color: "#ff6666", background: "rgba(255,0,0,0.1)", fontSize: 10 }}>🚪 LEAVE</button>
+                <button onClick={deleteRoom} title={iAmRoomHost ? "Delete the room (kicks everyone out)" : "Leave the room"} style={{ ...roomBtnSt, border: `1px solid ${iAmRoomHost ? "#ff4444" : "#ff8888"}`, color: iAmRoomHost ? "#ff4444" : "#ff6666", background: iAmRoomHost ? "rgba(255,0,0,0.18)" : "rgba(255,0,0,0.1)", fontSize: 10, fontWeight: iAmRoomHost ? 700 : 400 }}>{iAmRoomHost ? "🗑️ DELETE ROOM" : "🚪 LEAVE"}</button>
               </div>
             )}
           </div>
@@ -1636,21 +1706,22 @@ export default function App() {
                 : sortedMembers.map(member => {
                   const isMe = member.peerId === "me";
                   const isHost = isMe ? iAmRoomHost : member.isRoomHost;
+                  const online = isMe ? isConnected : member.connected !== false;
                   return (
-                    <div key={member.peerId} style={{ background: isMe ? "linear-gradient(135deg, rgba(0,212,255,0.12), rgba(0,99,255,0.08))" : "rgba(0,99,255,0.07)", border: `1px solid ${isMe ? "#00d4ff44" : "#004d7f"}`, borderRadius: 8, padding: "7px 10px", display: "flex", alignItems: "center", gap: 8, position: "relative" }}>
-                      <div style={{ width: 30, height: 30, borderRadius: "50%", background: "linear-gradient(135deg, #00d4ff, #0099ff)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, flexShrink: 0, position: "relative" }}>
+                    <div key={member.peerId} style={{ background: isMe ? "linear-gradient(135deg, rgba(0,212,255,0.12), rgba(0,99,255,0.08))" : "rgba(0,99,255,0.07)", border: `1px solid ${isMe ? "#00d4ff44" : "#004d7f"}`, borderRadius: 8, padding: "7px 10px", display: "flex", alignItems: "center", gap: 8, position: "relative", opacity: online ? 1 : 0.55 }}>
+                      <div style={{ width: 30, height: 30, borderRadius: "50%", background: "linear-gradient(135deg, #00d4ff, #0099ff)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, flexShrink: 0, position: "relative", filter: online ? "none" : "grayscale(0.7)" }}>
                         {member.avatar}
-                        <div style={{ position: "absolute", bottom: -2, right: -2, width: 9, height: 9, borderRadius: "50%", background: "#00ff00", border: "2px solid #050915" }} />
+                        <div style={{ position: "absolute", bottom: -2, right: -2, width: 9, height: 9, borderRadius: "50%", background: online ? "#00ff00" : "#888", border: "2px solid #050915" }} />
                       </div>
                       <div style={{ flex: 1, minWidth: 0 }}>
                         <div style={{ display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap" }}>
                           <span style={{ fontSize: 10, fontWeight: 700, color: isMe ? "#00d4ff" : "#e8f0ff", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 90 }}>{displayName(member)}</span>
                           <span style={{ fontSize: 8, padding: "1px 5px", borderRadius: 4, fontWeight: 700, background: isHost ? "rgba(255,165,0,0.2)" : "rgba(0,212,255,0.12)", color: isHost ? "#ffaa00" : "#00d4ff", border: `1px solid ${isHost ? "#ffaa00" : "#00d4ff"}` }}>{isHost ? "HOST" : "MEMBER"}</span>
                           {member.isFav && !isMe && <span style={{ color: "#ff3366", fontSize: 11 }}>❤️</span>}
-                          {member.isStreaming && !isMe && <span style={{ fontSize: 8, background: "rgba(255,0,0,0.2)", color: "#ff4444", border: "1px solid #ff4444", padding: "1px 4px", borderRadius: 4, fontWeight: 700 }}>🔴</span>}
+                          {member.isStreaming && !isMe && online && <span style={{ fontSize: 8, background: "rgba(255,0,0,0.2)", color: "#ff4444", border: "1px solid #ff4444", padding: "1px 4px", borderRadius: 4, fontWeight: 700 }}>🔴</span>}
                           {localNicknames[member.peerId] && <span style={{ fontSize: 7, color: "#ffaa00", opacity: 0.7 }}>(renamed)</span>}
                         </div>
-                        <div style={{ fontSize: 8, color: "#00ff00" }}>● online</div>
+                        <div style={{ fontSize: 8, color: online ? "#00ff00" : "#999" }}>● {online ? "online" : "offline"}</div>
                       </div>
                       {!isMe && (
                         <div style={{ position: "relative", flexShrink: 0 }} onClick={e => e.stopPropagation()}>

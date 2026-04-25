@@ -6,12 +6,13 @@ interface MemberMeta {
   userId: string;
   avatar: string;
   isStreaming: boolean;
+  connected: boolean;
 }
 
 interface RoomInfo {
   members: Map<string, MemberMeta>;
   hostSocketId: string;
-  hostUserId: string; // Fix 6: track host by userId so reconnect restores host status
+  hostUserId: string; // track host by userId so reconnect restores host status
 }
 
 const rooms = new Map<string, RoomInfo>();
@@ -19,8 +20,16 @@ const rooms = new Map<string, RoomInfo>();
 function membersList(room: RoomInfo) {
   return Array.from(room.members.entries()).map(([id, m]) => ({
     peerId: id, userId: m.userId, avatar: m.avatar, isStreaming: m.isStreaming,
-    isRoomHost: id === room.hostSocketId,
+    isRoomHost: id === room.hostSocketId, connected: m.connected,
   }));
+}
+
+// Find any existing entry in the room for this userId (used for reconnect)
+function findEntryByUserId(room: RoomInfo, userId: string): { peerId: string; meta: MemberMeta } | null {
+  for (const [peerId, meta] of room.members.entries()) {
+    if (meta.userId === userId) return { peerId, meta };
+  }
+  return null;
 }
 
 export function attachSignaling(httpServer: HttpServer) {
@@ -40,23 +49,38 @@ export function attachSignaling(httpServer: HttpServer) {
     let userMeta: MemberMeta = { userId: "Unknown", avatar: "👤", isStreaming: false };
 
     socket.on("join-room", ({ roomCode, userId, avatar }: { roomCode: string; userId: string; avatar: string }) => {
-      if (currentRoom) handleLeave(socket, currentRoom, io, rooms, userMeta);
+      // Leaving a previous room only counts if user explicitly switches rooms in the same socket session
+      if (currentRoom && currentRoom !== roomCode) handleExplicitLeave(socket, currentRoom, io, rooms, userMeta);
       currentRoom = roomCode;
-      userMeta = { userId, avatar, isStreaming: false };
+      userMeta = { userId, avatar, isStreaming: false, connected: true };
 
       const isNewRoom = !rooms.has(roomCode);
       if (isNewRoom) {
         rooms.set(roomCode, { members: new Map(), hostSocketId: socket.id, hostUserId: userId });
-      } else {
-        // Fix 6: if this user was the original host, restore their host socket ID
-        const room = rooms.get(roomCode)!;
-        if (room.hostUserId === userId) {
-          room.hostSocketId = socket.id;
-          logger.info({ socketId: socket.id, userId, roomCode }, "Host reconnected — host status restored");
-        }
       }
 
       const room = rooms.get(roomCode)!;
+
+      // RECONNECT path: if a member with this userId is already in the room (their old socket
+      // dropped, or they refreshed), replace the old peerId with the new socket.id and
+      // notify everyone so they can rebuild WebRTC connections under the fresh peerId.
+      const existing = findEntryByUserId(room, userId);
+      let oldPeerId: string | null = null;
+      let isStreamingCarry = false;
+      if (existing && existing.peerId !== socket.id) {
+        oldPeerId = existing.peerId;
+        isStreamingCarry = existing.meta.isStreaming;
+        // Carry forward host status (already covered by hostSocketId update below) and isStreaming
+        room.members.delete(existing.peerId);
+        userMeta.isStreaming = isStreamingCarry;
+      }
+
+      // If this userId was the original host, restore their host socket id (covers reconnect & first join)
+      if (room.hostUserId === userId) {
+        room.hostSocketId = socket.id;
+        logger.info({ socketId: socket.id, userId, roomCode }, "Host (re)connected — host status restored");
+      }
+
       room.members.set(socket.id, { ...userMeta });
       socket.join(roomCode);
 
@@ -67,14 +91,21 @@ export function attachSignaling(httpServer: HttpServer) {
         .map(([id, meta]) => ({
           peerId: id, userId: meta.userId, avatar: meta.avatar,
           isStreaming: meta.isStreaming, isRoomHost: id === room.hostSocketId,
+          connected: meta.connected,
         }));
+
+      // If this is a reconnect, tell everyone the old peerId is gone before announcing the new one
+      if (oldPeerId) {
+        socket.to(roomCode).emit("peer-left", { peerId: oldPeerId, userId, silent: true });
+      }
 
       socket.to(roomCode).emit("peer-joined", {
         peerId: socket.id, userId, avatar, isRoomHost: isHost,
+        reconnected: oldPeerId !== null,
       });
       socket.emit("room-joined", { roomCode, peers: existingPeers, iAmRoomHost: isHost });
       io.to(roomCode).emit("members-update", membersList(room));
-      logger.info({ socketId: socket.id, roomCode, userId, isHost }, "Joined room");
+      logger.info({ socketId: socket.id, roomCode, userId, isHost, reconnect: oldPeerId !== null }, "Joined room");
     });
 
     socket.on("start-stream", () => {
@@ -113,15 +144,33 @@ export function attachSignaling(httpServer: HttpServer) {
       if (!currentRoom) return;
       const room = rooms.get(currentRoom);
       if (!room) return;
-      // Fix 4: only host can kick
+      // Only host can kick
       if (socket.id !== room.hostSocketId) return;
       const targetMeta = room.members.get(targetPeerId);
       if (!targetMeta) return;
+      // Notify the target (if still online) and remove them from the room permanently
       const targetSocket = io.sockets.sockets.get(targetPeerId);
       if (targetSocket) {
         targetSocket.emit("you-were-kicked", { byUserId: userMeta.userId });
-        handleLeave(targetSocket, currentRoom, io, rooms, targetMeta);
+        handleExplicitLeave(targetSocket, currentRoom, io, rooms, targetMeta);
+      } else {
+        // Target was offline — just drop the entry and broadcast the new list
+        room.members.delete(targetPeerId);
+        io.to(currentRoom).emit("peer-left", { peerId: targetPeerId, userId: targetMeta.userId });
+        io.to(currentRoom).emit("members-update", membersList(room));
       }
+    });
+
+    // Host explicitly deletes (dissolves) the room — kicks every member out
+    socket.on("delete-room", () => {
+      if (!currentRoom) return;
+      const room = rooms.get(currentRoom);
+      if (!room) return;
+      if (socket.id !== room.hostSocketId) return;
+      io.to(currentRoom).emit("host-left-room", { hostUserId: userMeta.userId });
+      rooms.delete(currentRoom);
+      logger.info({ roomCode: currentRoom, hostUserId: userMeta.userId }, "Host explicitly deleted room");
+      currentRoom = null;
     });
 
     socket.on("mute-member", ({ targetPeerId }: { targetPeerId: string }) => {
@@ -151,20 +200,36 @@ export function attachSignaling(httpServer: HttpServer) {
       socket.to(to).emit("ice-candidate", { from: socket.id, candidate });
     });
 
+    // Member explicitly chose to leave the room
     socket.on("leave-room", () => {
-      if (currentRoom) { handleLeave(socket, currentRoom, io, rooms, userMeta); currentRoom = null; }
+      if (!currentRoom) return;
+      const room = rooms.get(currentRoom);
+      if (!room) { currentRoom = null; return; }
+      // If the host calls leave-room, treat it as deleting the room (dissolves it)
+      if (socket.id === room.hostSocketId) {
+        io.to(currentRoom).emit("host-left-room", { hostUserId: userMeta.userId });
+        rooms.delete(currentRoom);
+        logger.info({ roomCode: currentRoom, hostUserId: userMeta.userId }, "Host left — room dissolved");
+      } else {
+        handleExplicitLeave(socket, currentRoom, io, rooms, userMeta);
+      }
+      currentRoom = null;
     });
 
     socket.on("disconnect", () => {
-      if (currentRoom) handleLeave(socket, currentRoom, io, rooms, userMeta);
-      logger.info({ socketId: socket.id }, "Socket disconnected");
+      // Tab closed / network blip / browser refresh — DO NOT remove the member.
+      // Mark them as offline so others can see, but keep their slot so they can reconnect
+      // (and so the host can still kick them or delete the room).
+      if (currentRoom) handleSocketDrop(socket, currentRoom, io, rooms);
+      logger.info({ socketId: socket.id }, "Socket disconnected (member kept in room as offline)");
     });
   });
 
   return io;
 }
 
-function handleLeave(
+// Permanent removal — used by explicit leave-room (member) and kick-member (host).
+function handleExplicitLeave(
   socket: Socket, roomCode: string, io: IOServer,
   rooms: Map<string, RoomInfo>, userMeta: MemberMeta,
 ) {
@@ -172,7 +237,6 @@ function handleLeave(
   const room = rooms.get(roomCode);
   if (!room) return;
 
-  const wasHost = socket.id === room.hostSocketId;
   room.members.delete(socket.id);
 
   if (room.members.size === 0) {
@@ -180,15 +244,26 @@ function handleLeave(
     return;
   }
 
-  if (wasHost) {
-    io.to(roomCode).emit("host-left-room", { hostUserId: userMeta.userId });
-    rooms.delete(roomCode);
-    logger.info({ roomCode, hostUserId: userMeta.userId }, "Host left — room dissolved");
-  } else {
-    io.to(roomCode).emit("peer-left", { peerId: socket.id, userId: userMeta.userId });
-    io.to(roomCode).emit("members-update", Array.from(room.members.entries()).map(([id, m]) => ({
-      peerId: id, userId: m.userId, avatar: m.avatar, isStreaming: m.isStreaming,
-      isRoomHost: id === room.hostSocketId,
-    })));
-  }
+  io.to(roomCode).emit("peer-left", { peerId: socket.id, userId: userMeta.userId });
+  io.to(roomCode).emit("members-update", membersList(room));
+}
+
+// Soft drop — keeps the member in the room, just marks them offline so peers/UI know.
+// Triggered when the socket dies without an explicit leave (tab close, refresh, network blip).
+function handleSocketDrop(
+  socket: Socket, roomCode: string, io: IOServer,
+  rooms: Map<string, RoomInfo>,
+) {
+  socket.leave(roomCode);
+  const room = rooms.get(roomCode);
+  if (!room) return;
+  const meta = room.members.get(socket.id);
+  if (!meta) return;
+  meta.connected = false;
+  // Stop showing them as "streaming" once they're offline; they'll re-emit start-stream on reconnect
+  meta.isStreaming = false;
+  // Tell peers to tear down their RTCPeerConnection to this dead peerId — they'll get
+  // a fresh peer-joined when the same userId reconnects with a new socket.id.
+  io.to(roomCode).emit("peer-disconnected", { peerId: socket.id, userId: meta.userId });
+  io.to(roomCode).emit("members-update", membersList(room));
 }
