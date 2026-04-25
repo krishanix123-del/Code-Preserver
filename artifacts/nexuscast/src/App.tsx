@@ -635,8 +635,15 @@ export default function App() {
 
   // Fix 9+4: Stream button handler — show option modal on start, end stream without leaving room
   function handleStreamButtonClick() {
-    if (isStreaming) endStreamOnly();
-    else setShowStreamStartModal(true);
+    if (isStreaming) { endStreamOnly(); return; }
+    // Block non-hosts from starting any kind of broadcast while the room host is live.
+    // The server already rejects non-host `start-stream`, but tracks travel peer-to-peer,
+    // so we must also gate it client-side or remote peers will still receive the media.
+    if (hostIsActivelyStreaming()) {
+      notify("The host is streaming — only the host can broadcast right now.", "warning");
+      return;
+    }
+    setShowStreamStartModal(true);
   }
 
   // Fix 2/4/7: End stream but STAY in room — keep PCs alive, just stop tracks
@@ -665,6 +672,12 @@ export default function App() {
   async function startStreamWithOption(option: StreamStartOption) {
     setShowStreamStartModal(false);
     if (!option) return;
+    // Defense-in-depth: even if the modal slipped through, never let a non-host
+    // broadcast camera/screen while the room host is actively streaming.
+    if (hostIsActivelyStreaming()) {
+      notify("The host is streaming — only the host can broadcast right now.", "warning");
+      return;
+    }
     let cameraStarted = false;
     let screenStarted = false;
 
