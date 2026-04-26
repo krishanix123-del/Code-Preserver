@@ -539,20 +539,30 @@ export default function App() {
     const pc = new RTCPeerConnection(RTC_CONFIG);
     pcsRef.current.set(peerId, pc);
 
-    // Add room audio track (mesh voice)
-    if (audioStreamRef.current) {
-      audioStreamRef.current.getAudioTracks().forEach(t => pc.addTrack(t, audioStreamRef.current!));
+    // IMPORTANT: bundle every track we add into the SAME MediaStream so the receiver's
+    // pc.ontrack always reports one combined stream containing both video+audio.
+    // Previously we were adding mic-audio and screen-video into *different* streams,
+    // and whichever ontrack fired last decided what got attached to the <video> element —
+    // if mic (audio-only) fired last, the member saw a black screen.
+    const outboundStream = new MediaStream();
+
+    // Pick the audio track to send: if we're already screen-sharing with a mixed mic+system
+    // track, prefer that. Otherwise use the room mic (audioStreamRef) so members can hear us.
+    const audioTrackToAdd: MediaStreamTrack | null =
+      (isScreenSharingRef.current && mixedAudioTrackRef.current) ? mixedAudioTrackRef.current
+      : (audioStreamRef.current?.getAudioTracks()[0] ?? null);
+    if (audioTrackToAdd) {
+      outboundStream.addTrack(audioTrackToAdd);
+      pc.addTrack(audioTrackToAdd, outboundStream);
     }
-    // Add local stream audio/video if streaming
-    if (localStreamRef.current) {
-      if (!isScreenSharingRef.current) {
-        localStreamRef.current.getVideoTracks().forEach(t => pc.addTrack(t, localStreamRef.current!));
-      }
-      // Don't add audio from localStream — audioStreamRef handles it
-    }
-    if (isScreenSharingRef.current && screenStreamRef.current) {
-      screenStreamRef.current.getVideoTracks().forEach(t => pc.addTrack(t, screenStreamRef.current!));
-      screenStreamRef.current.getAudioTracks().forEach(t => pc.addTrack(t, screenStreamRef.current!));
+
+    // Pick the video track: screen share takes priority over camera while sharing
+    const videoTrackToAdd: MediaStreamTrack | null = isScreenSharingRef.current
+      ? (screenStreamRef.current?.getVideoTracks()[0] ?? null)
+      : (localStreamRef.current?.getVideoTracks()[0] ?? null);
+    if (videoTrackToAdd) {
+      outboundStream.addTrack(videoTrackToAdd);
+      pc.addTrack(videoTrackToAdd, outboundStream);
     }
 
     pc.onicecandidate = e => {
@@ -562,14 +572,28 @@ export default function App() {
     pc.ontrack = e => {
       const stream = e.streams?.[0];
       if (!stream) return;
+      const incomingHasVideo = stream.getVideoTracks().length > 0;
+      // Never let an audio-only stream overwrite a stream that already carries video —
+      // that swap was the exact reason members were seeing a black screen during share.
       setRemoteStreams(p => {
-        const exists = p.find(r => r.peerId === peerId);
-        return exists ? p.map(r => r.peerId === peerId ? { peerId, stream } : r) : [...p, { peerId, stream }];
+        const existing = p.find(r => r.peerId === peerId);
+        if (!existing) return [...p, { peerId, stream }];
+        const existingHasVideo = existing.stream.getVideoTracks().length > 0;
+        if (existingHasVideo && !incomingHasVideo) return p; // keep the video stream
+        return p.map(r => r.peerId === peerId ? { peerId, stream } : r);
       });
-      setFocusedStream(prev => prev?.peerId === peerId ? { peerId, stream } : prev ?? { peerId, stream });
-      attachStreamToVideo(peerId, stream);
+      setFocusedStream(prev => {
+        if (prev?.peerId !== peerId) return prev ?? { peerId, stream };
+        const prevHasVideo = prev.stream.getVideoTracks().length > 0;
+        if (prevHasVideo && !incomingHasVideo) return prev;
+        return { peerId, stream };
+      });
+      // Only re-attach the <video> element when the new stream actually carries video.
+      if (incomingHasVideo) attachStreamToVideo(peerId, stream);
       // Also listen for new tracks added later (e.g., screen share added mid-stream)
-      stream.onaddtrack = () => attachStreamToVideo(peerId, stream);
+      stream.onaddtrack = () => {
+        if (stream.getVideoTracks().length > 0) attachStreamToVideo(peerId, stream);
+      };
     };
 
     pc.oniceconnectionstatechange = () => {
