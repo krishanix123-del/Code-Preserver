@@ -127,6 +127,10 @@ export default function App() {
   const miniVideoRef = useRef<HTMLVideoElement>(null);
   const localCenterRef = useRef<HTMLVideoElement>(null);
   const pcsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+  // Per-PC outbound MediaStream — every track we ever send to a peer goes into the SAME
+  // MediaStream so the receiver always sees one growing stream (avoids the "two-streams,
+  // audio-only wins, video element black" race).
+  const outboundStreamsRef = useRef<Map<string, MediaStream>>(new Map());
   const socketRef = useRef<Socket | null>(null);
   const remoteVideoRefs = useRef<Map<string, HTMLVideoElement>>(new Map());
 
@@ -539,12 +543,12 @@ export default function App() {
     const pc = new RTCPeerConnection(RTC_CONFIG);
     pcsRef.current.set(peerId, pc);
 
-    // IMPORTANT: bundle every track we add into the SAME MediaStream so the receiver's
-    // pc.ontrack always reports one combined stream containing both video+audio.
-    // Previously we were adding mic-audio and screen-video into *different* streams,
-    // and whichever ontrack fired last decided what got attached to the <video> element —
-    // if mic (audio-only) fired last, the member saw a black screen.
+    // IMPORTANT: bundle every track we ever send to this peer into the SAME MediaStream so
+    // the receiver's pc.ontrack always reports one combined stream containing whatever we're
+    // currently sending. We REUSE this stream on later addTrack() calls (camera turn-on,
+    // screen share start, etc.) so the receiver doesn't see a second/parallel stream.
     const outboundStream = new MediaStream();
+    outboundStreamsRef.current.set(peerId, outboundStream);
 
     // Pick the audio track to send: if we're already screen-sharing with a mixed mic+system
     // track, prefer that. Otherwise use the room mic (audioStreamRef) so members can hear us.
@@ -660,6 +664,7 @@ export default function App() {
   function removePeer(peerId: string) {
     const pc = pcsRef.current.get(peerId);
     if (pc) { pc.close(); pcsRef.current.delete(peerId); }
+    outboundStreamsRef.current.delete(peerId);
     // Fix 1/7: clear video srcObject to prevent frozen/black frame ghost
     const vid = remoteVideoRefs.current.get(peerId);
     if (vid) { vid.pause(); vid.srcObject = null; }
@@ -739,12 +744,15 @@ export default function App() {
           localCenterRef.current.play().catch(() => {});
         }
         // Send to existing peers; apply encoding caps after a short delay (browser needs ICE first)
-        pcsRef.current.forEach(pc => {
+        pcsRef.current.forEach((pc, peerId) => {
           const senders = pc.getSenders();
+          const ob = outboundStreamsRef.current.get(peerId) ?? (() => {
+            const s = new MediaStream(); outboundStreamsRef.current.set(peerId, s); return s;
+          })();
           stream.getTracks().forEach(track => {
             const existing = senders.find(s => s.track?.kind === track.kind);
             if (existing) existing.replaceTrack(track).catch(() => {});
-            else pc.addTrack(track, stream);
+            else { try { ob.addTrack(track); } catch {} pc.addTrack(track, ob); }
           });
           setTimeout(() => applyVideoEncodingParams(pc, false), 1500);
         });
@@ -798,15 +806,18 @@ export default function App() {
           const audioToSend: MediaStreamTrack | null = screenAudio
             ? (buildMixedAudioTrack(screenAudio) ?? screenAudio)
             : null;
-          pcsRef.current.forEach(pc => {
+          pcsRef.current.forEach((pc, peerId) => {
+            const ob = outboundStreamsRef.current.get(peerId) ?? (() => {
+              const s = new MediaStream(); outboundStreamsRef.current.set(peerId, s); return s;
+            })();
             // Find active video sender OR a null-track sender (camera was turned off earlier)
             const videoSender = pc.getSenders().find(s => s.track?.kind === "video") ?? pc.getSenders().find(s => s.track === null);
             if (videoSender) videoSender.replaceTrack(screenVideoTrack).catch(() => {});
-            else pc.addTrack(screenVideoTrack, screenStream);
+            else { try { ob.addTrack(screenVideoTrack); } catch {} pc.addTrack(screenVideoTrack, ob); }
             if (audioToSend) {
               const audioSender = pc.getSenders().find(s => s.track?.kind === "audio");
               if (audioSender) audioSender.replaceTrack(audioToSend).catch(() => {});
-              else pc.addTrack(audioToSend, screenStream);
+              else { try { ob.addTrack(audioToSend); } catch {} pc.addTrack(audioToSend, ob); }
             }
             // Apply screen share encoding caps shortly after — give ICE a moment first
             setTimeout(() => applyVideoEncodingParams(pc, true), 250);
@@ -884,12 +895,15 @@ export default function App() {
           localCenterRef.current.srcObject = stream;
           localCenterRef.current.play().catch(() => {});
         }
-        pcsRef.current.forEach(pc => {
+        pcsRef.current.forEach((pc, peerId) => {
           const senders = pc.getSenders();
+          const ob = outboundStreamsRef.current.get(peerId) ?? (() => {
+            const s = new MediaStream(); outboundStreamsRef.current.set(peerId, s); return s;
+          })();
           stream.getTracks().forEach(track => {
             const existing = senders.find(s => s.track?.kind === track.kind);
             if (existing) existing.replaceTrack(track).catch(() => {});
-            else pc.addTrack(track, stream);
+            else { try { ob.addTrack(track); } catch {} pc.addTrack(track, ob); }
           });
           setTimeout(() => applyVideoEncodingParams(pc, false), 1500);
         });
@@ -1035,14 +1049,17 @@ export default function App() {
         ? (buildMixedAudioTrack(screenAudio) ?? screenAudio)
         : null;
 
-      pcsRef.current.forEach(pc => {
+      pcsRef.current.forEach((pc, peerId) => {
+        const ob = outboundStreamsRef.current.get(peerId) ?? (() => {
+          const s = new MediaStream(); outboundStreamsRef.current.set(peerId, s); return s;
+        })();
         const videoSender = pc.getSenders().find(s => s.track?.kind === "video") ?? pc.getSenders().find(s => s.track === null);
         if (videoSender) videoSender.replaceTrack(screenTrack).catch(() => {});
-        else pc.addTrack(screenTrack, screenStream);
+        else { try { ob.addTrack(screenTrack); } catch {} pc.addTrack(screenTrack, ob); }
         if (audioToSend) {
           const audioSender = pc.getSenders().find(s => s.track?.kind === "audio");
           if (audioSender) audioSender.replaceTrack(audioToSend).catch(() => {});
-          else pc.addTrack(audioToSend, screenStream);
+          else { try { ob.addTrack(audioToSend); } catch {} pc.addTrack(audioToSend, ob); }
         }
         setTimeout(() => applyVideoEncodingParams(pc, true), 250);
       });
