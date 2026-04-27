@@ -7,6 +7,7 @@ interface MemberMeta {
   avatar: string;
   isStreaming: boolean;
   connected: boolean;
+  isViewer: boolean;
 }
 
 interface RoomInfo {
@@ -20,7 +21,7 @@ const rooms = new Map<string, RoomInfo>();
 function membersList(room: RoomInfo) {
   return Array.from(room.members.entries()).map(([id, m]) => ({
     peerId: id, userId: m.userId, avatar: m.avatar, isStreaming: m.isStreaming,
-    isRoomHost: id === room.hostSocketId, connected: m.connected,
+    isRoomHost: id === room.hostSocketId, connected: m.connected, isViewer: m.isViewer,
   }));
 }
 
@@ -46,13 +47,13 @@ export function attachSignaling(httpServer: HttpServer) {
   io.on("connection", (socket: Socket) => {
     logger.info({ socketId: socket.id }, "Socket connected");
     let currentRoom: string | null = null;
-    let userMeta: MemberMeta = { userId: "Unknown", avatar: "👤", isStreaming: false };
+    let userMeta: MemberMeta = { userId: "Unknown", avatar: "👤", isStreaming: false, connected: true, isViewer: false };
 
-    socket.on("join-room", ({ roomCode, userId, avatar }: { roomCode: string; userId: string; avatar: string }) => {
+    socket.on("join-room", ({ roomCode, userId, avatar, isViewer }: { roomCode: string; userId: string; avatar: string; isViewer?: boolean }) => {
       // Leaving a previous room only counts if user explicitly switches rooms in the same socket session
       if (currentRoom && currentRoom !== roomCode) handleExplicitLeave(socket, currentRoom, io, rooms, userMeta);
       currentRoom = roomCode;
-      userMeta = { userId, avatar, isStreaming: false, connected: true };
+      userMeta = { userId, avatar, isStreaming: false, connected: true, isViewer: !!isViewer };
 
       const isNewRoom = !rooms.has(roomCode);
       if (isNewRoom) {
@@ -91,7 +92,7 @@ export function attachSignaling(httpServer: HttpServer) {
         .map(([id, meta]) => ({
           peerId: id, userId: meta.userId, avatar: meta.avatar,
           isStreaming: meta.isStreaming, isRoomHost: id === room.hostSocketId,
-          connected: meta.connected,
+          connected: meta.connected, isViewer: meta.isViewer,
         }));
 
       // If this is a reconnect, tell everyone the old peerId is gone before announcing the new one
@@ -101,7 +102,7 @@ export function attachSignaling(httpServer: HttpServer) {
 
       socket.to(roomCode).emit("peer-joined", {
         peerId: socket.id, userId, avatar, isRoomHost: isHost,
-        reconnected: oldPeerId !== null,
+        reconnected: oldPeerId !== null, isViewer: userMeta.isViewer,
       });
       socket.emit("room-joined", { roomCode, peers: existingPeers, iAmRoomHost: isHost });
       io.to(roomCode).emit("members-update", membersList(room));

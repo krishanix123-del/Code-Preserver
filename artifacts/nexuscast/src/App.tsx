@@ -45,7 +45,7 @@ const RTC_CONFIG: RTCConfiguration = {
 };
 
 interface ChatMessage { id: number; sender: string; text: string; }
-interface Member { peerId: string; userId: string; avatar: string; isFav: boolean; isStreaming: boolean; isRoomHost: boolean; connected?: boolean; }
+interface Member { peerId: string; userId: string; avatar: string; isFav: boolean; isStreaming: boolean; isRoomHost: boolean; connected?: boolean; isViewer?: boolean; }
 interface RemoteStream { peerId: string; stream: MediaStream; }
 interface Notification { id: number; message: string; type: "success" | "error" | "info" | "warning"; }
 interface IncomingJoinReq { from: string; userId: string; avatar: string; }
@@ -262,7 +262,7 @@ export default function App() {
       setIsConnected(true);
       notify("Connected to server", "success");
       if (currentRoomRef.current) {
-        socket.emit("join-room", { roomCode: currentRoomRef.current, userId: userIdRef.current, avatar: userAvatarRef.current });
+        socket.emit("join-room", { roomCode: currentRoomRef.current, userId: userIdRef.current, avatar: userAvatarRef.current, isViewer: _isViewer });
         if (isStreamingRef.current) socket.emit("start-stream");
       } else {
         // Auto-join from URL parameter (mobile app deep link / QR code scan / watch link)
@@ -273,8 +273,8 @@ export default function App() {
           const code = ((watchParam || roomParam) || "").toUpperCase();
           if (code && code.length >= 4) {
             setCurrentRoom(code);
-            setMembers([{ peerId: "me", userId: userIdRef.current, avatar: userAvatarRef.current, isFav: false, isStreaming: false, isRoomHost: false, connected: true }]);
-            socket.emit("join-room", { roomCode: code, userId: userIdRef.current, avatar: userAvatarRef.current });
+            setMembers([{ peerId: "me", userId: userIdRef.current, avatar: userAvatarRef.current, isFav: false, isStreaming: false, isRoomHost: false, connected: true, isViewer: _isViewer }]);
+            socket.emit("join-room", { roomCode: code, userId: userIdRef.current, avatar: userAvatarRef.current, isViewer: _isViewer });
             addMsg("⚡ SYSTEM", _isViewer ? `👁️ Watching room: ${code}` : `Auto-joined room: ${code}`);
             notify(_isViewer ? `Watching ${code} as a guest` : `Joined room ${code}`, "success");
           }
@@ -288,10 +288,10 @@ export default function App() {
       else notify("Connection lost. Reconnecting...", "warning");
     });
 
-    socket.on("room-joined", ({ peers, iAmRoomHost: iAmHost }: { peers: { peerId: string; userId: string; avatar: string; isStreaming: boolean; isRoomHost: boolean; connected?: boolean }[]; iAmRoomHost: boolean; }) => {
+    socket.on("room-joined", ({ peers, iAmRoomHost: iAmHost }: { peers: { peerId: string; userId: string; avatar: string; isStreaming: boolean; isRoomHost: boolean; connected?: boolean; isViewer?: boolean }[]; iAmRoomHost: boolean; }) => {
       setIAmRoomHost(iAmHost);
-      peers.forEach(({ peerId, userId: uid, avatar, isStreaming: streaming, isRoomHost, connected }) => {
-        setMembers(p => p.find(m => m.peerId === peerId) ? p : [...p, { peerId, userId: uid, avatar, isFav: false, isStreaming: streaming, isRoomHost, connected: connected !== false }]);
+      peers.forEach(({ peerId, userId: uid, avatar, isStreaming: streaming, isRoomHost, connected, isViewer: peerIsViewer }) => {
+        setMembers(p => p.find(m => m.peerId === peerId) ? p : [...p, { peerId, userId: uid, avatar, isFav: false, isStreaming: streaming, isRoomHost, connected: connected !== false, isViewer: !!peerIsViewer }]);
         // Always connect so the host can push video later via renegotiation
         if (connected !== false) connectToPeer(peerId, socket);
         if (streaming && connected !== false) {
@@ -308,7 +308,7 @@ export default function App() {
       });
     });
 
-    socket.on("peer-joined", ({ peerId, userId: uid, avatar, isRoomHost, reconnected }: { peerId: string; userId: string; avatar: string; isRoomHost: boolean; reconnected?: boolean }) => {
+    socket.on("peer-joined", ({ peerId, userId: uid, avatar, isRoomHost, reconnected, isViewer: peerIsViewer }: { peerId: string; userId: string; avatar: string; isRoomHost: boolean; reconnected?: boolean; isViewer?: boolean }) => {
       notify(reconnected ? `${uid} reconnected` : `${uid} joined the room`, "info");
       addMsg("⚡ SYSTEM", reconnected ? `${uid} reconnected` : `${uid} joined`);
       // If this is a reconnect, the server already removed the old peerId entry from the room state
@@ -321,7 +321,7 @@ export default function App() {
         return [
           ...(myEntry ? [myEntry] : []),
           ...others,
-          { peerId, userId: uid, avatar, isFav: false, isStreaming: false, isRoomHost, connected: true },
+          { peerId, userId: uid, avatar, isFav: false, isStreaming: false, isRoomHost, connected: true, isViewer: !!peerIsViewer },
         ];
       });
       // Don't initiate — the new peer sends offers to existing peers; just notify if we're streaming
@@ -451,18 +451,19 @@ export default function App() {
       removePeer(peerId);
     });
 
-    socket.on("members-update", (list: { peerId: string; userId: string; avatar: string; isStreaming: boolean; isRoomHost: boolean; connected?: boolean }[]) => {
+    socket.on("members-update", (list: { peerId: string; userId: string; avatar: string; isStreaming: boolean; isRoomHost: boolean; connected?: boolean; isViewer?: boolean }[]) => {
       setMembers(prev => {
         const myEntry = prev.find(m => m.peerId === "me");
         const updated = list.filter(p => p.peerId !== socket.id).map(p => ({
           ...p,
           isFav: prev.find(m => m.peerId === p.peerId)?.isFav ?? false,
           connected: p.connected !== false,
+          isViewer: !!p.isViewer,
         }));
         // Update my own connected flag based on what the server says about my socket id
         const myServerEntry = list.find(p => p.peerId === socket.id);
         const meUpdated = myEntry && myServerEntry
-          ? { ...myEntry, connected: myServerEntry.connected !== false, isStreaming: myServerEntry.isStreaming, isRoomHost: myServerEntry.isRoomHost }
+          ? { ...myEntry, connected: myServerEntry.connected !== false, isStreaming: myServerEntry.isStreaming, isRoomHost: myServerEntry.isRoomHost, isViewer: !!myServerEntry.isViewer }
           : myEntry;
         return meUpdated ? [meUpdated, ...updated] : updated;
       });
@@ -498,16 +499,16 @@ export default function App() {
     };
   }, []);
 
-  // Adaptive encoding: lower bitrate on mobile, separate caps for camera vs screen share
+  // Adaptive encoding: bumped for "lagless" feel — higher bitrates + framerate, prioritise framerate over resolution.
+  // Mobile: camera 900 Kbps / screen 1.5 Mbps | Desktop: camera 2.5 Mbps / screen 4 Mbps.
   function applyVideoEncodingParams(pc: RTCPeerConnection, isScreenShare = false) {
     const isMob = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-    // Mobile: camera 600 Kbps / screen 900 Kbps | Desktop: camera 1200 Kbps / screen 2000 Kbps
     const maxBitrate = isScreenShare
-      ? (isMob ? 900_000 : 2_000_000)
-      : (isMob ? 600_000 : 1_200_000);
+      ? (isMob ? 1_500_000 : 4_000_000)
+      : (isMob ? 900_000 : 2_500_000);
     const maxFramerate = isScreenShare
-      ? (isMob ? 15 : 24)
-      : (isMob ? 24 : 30);
+      ? (isMob ? 20 : 30)
+      : (isMob ? 30 : 30);
 
     pc.getSenders().forEach(async sender => {
       if (sender.track?.kind === "video") {
@@ -518,11 +519,29 @@ export default function App() {
           }
           params.encodings[0].maxBitrate = maxBitrate;
           params.encodings[0].maxFramerate = maxFramerate;
-          params.encodings[0].degradationPreference = "maintain-framerate";
+          // 'maintain-framerate' keeps motion smooth at the cost of resolution — best for "lagless" perception
+          (params.encodings[0] as { degradationPreference?: string }).degradationPreference = "maintain-framerate";
+          // Low jitter buffer at the sender side too
+          (params as { degradationPreference?: string }).degradationPreference = "maintain-framerate";
           await sender.setParameters(params);
         } catch {}
       }
     });
+  }
+
+  // Tell the receiver to use the smallest possible jitter buffer — trades robustness for latency.
+  // Real-time perceived "no lag" comes from this more than from raw bitrate.
+  function applyLowLatencyToReceivers(pc: RTCPeerConnection) {
+    try {
+      pc.getReceivers().forEach(r => {
+        if (r.track?.kind === "video") {
+          (r as unknown as { playoutDelayHint?: number }).playoutDelayHint = 0;
+          (r as unknown as { jitterBufferTarget?: number }).jitterBufferTarget = 0;
+        } else if (r.track?.kind === "audio") {
+          (r as unknown as { playoutDelayHint?: number }).playoutDelayHint = 0;
+        }
+      });
+    } catch {}
   }
 
   function attachStreamToVideo(peerId: string, stream: MediaStream) {
@@ -613,9 +632,12 @@ export default function App() {
       });
       // Only re-attach the <video> element when the new stream actually carries video.
       if (incomingHasVideo) attachStreamToVideo(peerId, stream);
+      // Lagless: shrink the receive jitter buffer so frames render the moment they arrive
+      applyLowLatencyToReceivers(pc);
       // Also listen for new tracks added later (e.g., screen share added mid-stream)
       stream.onaddtrack = () => {
         if (stream.getVideoTracks().length > 0) attachStreamToVideo(peerId, stream);
+        applyLowLatencyToReceivers(pc);
       };
     };
 
@@ -1116,8 +1138,8 @@ export default function App() {
 
   function joinRoomOnServer(roomCode: string) {
     setCurrentRoom(roomCode);
-    setMembers([{ peerId: "me", userId: userIdRef.current, avatar: userAvatarRef.current, isFav: false, isStreaming: isStreamingRef.current, isRoomHost: false, connected: true }]);
-    socketRef.current?.emit("join-room", { roomCode, userId: userIdRef.current, avatar: userAvatarRef.current });
+    setMembers([{ peerId: "me", userId: userIdRef.current, avatar: userAvatarRef.current, isFav: false, isStreaming: isStreamingRef.current, isRoomHost: false, connected: true, isViewer: _isViewer }]);
+    socketRef.current?.emit("join-room", { roomCode, userId: userIdRef.current, avatar: userAvatarRef.current, isViewer: _isViewer });
     if (isStreamingRef.current) socketRef.current?.emit("start-stream");
     addMsg("⚡ SYSTEM", `Joined room: ${roomCode}`);
     notify(`Joined room ${roomCode}`, "success");
@@ -1264,6 +1286,14 @@ export default function App() {
 
   // Fix 3/4/6: only the room host can start a stream; if already streaming always show END
   const canStartStream = iAmRoomHost || isStreaming;
+
+  // Live viewer count — anyone in the room flagged as a viewer (from a watch link).
+  // Counts only "connected" viewers so disconnected guests don't inflate the number.
+  const viewerCount = useMemo(
+    () => members.filter(m => m.isViewer && m.peerId !== "me" && m.connected !== false).length,
+    [members]
+  );
+  const someoneIsLive = isStreaming || members.some(m => m.isStreaming && m.peerId !== "me");
   // If any other member is streaming, host should still see the button (to start their own or end theirs)
   const showLocalCenter = (isStreaming || isWebcamOn || isScreenSharing) && !focusedStream && remoteStreams.length === 0;
   // Members only see the remote stream after they've chosen to join it
@@ -1542,6 +1572,11 @@ export default function App() {
               )}
             </>
           )}
+          {someoneIsLive && (
+            <div title={`${viewerCount} watching from a watch link`} style={{ background: "rgba(255,0,128,0.18)", padding: "4px 9px", borderRadius: 14, fontSize: 11, fontWeight: 700, color: "#ff88aa", border: "1px solid #ff4488" }}>
+              👁️ {viewerCount}
+            </div>
+          )}
           <div style={{ color: "#00d4ff", fontFamily: "monospace", fontWeight: 700, fontSize: 14 }}>{fmt(streamSec)}</div>
         </div>
 
@@ -1784,8 +1819,15 @@ export default function App() {
         {/* CENTER VIDEO */}
         <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 10, minWidth: 0 }}>
           <div style={{ flex: 1, position: "relative", borderRadius: 16, overflow: "hidden", border: `3px solid ${isStreaming ? "#ff0000" : "#00d4ff"}`, background: "#000", boxShadow: isStreaming ? "0 0 40px rgba(255,0,0,0.3)" : "0 0 20px rgba(0,212,255,0.2)", transition: "all .3s" }}>
-            <div style={{ position: "absolute", top: 10, left: 10, background: "rgba(0,14,39,0.85)", padding: "3px 10px", borderRadius: 16, fontSize: 10, fontWeight: 600, color: "#00d4ff", border: "1px solid #004d7f", zIndex: 15 }}>
-              {isScreenSharing ? "🖥️ SCREEN SHARE" : isStreaming ? "🔴 LIVE STREAM" : "🎥 STREAM"}
+            <div style={{ position: "absolute", top: 10, left: 10, display: "flex", gap: 6, zIndex: 15 }}>
+              <div style={{ background: "rgba(0,14,39,0.85)", padding: "3px 10px", borderRadius: 16, fontSize: 10, fontWeight: 600, color: "#00d4ff", border: "1px solid #004d7f" }}>
+                {isScreenSharing ? "🖥️ SCREEN SHARE" : isStreaming ? "🔴 LIVE STREAM" : "🎥 STREAM"}
+              </div>
+              {someoneIsLive && (
+                <div title={`${viewerCount} ${viewerCount === 1 ? "guest is" : "guests are"} watching from a watch link`} style={{ background: "rgba(255,0,128,0.18)", padding: "3px 10px", borderRadius: 16, fontSize: 10, fontWeight: 700, color: "#ff88aa", border: "1px solid #ff4488" }}>
+                  👁️ {viewerCount} watching
+                </div>
+              )}
             </div>
             {isStreaming && <div style={{ position: "absolute", top: 10, right: 10, background: "rgba(255,0,0,0.25)", padding: "3px 10px", borderRadius: 16, fontSize: 10, fontWeight: 700, color: "#ff4444", border: "1px solid #ff4444", animation: "statusBlink 1s infinite", zIndex: 15 }}>● LIVE</div>}
 
