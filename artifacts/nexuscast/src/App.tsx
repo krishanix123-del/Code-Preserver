@@ -851,10 +851,8 @@ export default function App() {
             const ob = outboundStreamsRef.current.get(peerId) ?? (() => {
               const s = new MediaStream(); outboundStreamsRef.current.set(peerId, s); return s;
             })();
-            // CRITICAL bug fix: only match a *video* sender (or video transceiver with empty sender).
-            // The previous fallback `?? find(s => s.track === null)` would match a muted-mic AUDIO
-            // sender and then replaceTrack a video track onto an audio m-line — viewer sees BLACK.
-            const videoSender = pickVideoSender(pc);
+            // Find active video sender OR a null-track sender (camera was turned off earlier)
+            const videoSender = pc.getSenders().find(s => s.track?.kind === "video") ?? pc.getSenders().find(s => s.track === null);
             if (videoSender) videoSender.replaceTrack(screenVideoTrack).catch(() => {});
             else { try { ob.addTrack(screenVideoTrack); } catch {} pc.addTrack(screenVideoTrack, ob); }
             if (audioToSend) {
@@ -1047,9 +1045,7 @@ export default function App() {
     const camTrack = localStreamRef.current?.getVideoTracks()[0] ?? null;
     const micTrack = audioStreamRef.current?.getAudioTracks()[0] ?? localStreamRef.current?.getAudioTracks()[0] ?? null;
     pcsRef.current.forEach(pc => {
-      // CRITICAL: pickVideoSender ignores null-track audio senders so we never replaceTrack
-      // a video into an audio m-line (the cause of the persistent black-screen bug).
-      const videoSender = pickVideoSender(pc);
+      const videoSender = pc.getSenders().find(s => s.track?.kind === "video") ?? pc.getSenders().find(s => s.track === null);
       if (videoSender) videoSender.replaceTrack(camTrack).catch(() => {});
       // Restore the mic audio (we may have been sending the mixed mic+system track)
       const audioSender = pc.getSenders().find(s => s.track?.kind === "audio");
@@ -1098,8 +1094,7 @@ export default function App() {
         const ob = outboundStreamsRef.current.get(peerId) ?? (() => {
           const s = new MediaStream(); outboundStreamsRef.current.set(peerId, s); return s;
         })();
-        // CRITICAL: pickVideoSender — see comment at toggleWebcam. The old fallback caused black screens.
-        const videoSender = pickVideoSender(pc);
+        const videoSender = pc.getSenders().find(s => s.track?.kind === "video") ?? pc.getSenders().find(s => s.track === null);
         if (videoSender) videoSender.replaceTrack(screenTrack).catch(() => {});
         else { try { ob.addTrack(screenTrack); } catch {} pc.addTrack(screenTrack, ob); }
         if (audioToSend) {
