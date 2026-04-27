@@ -9,6 +9,10 @@ const _initParams = new URLSearchParams(typeof window !== "undefined" ? window.l
 const _nativeUid = _initParams.get("uid") ?? null;
 const _nativeAvatar = _initParams.get("avatar") ? decodeURIComponent(_initParams.get("avatar")!) : null;
 const _isNativeApp = _initParams.get("native") === "1";
+// "Watch link" mode: ?watch=ROOMCODE auto-joins the room as a view-only guest.
+// Viewers don't broadcast (no mic, no camera, no screen share), they just watch + chat.
+const _watchCode = (_initParams.get("watch") || "").toUpperCase();
+const _isViewer = _watchCode.length >= 4;
 
 /** Post a message to the React Native WebView wrapper (no-op in browser) */
 function postToNative(data: Record<string, unknown>) {
@@ -64,8 +68,10 @@ export default function App() {
   const [streamSec, setStreamSec] = useState(0);
   const [currentRoom, setCurrentRoom] = useState<string | null>(null);
   const [iAmRoomHost, setIAmRoomHost] = useState(false);
-  const [userId, setUserId] = useState(_nativeUid || "USER_" + Math.random().toString(36).substr(2, 4).toUpperCase());
-  const [userAvatar, setUserAvatar] = useState(_nativeAvatar || "👤");
+  const [userId, setUserId] = useState(
+    _nativeUid || (_isViewer ? "Guest_" : "USER_") + Math.random().toString(36).substr(2, 4).toUpperCase()
+  );
+  const [userAvatar, setUserAvatar] = useState(_nativeAvatar || (_isViewer ? "👁️" : "👤"));
 
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
@@ -259,17 +265,18 @@ export default function App() {
         socket.emit("join-room", { roomCode: currentRoomRef.current, userId: userIdRef.current, avatar: userAvatarRef.current });
         if (isStreamingRef.current) socket.emit("start-stream");
       } else {
-        // Auto-join from URL parameter (mobile app deep link / QR code scan)
+        // Auto-join from URL parameter (mobile app deep link / QR code scan / watch link)
         try {
           const params = new URLSearchParams(window.location.search);
+          const watchParam = params.get("watch");
           const roomParam = params.get("room");
-          if (roomParam && roomParam.length >= 4) {
-            const code = roomParam.toUpperCase();
+          const code = ((watchParam || roomParam) || "").toUpperCase();
+          if (code && code.length >= 4) {
             setCurrentRoom(code);
             setMembers([{ peerId: "me", userId: userIdRef.current, avatar: userAvatarRef.current, isFav: false, isStreaming: false, isRoomHost: false, connected: true }]);
             socket.emit("join-room", { roomCode: code, userId: userIdRef.current, avatar: userAvatarRef.current });
-            addMsg("⚡ SYSTEM", `Auto-joined room: ${code}`);
-            notify(`Joined room ${code}`, "success");
+            addMsg("⚡ SYSTEM", _isViewer ? `👁️ Watching room: ${code}` : `Auto-joined room: ${code}`);
+            notify(_isViewer ? `Watching ${code} as a guest` : `Joined room ${code}`, "success");
           }
         } catch {}
       }
@@ -288,10 +295,15 @@ export default function App() {
         // Always connect so the host can push video later via renegotiation
         if (connected !== false) connectToPeer(peerId, socket);
         if (streaming && connected !== false) {
-          // Show join/skip prompt — member decides whether to watch the active stream
-          setJoinStreamPrompt({ hostPeerId: peerId, hostUserId: uid });
-          addMsg("⚡ SYSTEM", `${uid} is streaming — click Join Stream to watch!`);
-          notify(`📡 ${uid} is live in this room!`, "info");
+          if (_isViewer) {
+            // Viewers auto-join the active stream — no prompt, that's the whole point of the watch link
+            socket.emit("join-stream-request", { hostPeerId: peerId });
+            addMsg("⚡ SYSTEM", `👁️ Watching ${uid}'s stream`);
+          } else {
+            setJoinStreamPrompt({ hostPeerId: peerId, hostUserId: uid });
+            addMsg("⚡ SYSTEM", `${uid} is streaming — click Join Stream to watch!`);
+            notify(`📡 ${uid} is live in this room!`, "info");
+          }
         }
       });
     });
@@ -336,12 +348,18 @@ export default function App() {
 
     socket.on("peer-started-stream", ({ peerId, userId: uid }: { peerId: string; userId: string }) => {
       setMembers(p => p.map(m => m.peerId === peerId ? { ...m, isStreaming: true } : m));
-      // Show join/skip prompt — do NOT auto-join; member decides
-      setJoinStreamPrompt({ hostPeerId: peerId, hostUserId: uid });
-      addMsg("⚡ SYSTEM", `${uid} started streaming — click Join Stream to watch!`);
-      notify(`📡 ${uid} started streaming!`, "info");
-      // Establish WebRTC connection now so tracks are ready when they choose to join
+      // Establish WebRTC connection now so tracks are ready immediately
       if (!pcsRef.current.has(peerId)) connectToPeer(peerId, socket);
+      if (_isViewer) {
+        // Viewer auto-joins — they came here specifically to watch
+        socket.emit("join-stream-request", { hostPeerId: peerId });
+        addMsg("⚡ SYSTEM", `👁️ ${uid} went live — auto-joining`);
+      } else {
+        // Show join/skip prompt — do NOT auto-join; member decides
+        setJoinStreamPrompt({ hostPeerId: peerId, hostUserId: uid });
+        addMsg("⚡ SYSTEM", `${uid} started streaming — click Join Stream to watch!`);
+        notify(`📡 ${uid} started streaming!`, "info");
+      }
     });
 
     socket.on("peer-stopped-stream", ({ peerId }: { peerId: string }) => {
@@ -530,6 +548,7 @@ export default function App() {
   }
 
   async function initRoomAudio() {
+    if (_isViewer) return; // view-only guests don't have a mic
     if (audioStreamRef.current) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
@@ -1221,6 +1240,15 @@ export default function App() {
     if (currentRoom) navigator.clipboard.writeText(currentRoom).then(() => notify("Copied!", "success"));
   }
 
+  function copyWatchLink() {
+    if (!currentRoom) return;
+    const url = `${window.location.origin}/?watch=${currentRoom}`;
+    navigator.clipboard.writeText(url).then(
+      () => notify("📺 Watch link copied — share it like a YouTube link!", "success"),
+      () => notify(url, "info")
+    );
+  }
+
   function displayName(member: Member) {
     return localNicknames[member.peerId] || member.userId;
   }
@@ -1495,16 +1523,24 @@ export default function App() {
 
         {/* STREAM CONTROLS */}
         <div style={{ background: "rgba(10,14,39,0.95)", borderBottom: "1px solid #004d7f", padding: "10px 12px", display: "flex", gap: 8, justifyContent: "center", flexShrink: 0, flexWrap: "wrap", alignItems: "center" }}>
-          {/* Fix 3: STREAM button only for host */}
-          {canStartStream && (
-            <button onClick={handleStreamButtonClick} style={{ padding: "10px 18px", borderRadius: 10, border: `2px solid ${isStreaming ? "#ff4444" : "#00d4ff"}`, background: isStreaming ? "rgba(255,0,0,0.2)" : "rgba(0,212,255,0.15)", color: isStreaming ? "#ff6666" : "#00d4ff", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>
-              {isStreaming ? "⏹ END" : "▶ STREAM"}
-            </button>
-          )}
-          <button onClick={toggleWebcam} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isWebcamOn ? "#00d4ff" : "#334"}`, background: isWebcamOn ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isWebcamOn ? "#00d4ff" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>📹</button>
-          <button onClick={toggleScreenShare} title={isMobileDevice ? "Screen share is desktop-only" : "Share your screen"} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isScreenSharing ? "#00d4ff" : "#334"}`, background: isScreenSharing ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isScreenSharing ? "#00d4ff" : (isMobileDevice ? "#445" : "#667"), fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", opacity: isMobileDevice ? 0.45 : 1, position: "relative" }}>🖥️{isMobileDevice && <span style={{ position: "absolute", top: -3, right: -3, fontSize: 10, color: "#a0b0d0", background: "#0a0e27", borderRadius: "50%", width: 14, height: 14, display: "flex", alignItems: "center", justifyContent: "center", border: "1px solid #334" }}>💻</span>}</button>
-          {(isStreaming || joinedStreamHostId) && (
-            <button onClick={toggleMic} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#334"}`, background: isMuted ? "rgba(255,170,0,0.15)" : isMicOn ? "rgba(0,255,0,0.15)" : "rgba(0,0,0,0.3)", color: isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>{isMuted ? "🔇" : isMicOn ? "🎙️" : "🔇"}</button>
+          {_isViewer ? (
+            <div style={{ padding: "8px 14px", borderRadius: 10, border: "2px solid #00d4ff", background: "rgba(0,212,255,0.15)", color: "#00d4ff", fontWeight: 800, fontSize: 12, letterSpacing: 1 }}>
+              👁️ WATCHING AS GUEST
+            </div>
+          ) : (
+            <>
+              {/* Fix 3: STREAM button only for host */}
+              {canStartStream && (
+                <button onClick={handleStreamButtonClick} style={{ padding: "10px 18px", borderRadius: 10, border: `2px solid ${isStreaming ? "#ff4444" : "#00d4ff"}`, background: isStreaming ? "rgba(255,0,0,0.2)" : "rgba(0,212,255,0.15)", color: isStreaming ? "#ff6666" : "#00d4ff", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>
+                  {isStreaming ? "⏹ END" : "▶ STREAM"}
+                </button>
+              )}
+              <button onClick={toggleWebcam} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isWebcamOn ? "#00d4ff" : "#334"}`, background: isWebcamOn ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isWebcamOn ? "#00d4ff" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>📹</button>
+              <button onClick={toggleScreenShare} title={isMobileDevice ? "Screen share is desktop-only" : "Share your screen"} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isScreenSharing ? "#00d4ff" : "#334"}`, background: isScreenSharing ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isScreenSharing ? "#00d4ff" : (isMobileDevice ? "#445" : "#667"), fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", opacity: isMobileDevice ? 0.45 : 1, position: "relative" }}>🖥️{isMobileDevice && <span style={{ position: "absolute", top: -3, right: -3, fontSize: 10, color: "#a0b0d0", background: "#0a0e27", borderRadius: "50%", width: 14, height: 14, display: "flex", alignItems: "center", justifyContent: "center", border: "1px solid #334" }}>💻</span>}</button>
+              {(isStreaming || joinedStreamHostId) && (
+                <button onClick={toggleMic} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#334"}`, background: isMuted ? "rgba(255,170,0,0.15)" : isMicOn ? "rgba(0,255,0,0.15)" : "rgba(0,0,0,0.3)", color: isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>{isMuted ? "🔇" : isMicOn ? "🎙️" : "🔇"}</button>
+              )}
+            </>
           )}
           <div style={{ color: "#00d4ff", fontFamily: "monospace", fontWeight: 700, fontSize: 14 }}>{fmt(streamSec)}</div>
         </div>
@@ -1512,10 +1548,13 @@ export default function App() {
         {/* ROOM BAR */}
         <div style={{ background: "rgba(5,9,21,0.9)", borderBottom: "1px solid #004d7f", padding: "8px 12px", display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
           <div style={{ flex: 1, fontSize: 11, color: currentRoom ? "#00d4ff" : "#a0b0d0", fontFamily: "monospace", fontWeight: 600 }}>{currentRoom ? `🏠 ${currentRoom}` : "No Room"}</div>
-          <button onClick={createRoom} style={{ padding: "5px 10px", background: "rgba(0,212,255,0.15)", border: "1px solid #00d4ff", color: "#00d4ff", borderRadius: 7, fontSize: 10, fontWeight: 600, cursor: "pointer" }}>+ NEW</button>
-          <button onClick={() => setShowJoinModal(true)} style={{ padding: "5px 10px", background: "rgba(0,212,255,0.15)", border: "1px solid #00d4ff", color: "#00d4ff", borderRadius: 7, fontSize: 10, fontWeight: 600, cursor: "pointer" }}>JOIN</button>
+          {!_isViewer && <>
+            <button onClick={createRoom} style={{ padding: "5px 10px", background: "rgba(0,212,255,0.15)", border: "1px solid #00d4ff", color: "#00d4ff", borderRadius: 7, fontSize: 10, fontWeight: 600, cursor: "pointer" }}>+ NEW</button>
+            <button onClick={() => setShowJoinModal(true)} style={{ padding: "5px 10px", background: "rgba(0,212,255,0.15)", border: "1px solid #00d4ff", color: "#00d4ff", borderRadius: 7, fontSize: 10, fontWeight: 600, cursor: "pointer" }}>JOIN</button>
+          </>}
           {currentRoom && <>
-            <button onClick={copyRoomCode} style={{ padding: "5px 8px", background: "rgba(0,212,255,0.1)", border: "1px solid #004d7f", color: "#a0b0d0", borderRadius: 7, fontSize: 10, cursor: "pointer" }}>📋</button>
+            <button onClick={copyRoomCode} title="Copy room code" style={{ padding: "5px 8px", background: "rgba(0,212,255,0.1)", border: "1px solid #004d7f", color: "#a0b0d0", borderRadius: 7, fontSize: 10, cursor: "pointer" }}>📋</button>
+            <button onClick={copyWatchLink} title="Copy public watch link" style={{ padding: "5px 8px", background: "rgba(255,0,128,0.15)", border: "1px solid #ff4488", color: "#ff88aa", borderRadius: 7, fontSize: 10, cursor: "pointer" }}>📺</button>
             <button onClick={deleteRoom} title={iAmRoomHost ? "Delete the room (kicks everyone out)" : "Leave the room"} style={{ padding: "5px 8px", background: iAmRoomHost ? "rgba(255,0,0,0.2)" : "rgba(255,0,0,0.1)", border: `1px solid ${iAmRoomHost ? "#ff4444" : "#ff8888"}`, color: iAmRoomHost ? "#ff4444" : "#ff6666", borderRadius: 7, fontSize: 10, cursor: "pointer", fontWeight: iAmRoomHost ? 700 : 400 }}>{iAmRoomHost ? "🗑️" : "🚪"}</button>
           </>}
         </div>
@@ -1668,12 +1707,21 @@ export default function App() {
         {/* LEFT PANEL */}
         <div style={{ width: 270, display: "flex", flexDirection: "column", gap: 10, flexShrink: 0, overflowY: "auto" }}>
           <div style={panelSt}>
+            {_isViewer && (
+              <div style={{ marginBottom: 10, padding: "8px 10px", background: "linear-gradient(135deg, rgba(0,212,255,0.15), rgba(0,153,255,0.1))", border: "1px solid #00d4ff", borderRadius: 10, textAlign: "center" }}>
+                <div style={{ fontSize: 18 }}>👁️</div>
+                <div style={{ fontSize: 10, fontWeight: 800, color: "#00d4ff", letterSpacing: 1 }}>WATCHING AS GUEST</div>
+                <div style={{ fontSize: 9, color: "#a0b0d0", marginTop: 2 }}>View-only · chat enabled</div>
+              </div>
+            )}
             <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
               {[
-                // Fix 3: STREAM button only visible to host (canStartStream)
-                ...(canStartStream ? [{ icon: isStreaming ? "⏹" : "▶", label: "STREAM", active: isStreaming, onClick: handleStreamButtonClick, color: isStreaming ? "#ff4444" : "#00d4ff" }] : []),
-                { icon: "📹", label: "CAMERA", active: isWebcamOn, onClick: toggleWebcam, color: "#00d4ff" },
-                { icon: "🖥️", label: "SCREEN", active: isScreenSharing, onClick: toggleScreenShare, color: "#00d4ff" },
+                // Viewers can't broadcast — hide STREAM/CAMERA/SCREEN entirely
+                ...(_isViewer ? [] : [
+                  ...(canStartStream ? [{ icon: isStreaming ? "⏹" : "▶", label: "STREAM", active: isStreaming, onClick: handleStreamButtonClick, color: isStreaming ? "#ff4444" : "#00d4ff" }] : []),
+                  { icon: "📹", label: "CAMERA", active: isWebcamOn, onClick: toggleWebcam, color: "#00d4ff" },
+                  { icon: "🖥️", label: "SCREEN", active: isScreenSharing, onClick: toggleScreenShare, color: "#00d4ff" },
+                ]),
                 { icon: "👥", label: "TEAM", active: false, onClick: () => setShowTeamModal(true), color: "#00d4ff" },
               ].map(btn => (
                 <div key={btn.label} onClick={btn.onClick} title={btn.label} style={{ width: 56, height: 56, borderRadius: "50%", cursor: "pointer", userSelect: "none", background: btn.active ? `linear-gradient(135deg, ${btn.color}, ${btn.color}aa)` : "rgba(0,212,255,0.1)", border: `2px solid ${btn.color}`, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", boxShadow: btn.active ? `0 0 28px ${btn.color}88` : `0 0 6px ${btn.color}22`, transition: "all .3s" }}>
@@ -1691,7 +1739,7 @@ export default function App() {
             )}
           </div>
 
-          {(isStreaming || joinedStreamHostId !== null) && (
+          {!_isViewer && (isStreaming || joinedStreamHostId !== null) && (
             <div style={panelSt}>
               <div style={{ fontSize: 11, fontWeight: 700, color: "#00d4ff", marginBottom: 8 }}>🎙️ MICROPHONE</div>
               <div onClick={toggleMic} style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "11px 0", borderRadius: 12, cursor: isMuted ? "not-allowed" : "pointer", background: isMuted ? "rgba(255,170,0,0.1)" : isMicOn ? "linear-gradient(135deg, rgba(0,255,0,0.18), rgba(0,200,0,0.12))" : "rgba(0,0,0,0.3)", border: `2px solid ${isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#555"}`, boxShadow: isMicOn ? "0 0 18px rgba(0,255,0,0.25)" : "none", transition: "all .3s" }}>
@@ -1703,18 +1751,23 @@ export default function App() {
 
           <div style={panelSt}>
             <div style={{ fontSize: 11, fontWeight: 700, color: "#00d4ff", marginBottom: 8 }}>🎮 ROOM CONTROLS</div>
-            <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
-              <button onClick={createRoom} style={roomBtnSt}>➕ CREATE</button>
-              <button onClick={() => setShowJoinModal(true)} style={roomBtnSt}>🔗 JOIN</button>
-            </div>
+            {!_isViewer && (
+              <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                <button onClick={createRoom} style={roomBtnSt}>➕ CREATE</button>
+                <button onClick={() => setShowJoinModal(true)} style={roomBtnSt}>🔗 JOIN</button>
+              </div>
+            )}
             <div style={{ background: "rgba(0,0,0,0.5)", padding: 8, borderRadius: 8, fontSize: 11, textAlign: "center", fontFamily: "monospace", letterSpacing: 1, color: currentRoom ? "#00d4ff" : "#a0b0d0", marginBottom: 8 }}>
               {currentRoom ? `🏠 ROOM: ${currentRoom}` : "No Active Room"}
             </div>
             {currentRoom && (
-              <div style={{ display: "flex", gap: 6 }}>
-                <button onClick={copyRoomCode} style={{ ...roomBtnSt, fontSize: 10 }}>📋 COPY</button>
-                <button onClick={deleteRoom} title={iAmRoomHost ? "Delete the room (kicks everyone out)" : "Leave the room"} style={{ ...roomBtnSt, border: `1px solid ${iAmRoomHost ? "#ff4444" : "#ff8888"}`, color: iAmRoomHost ? "#ff4444" : "#ff6666", background: iAmRoomHost ? "rgba(255,0,0,0.18)" : "rgba(255,0,0,0.1)", fontSize: 10, fontWeight: iAmRoomHost ? 700 : 400 }}>{iAmRoomHost ? "🗑️ DELETE ROOM" : "🚪 LEAVE"}</button>
-              </div>
+              <>
+                <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+                  <button onClick={copyRoomCode} style={{ ...roomBtnSt, fontSize: 10 }}>📋 COPY CODE</button>
+                  <button onClick={deleteRoom} title={iAmRoomHost ? "Delete the room (kicks everyone out)" : "Leave the room"} style={{ ...roomBtnSt, border: `1px solid ${iAmRoomHost ? "#ff4444" : "#ff8888"}`, color: iAmRoomHost ? "#ff4444" : "#ff6666", background: iAmRoomHost ? "rgba(255,0,0,0.18)" : "rgba(255,0,0,0.1)", fontSize: 10, fontWeight: iAmRoomHost ? 700 : 400 }}>{iAmRoomHost ? "🗑️ DELETE ROOM" : "🚪 LEAVE"}</button>
+                </div>
+                <button onClick={copyWatchLink} style={{ ...roomBtnSt, width: "100%", fontSize: 10, background: "linear-gradient(135deg, rgba(255,0,128,0.18), rgba(255,0,128,0.08))", border: "1px solid #ff4488", color: "#ff88aa", fontWeight: 700 }}>📺 SHARE WATCH LINK</button>
+              </>
             )}
           </div>
 
