@@ -63,6 +63,9 @@ export default function App() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [isWebcamOn, setIsWebcamOn] = useState(false);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
+  // While screen-sharing, lets the host briefly hide their screen from viewers
+  // without ending the broadcast. Viewers see a black frame; audio keeps flowing.
+  const [isScreenPaused, setIsScreenPaused] = useState(false);
   const [isMicOn, setIsMicOn] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [streamSec, setStreamSec] = useState(0);
@@ -772,7 +775,7 @@ export default function App() {
         try { pc.removeTrack(sender); } catch {}
       });
     });
-    setIsStreaming(false); setIsWebcamOn(false); setIsScreenSharing(false); setIsMicOn(false);
+    setIsStreaming(false); setIsWebcamOn(false); setIsScreenSharing(false); setIsScreenPaused(false); setIsMicOn(false);
     addMsg("⚡ SYSTEM", "Stream ended. You are still in the room.");
     notify("Stream ended. Still in room.", "info");
   }
@@ -983,6 +986,18 @@ export default function App() {
     return _isNativeApp || /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
   }, []);
 
+  // Briefly hide the screen from viewers without ending the broadcast. Disabling the
+  // outgoing video track causes WebRTC to deliver black frames to receivers, while
+  // the connection (and any audio we're sending) stays fully alive. Toggling it back
+  // resumes the live screen content instantly — no renegotiation needed.
+  function togglePauseScreen() {
+    if (!isScreenSharing || !screenStreamRef.current) return;
+    const next = !isScreenPaused;
+    screenStreamRef.current.getVideoTracks().forEach(t => { t.enabled = !next; });
+    setIsScreenPaused(next);
+    notify(next ? "Screen share paused — viewers see a black frame ⏸" : "Screen share resumed ▶", "info");
+  }
+
   // Screen share toggle — does NOT end stream. When turning ON, opens a modal so the host can pick "with audio" or "without audio" first.
   function toggleScreenShare() {
     if (isScreenSharing) {
@@ -1080,6 +1095,7 @@ export default function App() {
 
     teardownMixedAudio();
     setIsScreenSharing(false);
+    setIsScreenPaused(false);
     notify("Screen share stopped. Stream continues.", "info");
     // Release the guard after the state has settled
     setTimeout(() => { stoppingScreenShareRef.current = false; }, 300);
@@ -1206,7 +1222,7 @@ export default function App() {
     screenStreamRef.current?.getTracks().forEach(t => t.stop()); screenStreamRef.current = null;
     setRemoteStreams([]); setFocusedStream(null); setMembers([]);
     setCurrentRoom(null); setJoinedStreamHostId(null); setIAmRoomHost(false);
-    setIsMicOn(false); setIsWebcamOn(false); setIsScreenSharing(false); setIsStreaming(false);
+    setIsMicOn(false); setIsWebcamOn(false); setIsScreenSharing(false); setIsScreenPaused(false); setIsStreaming(false);
     addMsg("⚡ SYSTEM", amHost ? "You deleted the room." : "You left the room.");
     notify(amHost ? "Room deleted" : "Left the room", "info");
     if (_isNativeApp) postToNative({ type: "leave_room" });
@@ -1564,6 +1580,13 @@ export default function App() {
             </div>
           )}
           {isStreaming && <div style={{ position: "absolute", top: 8, right: 8, background: "rgba(255,0,0,0.25)", padding: "3px 8px", borderRadius: 12, fontSize: 9, fontWeight: 700, color: "#ff4444", border: "1px solid #ff4444", animation: "statusBlink 1s infinite" }}>● LIVE</div>}
+          {isScreenSharing && isScreenPaused && (
+            <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 6, background: "rgba(0,0,0,0.8)", color: "#ffaa00", fontWeight: 800, fontSize: 14, letterSpacing: 2, pointerEvents: "none" }}>
+              <div style={{ fontSize: 28 }}>⏸</div>
+              <div>SCREEN PAUSED</div>
+              <div style={{ fontSize: 9, color: "#a0b0d0", letterSpacing: 1, fontWeight: 500 }}>Viewers see a black frame</div>
+            </div>
+          )}
           {!audioUnlocked && remoteStreams.length > 0 && (
             <div onClick={unlockAudio} style={{ position: "absolute", bottom: 8, left: "50%", transform: "translateX(-50%)", background: "rgba(0,212,255,0.2)", border: "1px solid #00d4ff", borderRadius: 16, padding: "6px 16px", fontSize: 10, color: "#00d4ff" }}>🔊 Tap to enable audio</div>
           )}
@@ -1779,6 +1802,14 @@ export default function App() {
                   ...(canStartStream ? [{ icon: isStreaming ? "⏹" : "▶", label: "STREAM", active: isStreaming, onClick: handleStreamButtonClick, color: isStreaming ? "#ff4444" : "#00d4ff" }] : []),
                   { icon: "📹", label: "CAMERA", active: isWebcamOn, onClick: toggleWebcam, color: "#00d4ff" },
                   { icon: "🖥️", label: "SCREEN", active: isScreenSharing, onClick: toggleScreenShare, color: "#00d4ff" },
+                  // Only show the PAUSE/RESUME toggle while a screen share is actually active
+                  ...(isScreenSharing ? [{
+                    icon: isScreenPaused ? "▶" : "⏸",
+                    label: isScreenPaused ? "RESUME" : "PAUSE",
+                    active: isScreenPaused,
+                    onClick: togglePauseScreen,
+                    color: "#ffaa00",
+                  }] : []),
                 ]),
                 { icon: "👥", label: "TEAM", active: false, onClick: () => setShowTeamModal(true), color: "#00d4ff" },
               ].map(btn => (
@@ -1855,6 +1886,14 @@ export default function App() {
             {isStreaming && <div style={{ position: "absolute", top: 10, right: 10, background: "rgba(255,0,0,0.25)", padding: "3px 10px", borderRadius: 16, fontSize: 10, fontWeight: 700, color: "#ff4444", border: "1px solid #ff4444", animation: "statusBlink 1s infinite", zIndex: 15 }}>● LIVE</div>}
 
             <video ref={localCenterRef} autoPlay muted playsInline style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: isScreenSharing ? "contain" : "cover", display: showLocalCenter ? "block" : "none", background: "#000" }} />
+
+            {showLocalCenter && isScreenSharing && isScreenPaused && (
+              <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, background: "rgba(0,0,0,0.8)", color: "#ffaa00", fontWeight: 800, letterSpacing: 3, pointerEvents: "none", zIndex: 16 }}>
+                <div style={{ fontSize: 56 }}>⏸</div>
+                <div style={{ fontSize: 20 }}>SCREEN PAUSED</div>
+                <div style={{ fontSize: 11, color: "#a0b0d0", letterSpacing: 1, fontWeight: 500, marginTop: 4 }}>Viewers see a black frame · click RESUME to continue</div>
+              </div>
+            )}
 
             {showRemoteCenter && (
               focusedStream
