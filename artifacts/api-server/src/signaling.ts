@@ -207,6 +207,14 @@ export function attachSignaling(httpServer: HttpServer) {
       socket.to(to).emit("ice-candidate", { from: socket.id, candidate });
     });
 
+    // Relay a peer's outgoing-video status (camera off / screen share starts / etc.) to
+    // everyone else in the room. Receivers use this to render a "Camera off" placeholder
+    // because WebRTC's `replaceTrack(null)` leaves a frozen last frame on the receiver.
+    socket.on("peer-video-state", ({ off }: { off: boolean }) => {
+      if (!currentRoom) return;
+      socket.to(currentRoom).emit("peer-video-state", { from: socket.id, off: !!off });
+    });
+
     // Member explicitly chose to leave the room
     socket.on("leave-room", () => {
       if (!currentRoom) return;

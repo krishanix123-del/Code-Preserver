@@ -66,6 +66,10 @@ export default function App() {
   // While screen-sharing, lets the host briefly hide their screen from viewers
   // without ending the broadcast. Viewers see a black frame; audio keeps flowing.
   const [isScreenPaused, setIsScreenPaused] = useState(false);
+  // Set of remote peerIds whose outgoing video is currently OFF. WebRTC's
+  // replaceTrack(null) leaves a frozen last frame on the receiver, so each peer
+  // tells the room when their video stops/starts and we render a placeholder.
+  const [peerVideoOff, setPeerVideoOff] = useState<Set<string>>(new Set());
   const [isMicOn, setIsMicOn] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [streamSec, setStreamSec] = useState(0);
@@ -365,6 +369,7 @@ export default function App() {
       remoteVideoRefs.current.delete(peerId);
       setRemoteStreams(p => p.filter(r => r.peerId !== peerId));
       setFocusedStream(p => p?.peerId === peerId ? null : p);
+      setPeerVideoOff(p => { if (!p.has(peerId)) return p; const n = new Set(p); n.delete(peerId); return n; });
       // If we were watching this peer's stream, clear the join state
       setJoinedStreamHostId(prev => prev === peerId ? null : prev);
       setJoinStreamPrompt(prev => prev?.hostPeerId === peerId ? null : prev);
@@ -492,6 +497,16 @@ export default function App() {
           ? { ...myEntry, connected: myServerEntry.connected !== false, isStreaming: myServerEntry.isStreaming, isRoomHost: myServerEntry.isRoomHost, isViewer: !!myServerEntry.isViewer }
           : myEntry;
         return meUpdated ? [meUpdated, ...updated] : updated;
+      });
+    });
+
+    // Receive a peer's outgoing-video status (camera off / screen on) so we can show
+    // a "Camera off" placeholder over the otherwise-frozen video element.
+    socket.on("peer-video-state", ({ from, off }: { from: string; off: boolean }) => {
+      setPeerVideoOff(prev => {
+        const next = new Set(prev);
+        if (off) next.add(from); else next.delete(from);
+        return next;
       });
     });
 
@@ -698,21 +713,44 @@ export default function App() {
 
     // CRITICAL: renegotiate when tracks are added/removed after connection.
     // Debounce 150ms to batch simultaneous addTrack calls (video+audio) into ONE offer.
+    // If signalingState isn't stable when the timer fires, we set a "pending" flag and
+    // retry on the next signalingstatechange — without this, screen-share renegotiations
+    // were being silently dropped, which is exactly why members never saw the screen.
     let _negotiationTimer: ReturnType<typeof setTimeout> | null = null;
+    let _renegotiationPending = false;
+    const tryNegotiate = async () => {
+      if (pc.signalingState !== "stable") {
+        _renegotiationPending = true;
+        return;
+      }
+      _renegotiationPending = false;
+      try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        socket.emit("offer", { to: peerId, offer });
+      } catch {}
+    };
     pc.onnegotiationneeded = () => {
       if (!currentRoomRef.current) return;
       if (_negotiationTimer) clearTimeout(_negotiationTimer);
-      _negotiationTimer = setTimeout(async () => {
-        if (pc.signalingState !== "stable") return; // avoid collisions
-        try {
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          socket.emit("offer", { to: peerId, offer });
-        } catch {}
-      }, 150);
+      _negotiationTimer = setTimeout(tryNegotiate, 150);
     };
+    pc.addEventListener("signalingstatechange", () => {
+      if (pc.signalingState === "stable" && _renegotiationPending) {
+        // Small delay so the answer we just processed has fully settled.
+        setTimeout(tryNegotiate, 50);
+      }
+    });
 
     return pc;
+  }
+
+  // Tell other peers in the room whether our outgoing video is currently off
+  // (camera turned off and screen not shared). Receivers use this to render a
+  // "Camera off" placeholder instead of a frozen last frame.
+  function emitVideoOffState(off: boolean) {
+    if (!currentRoomRef.current) return;
+    socketRef.current?.emit("peer-video-state", { off });
   }
 
   // connectToPeer: initiator side — we create the offer (for all peers)
@@ -739,6 +777,7 @@ export default function App() {
     setRemoteStreams(p => p.filter(r => r.peerId !== peerId));
     setMembers(p => p.filter(m => m.peerId !== peerId));
     setFocusedStream(p => p?.peerId === peerId ? null : p);
+    setPeerVideoOff(p => { if (!p.has(peerId)) return p; const n = new Set(p); n.delete(peerId); return n; });
   }
 
   // Fix 9+4: Stream button handler — show option modal on start, end stream without leaving room
@@ -891,6 +930,8 @@ export default function App() {
           });
           screenStarted = true;
           setIsScreenSharing(true);
+          // Outgoing video is now active (screen) — clear the "off" placeholder for us.
+          emitVideoOffState(false);
           // When the browser-level "Stop sharing" button is clicked, route through the
           // single canonical stop path so the camera / encoding caps / mixed audio teardown
           // all happen exactly once (no double-bounce, no lag).
@@ -946,6 +987,9 @@ export default function App() {
         if (videoSender) videoSender.replaceTrack(null).catch(() => {});
       });
       setIsWebcamOn(false);
+      // Tell peers our outgoing video is now off (unless we're still screen-sharing) so
+      // they can show a "Camera off" placeholder instead of the frozen last frame.
+      if (!isScreenSharingRef.current) emitVideoOffState(true);
       notify("Camera off. Stream continues.", "info");
     } else {
       try {
@@ -975,6 +1019,8 @@ export default function App() {
           setTimeout(() => applyVideoEncodingParams(pc, false), 1500);
         });
         setIsWebcamOn(true);
+        // Our outgoing video is back on — tell peers to drop the placeholder.
+        emitVideoOffState(false);
         notify("Camera is on 📹", "success");
       } catch { notify("Camera/microphone permission required", "error"); }
     }
@@ -1096,6 +1142,9 @@ export default function App() {
     teardownMixedAudio();
     setIsScreenSharing(false);
     setIsScreenPaused(false);
+    // If the camera isn't on either, our outgoing video is now off — tell peers
+    // so they paint a placeholder instead of the frozen last screen frame.
+    if (!localStreamRef.current?.getVideoTracks().length) emitVideoOffState(true);
     notify("Screen share stopped. Stream continues.", "info");
     // Release the guard after the state has settled
     setTimeout(() => { stoppingScreenShareRef.current = false; }, 300);
@@ -1145,6 +1194,8 @@ export default function App() {
       });
 
       setIsScreenSharing(true);
+      // Outgoing video is now active (screen) — clear the "off" placeholder for us.
+      emitVideoOffState(false);
       if (withAudio && !screenAudio) {
         notify("Screen shared 🖥️ — but your browser/source didn't share audio. Tip: in Chrome pick a Tab and tick 'Share tab audio'.", "warning");
       } else {
@@ -1555,9 +1606,9 @@ export default function App() {
           <video ref={localCenterRef} autoPlay muted playsInline style={{ width: "100%", height: "100%", objectFit: isScreenSharing ? "contain" : "cover", display: showLocalCenter ? "block" : "none", background: "#000" }} />
           {showRemoteCenter && (
             focusedStream
-              ? <RemoteVideoEl key={focusedStream.peerId} stream={focusedStream.stream} peerId={focusedStream.peerId} videoRefs={remoteVideoRefs} />
+              ? <RemoteVideoEl key={focusedStream.peerId} stream={focusedStream.stream} peerId={focusedStream.peerId} videoRefs={remoteVideoRefs} videoOff={peerVideoOff.has(focusedStream.peerId)} />
               : remoteStreams.length > 0
-                ? <RemoteVideoEl key={remoteStreams[0].peerId} stream={remoteStreams[0].stream} peerId={remoteStreams[0].peerId} videoRefs={remoteVideoRefs} />
+                ? <RemoteVideoEl key={remoteStreams[0].peerId} stream={remoteStreams[0].stream} peerId={remoteStreams[0].peerId} videoRefs={remoteVideoRefs} videoOff={peerVideoOff.has(remoteStreams[0].peerId)} />
                 : null
           )}
           {!showLocalCenter && !showRemoteCenter && (
@@ -1897,9 +1948,9 @@ export default function App() {
 
             {showRemoteCenter && (
               focusedStream
-                ? <RemoteVideoEl key={focusedStream.peerId} stream={focusedStream.stream} peerId={focusedStream.peerId} videoRefs={remoteVideoRefs} />
+                ? <RemoteVideoEl key={focusedStream.peerId} stream={focusedStream.stream} peerId={focusedStream.peerId} videoRefs={remoteVideoRefs} videoOff={peerVideoOff.has(focusedStream.peerId)} />
                 : remoteStreams.length > 0
-                  ? <RemoteVideoEl key={remoteStreams[0].peerId} stream={remoteStreams[0].stream} peerId={remoteStreams[0].peerId} videoRefs={remoteVideoRefs} />
+                  ? <RemoteVideoEl key={remoteStreams[0].peerId} stream={remoteStreams[0].stream} peerId={remoteStreams[0].peerId} videoRefs={remoteVideoRefs} videoOff={peerVideoOff.has(remoteStreams[0].peerId)} />
                   : null
             )}
 
@@ -2047,7 +2098,7 @@ export default function App() {
   );
 }
 
-function RemoteVideoEl({ stream, peerId, videoRefs, small }: { stream: MediaStream; peerId: string; videoRefs: React.MutableRefObject<Map<string, HTMLVideoElement>>; small?: boolean }) {
+function RemoteVideoEl({ stream, peerId, videoRefs, small, videoOff }: { stream: MediaStream; peerId: string; videoRefs: React.MutableRefObject<Map<string, HTMLVideoElement>>; small?: boolean; videoOff?: boolean }) {
   const ref = useRef<HTMLVideoElement>(null);
   useEffect(() => {
     if (!ref.current) return;
@@ -2055,7 +2106,20 @@ function RemoteVideoEl({ stream, peerId, videoRefs, small }: { stream: MediaStre
     if (ref.current.srcObject !== stream) { ref.current.srcObject = stream; ref.current.play().catch(() => {}); }
     return () => { videoRefs.current.delete(peerId); };
   }, [stream, peerId]);
-  return <video ref={ref} autoPlay playsInline style={{ width: "100%", height: "100%", objectFit: small ? "cover" : "contain", position: small ? "relative" : "absolute", inset: 0, background: "#000" }} />;
+  return (
+    <>
+      <video ref={ref} autoPlay playsInline style={{ width: "100%", height: "100%", objectFit: small ? "cover" : "contain", position: small ? "relative" : "absolute", inset: 0, background: "#000" }} />
+      {videoOff && (
+        // Overlay covers the (otherwise frozen) last frame the moment the broadcaster
+        // turned their camera/screen off, so viewers see an explicit "off" state.
+        <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: small ? 4 : 10, background: "#000", color: "#a0b0d0", pointerEvents: "none", zIndex: 5 }}>
+          <div style={{ fontSize: small ? 22 : 48 }}>📷</div>
+          <div style={{ fontSize: small ? 9 : 14, fontWeight: 700, letterSpacing: small ? 1 : 2, color: "#00d4ff" }}>CAMERA OFF</div>
+          {!small && <div style={{ fontSize: 10, color: "#667", letterSpacing: 1 }}>Audio is still live</div>}
+        </div>
+      )}
+    </>
+  );
 }
 
 function ModalOverlay({ children, onClose }: { children: React.ReactNode; onClose: () => void }) {
