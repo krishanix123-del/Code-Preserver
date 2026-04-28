@@ -188,6 +188,29 @@ export default function App() {
     }
   }, [isWebcamOn, isScreenSharing]);
 
+  // Keep the local-center <video> attached to the right stream and PLAYING whenever
+  // it becomes visible. Browsers pause hidden videos (display:none) for performance,
+  // so even though we set srcObject + play() inline when the screen capture starts,
+  // the element was still hidden at that moment and the play state gets dropped.
+  // Re-running attach + play() after the visibility state flips is what restores the
+  // picture — without this, screen share locally shows solid black.
+  useEffect(() => {
+    const vid = localCenterRef.current;
+    if (!vid) return;
+    // We only want the local preview when WE are the one broadcasting
+    // and there's no remote stream taking over the center view.
+    if (!(isStreaming || isWebcamOn || isScreenSharing)) return;
+    if (focusedStream || remoteStreams.length > 0) return;
+    // Screen share takes priority over camera in the center preview.
+    const desired = isScreenSharing
+      ? (screenStreamRef.current ?? localStreamRef.current)
+      : localStreamRef.current;
+    if (!desired) return;
+    if (vid.srcObject !== desired) vid.srcObject = desired;
+    vid.muted = true; // never echo our own audio in local preview
+    vid.play().catch(() => {});
+  }, [isScreenSharing, isStreaming, isWebcamOn, focusedStream, remoteStreams.length]);
+
   // Fix 8: mobile detection
   useEffect(() => {
     const check = () => setIsMobile(window.innerWidth < 768);
