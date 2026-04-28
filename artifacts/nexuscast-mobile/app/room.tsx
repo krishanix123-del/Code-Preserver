@@ -242,6 +242,10 @@ export default function RoomScreen() {
           injectedJavaScript={INJECTED_JS}
           // Permissions
           mediaCapturePermissionGrantType="grantIfSameHostElsePrompt"
+          // `onPermissionRequest` is an Android-only prop that asks the embedded WebView
+          // to forward camera/microphone permission requests to JS — it's missing from
+          // this version of react-native-webview's TS types but works at runtime.
+          // @ts-expect-error: Android-only WebView prop not yet in shipped type defs
           onPermissionRequest={handlePermissionRequest}
           // Security / content
           mixedContentMode="always"

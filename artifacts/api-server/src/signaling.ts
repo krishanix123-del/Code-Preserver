@@ -191,13 +191,19 @@ export function attachSignaling(httpServer: HttpServer) {
       io.to(roomCode).emit("chat-message", { from: socket.id, userId, text, timestamp: Date.now() });
     });
 
-    socket.on("offer", ({ to, offer }: { to: string; offer: RTCSessionDescriptionInit }) => {
+    // The signaling server only relays SDP/ICE payloads verbatim; the real WebRTC
+    // DOM types only exist in browsers, so we describe them with minimal local
+    // shapes to keep this Node typecheck clean.
+    type SdpPayload = { type: "offer" | "answer" | "pranswer" | "rollback"; sdp?: string };
+    type IcePayload = { candidate?: string; sdpMid?: string | null; sdpMLineIndex?: number | null; usernameFragment?: string | null };
+
+    socket.on("offer", ({ to, offer }: { to: string; offer: SdpPayload }) => {
       socket.to(to).emit("offer", { from: socket.id, offer });
     });
-    socket.on("answer", ({ to, answer }: { to: string; answer: RTCSessionDescriptionInit }) => {
+    socket.on("answer", ({ to, answer }: { to: string; answer: SdpPayload }) => {
       socket.to(to).emit("answer", { from: socket.id, answer });
     });
-    socket.on("ice-candidate", ({ to, candidate }: { to: string; candidate: RTCIceCandidateInit }) => {
+    socket.on("ice-candidate", ({ to, candidate }: { to: string; candidate: IcePayload }) => {
       socket.to(to).emit("ice-candidate", { from: socket.id, candidate });
     });
 
