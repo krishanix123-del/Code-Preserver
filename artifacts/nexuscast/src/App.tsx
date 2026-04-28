@@ -629,23 +629,30 @@ export default function App() {
     const outboundStream = new MediaStream();
     outboundStreamsRef.current.set(peerId, outboundStream);
 
-    // Pick the audio track to send: if we're already screen-sharing with a mixed mic+system
-    // track, prefer that. Otherwise use the room mic (audioStreamRef) so members can hear us.
+    // CRITICAL: pre-create one audio + one video sendrecv transceiver on EVERY peer connection,
+    // BEFORE the first offer is created. This guarantees the SDP always has both an audio and a
+    // video m-line, so later turning on the camera or starting screen share is a one-line
+    // `replaceTrack(...)` on an already-negotiated sender — no addTrack, no renegotiation, no
+    // race. This eliminated the "screen invisible to viewers" bug that came from `addTrack`
+    // mid-call needing onnegotiationneeded to fire reliably (which it doesn't always).
+    const audioTransceiver = pc.addTransceiver("audio", { direction: "sendrecv", streams: [outboundStream] });
+    const videoTransceiver = pc.addTransceiver("video", { direction: "sendrecv", streams: [outboundStream] });
+
+    // Now seed the senders with whatever tracks we already have (mic / camera / screen),
+    // via replaceTrack so no extra renegotiation gets triggered.
     const audioTrackToAdd: MediaStreamTrack | null =
       (isScreenSharingRef.current && mixedAudioTrackRef.current) ? mixedAudioTrackRef.current
       : (audioStreamRef.current?.getAudioTracks()[0] ?? null);
     if (audioTrackToAdd) {
       outboundStream.addTrack(audioTrackToAdd);
-      pc.addTrack(audioTrackToAdd, outboundStream);
+      audioTransceiver.sender.replaceTrack(audioTrackToAdd).catch(() => {});
     }
-
-    // Pick the video track: screen share takes priority over camera while sharing
     const videoTrackToAdd: MediaStreamTrack | null = isScreenSharingRef.current
       ? (screenStreamRef.current?.getVideoTracks()[0] ?? null)
       : (localStreamRef.current?.getVideoTracks()[0] ?? null);
     if (videoTrackToAdd) {
       outboundStream.addTrack(videoTrackToAdd);
-      pc.addTrack(videoTrackToAdd, outboundStream);
+      videoTransceiver.sender.replaceTrack(videoTrackToAdd).catch(() => {});
     }
 
     pc.onicecandidate = e => {
@@ -760,7 +767,7 @@ export default function App() {
     initRoomAudio().catch(() => {});
     const pc = getOrCreatePC(peerId, socket);
     try {
-      const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+      const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       socket.emit("offer", { to: peerId, offer });
     } catch (err) { console.error("connectToPeer:", err); }
@@ -849,16 +856,15 @@ export default function App() {
           localCenterRef.current.srcObject = stream;
           localCenterRef.current.play().catch(() => {});
         }
-        // Send to existing peers; apply encoding caps after a short delay (browser needs ICE first)
+        // Send to existing peers via the pre-created transceivers — replaceTrack only.
         pcsRef.current.forEach((pc, peerId) => {
           const senders = pc.getSenders();
-          const ob = outboundStreamsRef.current.get(peerId) ?? (() => {
-            const s = new MediaStream(); outboundStreamsRef.current.set(peerId, s); return s;
-          })();
           stream.getTracks().forEach(track => {
-            const existing = senders.find(s => s.track?.kind === track.kind);
-            if (existing) existing.replaceTrack(track).catch(() => {});
-            else { try { ob.addTrack(track); } catch {} pc.addTrack(track, ob); }
+            const existing = senders.find(s => s.track?.kind === track.kind || s.track === null);
+            if (existing) {
+              existing.replaceTrack(track).catch(err => console.warn("[start-stream:camera] replaceTrack failed:", err));
+              console.log("[start-stream:camera] swapped", track.kind, "track for peer", peerId);
+            }
           });
           setTimeout(() => applyVideoEncodingParams(pc, false), 1500);
         });
@@ -913,17 +919,20 @@ export default function App() {
             ? (buildMixedAudioTrack(screenAudio) ?? screenAudio)
             : null;
           pcsRef.current.forEach((pc, peerId) => {
-            const ob = outboundStreamsRef.current.get(peerId) ?? (() => {
-              const s = new MediaStream(); outboundStreamsRef.current.set(peerId, s); return s;
-            })();
-            // Find active video sender OR a null-track sender (camera was turned off earlier)
-            const videoSender = pc.getSenders().find(s => s.track?.kind === "video") ?? pc.getSenders().find(s => s.track === null);
-            if (videoSender) videoSender.replaceTrack(screenVideoTrack).catch(() => {});
-            else { try { ob.addTrack(screenVideoTrack); } catch {} pc.addTrack(screenVideoTrack, ob); }
+            // Both transceivers were pre-created in getOrCreatePC, so the senders exist already.
+            // We just swap in the screen video track + (optional) mixed audio. No addTrack, no
+            // renegotiation — frames flow to viewers immediately on the next frame.
+            const videoSender = pc.getTransceivers().find(t => t.sender.track?.kind === "video" || (!t.sender.track && t.receiver.track.kind === "video"))?.sender
+              ?? pc.getSenders().find(s => s.track?.kind === "video" || s.track === null);
+            if (videoSender) {
+              videoSender.replaceTrack(screenVideoTrack).catch(err => console.warn("[screen] replaceTrack(video) failed:", err));
+              console.log("[screen] swapped video track for peer", peerId);
+            } else {
+              console.warn("[screen] no video sender on peer", peerId);
+            }
             if (audioToSend) {
-              const audioSender = pc.getSenders().find(s => s.track?.kind === "audio");
+              const audioSender = pc.getSenders().find(s => s.track?.kind === "audio" || s.track === null);
               if (audioSender) audioSender.replaceTrack(audioToSend).catch(() => {});
-              else { try { ob.addTrack(audioToSend); } catch {} pc.addTrack(audioToSend, ob); }
             }
             // Apply screen share encoding caps shortly after — give ICE a moment first
             setTimeout(() => applyVideoEncodingParams(pc, true), 250);
@@ -1008,13 +1017,13 @@ export default function App() {
         }
         pcsRef.current.forEach((pc, peerId) => {
           const senders = pc.getSenders();
-          const ob = outboundStreamsRef.current.get(peerId) ?? (() => {
-            const s = new MediaStream(); outboundStreamsRef.current.set(peerId, s); return s;
-          })();
           stream.getTracks().forEach(track => {
-            const existing = senders.find(s => s.track?.kind === track.kind);
-            if (existing) existing.replaceTrack(track).catch(() => {});
-            else { try { ob.addTrack(track); } catch {} pc.addTrack(track, ob); }
+            // Pre-created transceivers (see getOrCreatePC) guarantee a sender of each kind exists.
+            const existing = senders.find(s => s.track?.kind === track.kind || s.track === null);
+            if (existing) {
+              existing.replaceTrack(track).catch(err => console.warn("[toggleWebcam] replaceTrack failed:", err));
+              console.log("[toggleWebcam] swapped", track.kind, "track for peer", peerId);
+            }
           });
           setTimeout(() => applyVideoEncodingParams(pc, false), 1500);
         });
