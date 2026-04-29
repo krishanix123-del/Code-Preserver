@@ -140,10 +140,6 @@ export default function App() {
   const miniVideoRef = useRef<HTMLVideoElement>(null);
   const localCenterRef = useRef<HTMLVideoElement>(null);
   const pcsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
-  // Per-peer renegotiation trigger registered by getOrCreatePC. Call this AFTER
-  // adding/removing/replacing tracks so the offer/answer dance happens reliably,
-  // even on browsers where onnegotiationneeded doesn't fire predictably.
-  const negotiateRef = useRef<Map<string, () => void>>(new Map());
   // Per-PC outbound MediaStream — every track we ever send to a peer goes into the SAME
   // MediaStream so the receiver always sees one growing stream (avoids the "two-streams,
   // audio-only wins, video element black" race).
@@ -368,7 +364,6 @@ export default function App() {
       addMsg("⚡ SYSTEM", `${uid} went offline`);
       const pc = pcsRef.current.get(peerId);
       if (pc) { try { pc.close(); } catch {} pcsRef.current.delete(peerId); }
-      negotiateRef.current.delete(peerId);
       const vid = remoteVideoRefs.current.get(peerId);
       if (vid) { vid.pause(); vid.srcObject = null; }
       remoteVideoRefs.current.delete(peerId);
@@ -747,12 +742,6 @@ export default function App() {
       if (_negotiationTimer) clearTimeout(_negotiationTimer);
       _negotiationTimer = setTimeout(tryNegotiate, 150);
     };
-    // Expose the per-peer trigger so track-swap code paths (screen share, camera on/off)
-    // can FORCE a renegotiation without relying on onnegotiationneeded firing.
-    negotiateRef.current.set(peerId, () => {
-      if (_negotiationTimer) clearTimeout(_negotiationTimer);
-      _negotiationTimer = setTimeout(tryNegotiate, 50);
-    });
     pc.addEventListener("signalingstatechange", () => {
       if (pc.signalingState === "stable" && _renegotiationPending) {
         // Small delay so the answer we just processed has fully settled.
@@ -788,7 +777,6 @@ export default function App() {
     const pc = pcsRef.current.get(peerId);
     if (pc) { pc.close(); pcsRef.current.delete(peerId); }
     outboundStreamsRef.current.delete(peerId);
-    negotiateRef.current.delete(peerId);
     // Fix 1/7: clear video srcObject to prevent frozen/black frame ghost
     const vid = remoteVideoRefs.current.get(peerId);
     if (vid) { vid.pause(); vid.srcObject = null; }
@@ -878,8 +866,6 @@ export default function App() {
               console.log("[start-stream:camera] swapped", track.kind, "track for peer", peerId);
             }
           });
-          // FORCE renegotiation so the m-line direction allows sending.
-          negotiateRef.current.get(peerId)?.();
           setTimeout(() => applyVideoEncodingParams(pc, false), 1500);
         });
         cameraStarted = true;
@@ -933,20 +919,22 @@ export default function App() {
             ? (buildMixedAudioTrack(screenAudio) ?? screenAudio)
             : null;
           pcsRef.current.forEach((pc, peerId) => {
-            // Pre-created transceivers (see getOrCreatePC) guarantee a video sender exists.
-            const videoSender = pc.getSenders().find(s => s.track?.kind === "video" || s.track === null);
+            // Both transceivers were pre-created in getOrCreatePC, so the senders exist already.
+            // We just swap in the screen video track + (optional) mixed audio. No addTrack, no
+            // renegotiation — frames flow to viewers immediately on the next frame.
+            const videoSender = pc.getTransceivers().find(t => t.sender.track?.kind === "video" || (!t.sender.track && t.receiver.track.kind === "video"))?.sender
+              ?? pc.getSenders().find(s => s.track?.kind === "video" || s.track === null);
             if (videoSender) {
-              videoSender.replaceTrack(screenVideoTrack).catch(err => console.warn("[startStream:screen] video replaceTrack failed:", err));
-              console.log("[startStream:screen] swapped video track for peer", peerId);
+              videoSender.replaceTrack(screenVideoTrack).catch(err => console.warn("[screen] replaceTrack(video) failed:", err));
+              console.log("[screen] swapped video track for peer", peerId);
             } else {
-              console.warn("[startStream:screen] NO video sender on peer", peerId, "— transceivers:", pc.getTransceivers().length);
+              console.warn("[screen] no video sender on peer", peerId);
             }
             if (audioToSend) {
               const audioSender = pc.getSenders().find(s => s.track?.kind === "audio" || s.track === null);
               if (audioSender) audioSender.replaceTrack(audioToSend).catch(() => {});
             }
-            // FORCE a renegotiation — see comment in startScreenShareWithAudio.
-            negotiateRef.current.get(peerId)?.();
+            // Apply screen share encoding caps shortly after — give ICE a moment first
             setTimeout(() => applyVideoEncodingParams(pc, true), 250);
           });
           screenStarted = true;
@@ -1037,8 +1025,6 @@ export default function App() {
               console.log("[toggleWebcam] swapped", track.kind, "track for peer", peerId);
             }
           });
-          // FORCE renegotiation so the m-line direction allows sending.
-          negotiateRef.current.get(peerId)?.();
           setTimeout(() => applyVideoEncodingParams(pc, false), 1500);
         });
         setIsWebcamOn(true);
@@ -1202,22 +1188,17 @@ export default function App() {
         : null;
 
       pcsRef.current.forEach((pc, peerId) => {
-        // Pre-created transceivers (see getOrCreatePC) guarantee a video sender exists.
-        const videoSender = pc.getSenders().find(s => s.track?.kind === "video" || s.track === null);
-        if (videoSender) {
-          videoSender.replaceTrack(screenTrack).catch(err => console.warn("[startScreenShareWithAudio] video replaceTrack failed:", err));
-          console.log("[startScreenShareWithAudio] swapped video track for peer", peerId);
-        } else {
-          console.warn("[startScreenShareWithAudio] NO video sender on peer", peerId, "— transceivers:", pc.getTransceivers().length);
-        }
+        const ob = outboundStreamsRef.current.get(peerId) ?? (() => {
+          const s = new MediaStream(); outboundStreamsRef.current.set(peerId, s); return s;
+        })();
+        const videoSender = pc.getSenders().find(s => s.track?.kind === "video") ?? pc.getSenders().find(s => s.track === null);
+        if (videoSender) videoSender.replaceTrack(screenTrack).catch(() => {});
+        else { try { ob.addTrack(screenTrack); } catch {} pc.addTrack(screenTrack, ob); }
         if (audioToSend) {
-          const audioSender = pc.getSenders().find(s => s.track?.kind === "audio" || s.track === null);
+          const audioSender = pc.getSenders().find(s => s.track?.kind === "audio");
           if (audioSender) audioSender.replaceTrack(audioToSend).catch(() => {});
+          else { try { ob.addTrack(audioToSend); } catch {} pc.addTrack(audioToSend, ob); }
         }
-        // FORCE a renegotiation so the SDP m-line direction is updated to actually allow
-        // sending. Without this, on browsers / negotiation paths where the initial answer
-        // ended up "recvonly" or "inactive" for video, frames silently never reach viewers.
-        negotiateRef.current.get(peerId)?.();
         setTimeout(() => applyVideoEncodingParams(pc, true), 250);
       });
 
