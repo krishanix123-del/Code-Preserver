@@ -14,6 +14,10 @@ interface RoomInfo {
   members: Map<string, MemberMeta>;
   hostSocketId: string;
   hostUserId: string; // track host by userId so reconnect restores host status
+  // Set of peerIds (socket.ids) currently watching the active stream. A member
+  // is added when they emit `join-stream-request` and removed on stream stop /
+  // leave / disconnect. The size of this set is the "viewers watching" count.
+  streamViewers: Set<string>;
 }
 
 const rooms = new Map<string, RoomInfo>();
@@ -57,7 +61,7 @@ export function attachSignaling(httpServer: HttpServer) {
 
       const isNewRoom = !rooms.has(roomCode);
       if (isNewRoom) {
-        rooms.set(roomCode, { members: new Map(), hostSocketId: socket.id, hostUserId: userId });
+        rooms.set(roomCode, { members: new Map(), hostSocketId: socket.id, hostUserId: userId, streamViewers: new Set() });
       }
 
       const room = rooms.get(roomCode)!;
@@ -106,6 +110,8 @@ export function attachSignaling(httpServer: HttpServer) {
       });
       socket.emit("room-joined", { roomCode, peers: existingPeers, iAmRoomHost: isHost });
       io.to(roomCode).emit("members-update", membersList(room));
+      // Send current stream-viewer count so this socket sees the live tally immediately
+      socket.emit("stream-viewer-count", { count: room.streamViewers.size });
       logger.info({ socketId: socket.id, roomCode, userId, isHost, reconnect: oldPeerId !== null }, "Joined room");
     });
 
@@ -117,10 +123,13 @@ export function attachSignaling(httpServer: HttpServer) {
       if (socket.id !== room.hostSocketId) return;
       const m = room.members.get(socket.id);
       if (m) { m.isStreaming = true; userMeta.isStreaming = true; }
+      // Fresh stream — clear any leftover viewer set from a previous stream
+      room.streamViewers.clear();
       socket.to(currentRoom).emit("peer-started-stream", {
         peerId: socket.id, userId: userMeta.userId, avatar: userMeta.avatar,
       });
       io.to(currentRoom).emit("members-update", membersList(room));
+      io.to(currentRoom).emit("stream-viewer-count", { count: 0 });
     });
 
     socket.on("stop-stream", () => {
@@ -129,16 +138,40 @@ export function attachSignaling(httpServer: HttpServer) {
       if (!room) return;
       const m = room.members.get(socket.id);
       if (m) { m.isStreaming = false; userMeta.isStreaming = false; }
+      // Stream ended — wipe the viewer set; everyone watching falls off
+      if (socket.id === room.hostSocketId) room.streamViewers.clear();
       socket.to(currentRoom).emit("peer-stopped-stream", { peerId: socket.id, userId: userMeta.userId });
       io.to(currentRoom).emit("members-update", membersList(room));
+      io.to(currentRoom).emit("stream-viewer-count", { count: room.streamViewers.size });
     });
 
-    // Fix 5: auto-accept join requests — no host approval needed
+    // Fix 5: auto-accept join requests — no host approval needed.
+    // Also: this is the canonical "I am watching" signal, so we use it to drive the
+    // server-authoritative viewer counter that the host's UI reads.
     socket.on("join-stream-request", ({ hostPeerId }: { hostPeerId: string }) => {
       // Immediately send back stream-join-accepted to the requester
       socket.emit("stream-join-accepted", { hostPeerId });
       // Notify the host that this member joined
       io.to(hostPeerId).emit("stream-member-joined", { userId: userMeta.userId, avatar: userMeta.avatar });
+      // Track for the viewer counter (host doesn't count themselves as a viewer)
+      if (currentRoom) {
+        const room = rooms.get(currentRoom);
+        if (room && socket.id !== room.hostSocketId) {
+          room.streamViewers.add(socket.id);
+          io.to(currentRoom).emit("stream-viewer-count", { count: room.streamViewers.size });
+        }
+      }
+    });
+
+    // A viewer can explicitly stop watching without leaving the room (e.g. closes the
+    // stream view but stays in chat). Lets the host's counter drop accurately.
+    socket.on("leave-stream", () => {
+      if (!currentRoom) return;
+      const room = rooms.get(currentRoom);
+      if (!room) return;
+      if (room.streamViewers.delete(socket.id)) {
+        io.to(currentRoom).emit("stream-viewer-count", { count: room.streamViewers.size });
+      }
     });
 
     socket.on("kick-member", ({ targetPeerId }: { targetPeerId: string }) => {
@@ -253,6 +286,7 @@ function handleExplicitLeave(
   if (!room) return;
 
   room.members.delete(socket.id);
+  room.streamViewers.delete(socket.id);
 
   if (room.members.size === 0) {
     rooms.delete(roomCode);
@@ -261,6 +295,7 @@ function handleExplicitLeave(
 
   io.to(roomCode).emit("peer-left", { peerId: socket.id, userId: userMeta.userId });
   io.to(roomCode).emit("members-update", membersList(room));
+  io.to(roomCode).emit("stream-viewer-count", { count: room.streamViewers.size });
 }
 
 // Soft drop — keeps the member in the room, just marks them offline so peers/UI know.
@@ -277,8 +312,11 @@ function handleSocketDrop(
   meta.connected = false;
   // Stop showing them as "streaming" once they're offline; they'll re-emit start-stream on reconnect
   meta.isStreaming = false;
+  // Disconnected viewers should drop off the live count immediately
+  room.streamViewers.delete(socket.id);
   // Tell peers to tear down their RTCPeerConnection to this dead peerId — they'll get
   // a fresh peer-joined when the same userId reconnects with a new socket.id.
   io.to(roomCode).emit("peer-disconnected", { peerId: socket.id, userId: meta.userId });
   io.to(roomCode).emit("members-update", membersList(room));
+  io.to(roomCode).emit("stream-viewer-count", { count: room.streamViewers.size });
 }

@@ -95,6 +95,10 @@ export default function App() {
   const [incomingJoinReqs, setIncomingJoinReqs] = useState<IncomingJoinReq[]>([]);
   const [joinedStreamHostId, setJoinedStreamHostId] = useState<string | null>(null);
 
+  // Server-authoritative count of how many people are currently watching the active
+  // stream in this room. Driven by the server's `stream-viewer-count` event.
+  const [streamViewerCount, setStreamViewerCount] = useState<number>(0);
+
   // Fix 9: stream start option modal
   const [showStreamStartModal, setShowStreamStartModal] = useState(false);
 
@@ -396,6 +400,9 @@ export default function App() {
     socket.on("peer-stopped-stream", ({ peerId }: { peerId: string }) => {
       setMembers(p => p.map(m => m.peerId === peerId ? { ...m, isStreaming: false } : m));
       setJoinStreamPrompt(null);
+      // Stream is over for everyone — drop the local viewer count immediately so the
+      // badge resets even before the server's stream-viewer-count event lands.
+      setStreamViewerCount(0);
       // Fix 7: clear remote video immediately so no frozen frame
       const vid = remoteVideoRefs.current.get(peerId);
       if (vid) { vid.pause(); vid.srcObject = null; }
@@ -422,6 +429,12 @@ export default function App() {
       setJoinStreamPrompt(null);
     });
 
+    // Server-driven viewer count: tells everyone in the room how many people are
+    // currently watching the active stream. The host sees this on their badge.
+    socket.on("stream-viewer-count", ({ count }: { count: number }) => {
+      setStreamViewerCount(typeof count === "number" ? count : 0);
+    });
+
     // Fix 5: host notified when a member joins their stream
     socket.on("stream-member-joined", ({ userId: uid }: { userId: string }) => {
       notify(`${uid} joined your stream! 🎉`, "success");
@@ -435,6 +448,7 @@ export default function App() {
       pcsRef.current.clear();
       setRemoteStreams([]); setFocusedStream(null); setMembers([]);
       setCurrentRoom(null); setJoinedStreamHostId(null); setIAmRoomHost(false);
+      setStreamViewerCount(0);
       if (_isNativeApp) postToNative({ type: "leave_room" });
     });
 
@@ -523,6 +537,7 @@ export default function App() {
       setRemoteStreams([]); setFocusedStream(null); setMembers([]);
       setCurrentRoom(null); setJoinedStreamHostId(null);
       setJoinStreamPrompt(null); setIAmRoomHost(false);
+      setStreamViewerCount(0);
       if (_isNativeApp) postToNative({ type: "leave_room" });
     });
 
@@ -856,8 +871,8 @@ export default function App() {
           localCenterRef.current.srcObject = stream;
           localCenterRef.current.play().catch(() => {});
         }
-        // Send to existing peers via the pre-created transceivers — replaceTrack only.
-        pcsRef.current.forEach((pc, peerId) => {
+        // Send to existing peers via the pre-created transceivers — replaceTrack + force renegotiate.
+        pcsRef.current.forEach(async (pc, peerId) => {
           const senders = pc.getSenders();
           stream.getTracks().forEach(track => {
             const existing = senders.find(s => s.track?.kind === track.kind || s.track === null);
@@ -866,6 +881,16 @@ export default function App() {
               console.log("[start-stream:camera] swapped", track.kind, "track for peer", peerId);
             }
           });
+          // Safety net (same reasoning as in screen-share): explicitly renegotiate so the
+          // viewer side starts rendering frames immediately for senders that were previously
+          // empty (track === null at SDP time).
+          try {
+            if (pc.signalingState === "stable") {
+              const offer = await pc.createOffer();
+              await pc.setLocalDescription(offer);
+              socketRef.current?.emit("offer", { to: peerId, offer });
+            }
+          } catch (err) { console.warn("[start-stream:camera] forced renegotiation failed:", err); }
           setTimeout(() => applyVideoEncodingParams(pc, false), 1500);
         });
         cameraStarted = true;
@@ -918,21 +943,43 @@ export default function App() {
           const audioToSend: MediaStreamTrack | null = screenAudio
             ? (buildMixedAudioTrack(screenAudio) ?? screenAudio)
             : null;
-          pcsRef.current.forEach((pc, peerId) => {
+          pcsRef.current.forEach(async (pc, peerId) => {
             // Both transceivers were pre-created in getOrCreatePC, so the senders exist already.
-            // We just swap in the screen video track + (optional) mixed audio. No addTrack, no
-            // renegotiation — frames flow to viewers immediately on the next frame.
+            // Step 1: swap in the screen video track + (optional) mixed audio via replaceTrack.
             const videoSender = pc.getTransceivers().find(t => t.sender.track?.kind === "video" || (!t.sender.track && t.receiver.track.kind === "video"))?.sender
               ?? pc.getSenders().find(s => s.track?.kind === "video" || s.track === null);
             if (videoSender) {
-              videoSender.replaceTrack(screenVideoTrack).catch(err => console.warn("[screen] replaceTrack(video) failed:", err));
-              console.log("[screen] swapped video track for peer", peerId);
+              try {
+                await videoSender.replaceTrack(screenVideoTrack);
+                console.log("[screen] swapped video track for peer", peerId);
+              } catch (err) {
+                console.warn("[screen] replaceTrack(video) failed for", peerId, err);
+              }
             } else {
               console.warn("[screen] no video sender on peer", peerId);
             }
             if (audioToSend) {
               const audioSender = pc.getSenders().find(s => s.track?.kind === "audio" || s.track === null);
               if (audioSender) audioSender.replaceTrack(audioToSend).catch(() => {});
+            }
+            // Step 2: SAFETY NET — explicitly renegotiate now. replaceTrack alone does NOT
+            // trigger onnegotiationneeded in any browser, and on PCs whose video sender was
+            // never previously transmitting, the receiver's <video> element won't begin
+            // rendering frames until a fresh offer/answer round confirms the active sender.
+            // Without this, viewers stay on a black frame forever even though the screen
+            // track is technically being sent. We only renegotiate if we're in stable state;
+            // otherwise the existing in-flight negotiation will pick up the new track.
+            try {
+              if (pc.signalingState === "stable") {
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                socketRef.current?.emit("offer", { to: peerId, offer });
+                console.log("[screen] forced renegotiation for peer", peerId);
+              } else {
+                console.log("[screen] skip force renegotiate (state =", pc.signalingState, ") for peer", peerId);
+              }
+            } catch (err) {
+              console.warn("[screen] forced renegotiation failed for", peerId, err);
             }
             // Apply screen share encoding caps shortly after — give ICE a moment first
             setTimeout(() => applyVideoEncodingParams(pc, true), 250);
@@ -1015,7 +1062,7 @@ export default function App() {
           localCenterRef.current.srcObject = stream;
           localCenterRef.current.play().catch(() => {});
         }
-        pcsRef.current.forEach((pc, peerId) => {
+        pcsRef.current.forEach(async (pc, peerId) => {
           const senders = pc.getSenders();
           stream.getTracks().forEach(track => {
             // Pre-created transceivers (see getOrCreatePC) guarantee a sender of each kind exists.
@@ -1025,6 +1072,14 @@ export default function App() {
               console.log("[toggleWebcam] swapped", track.kind, "track for peer", peerId);
             }
           });
+          // Safety net: force a fresh offer so the viewer's <video> starts rendering frames.
+          try {
+            if (pc.signalingState === "stable") {
+              const offer = await pc.createOffer();
+              await pc.setLocalDescription(offer);
+              socketRef.current?.emit("offer", { to: peerId, offer });
+            }
+          } catch (err) { console.warn("[toggleWebcam] forced renegotiation failed:", err); }
           setTimeout(() => applyVideoEncodingParams(pc, false), 1500);
         });
         setIsWebcamOn(true);
@@ -1386,12 +1441,17 @@ export default function App() {
   // Fix 3/4/6: only the room host can start a stream; if already streaming always show END
   const canStartStream = iAmRoomHost || isStreaming;
 
-  // Live viewer count — anyone in the room flagged as a viewer (from a watch link).
-  // Counts only "connected" viewers so disconnected guests don't inflate the number.
-  const viewerCount = useMemo(
+  // Live viewer count — server-authoritative tally of everyone currently watching the
+  // active stream in this room: room members who clicked "Join Stream" PLUS watch-link
+  // viewers, minus anyone who left or disconnected. The server emits the canonical count
+  // via `stream-viewer-count`. We fall back to an `isViewer` member-list scan when the
+  // stream-aware count is 0 (e.g. nobody has join-streamed yet) so old watch-link sessions
+  // don't appear emptier than they are.
+  const watchLinkOnlyCount = useMemo(
     () => members.filter(m => m.isViewer && m.peerId !== "me" && m.connected !== false).length,
     [members]
   );
+  const viewerCount = streamViewerCount > 0 ? streamViewerCount : watchLinkOnlyCount;
   const someoneIsLive = isStreaming || members.some(m => m.isStreaming && m.peerId !== "me");
   // If any other member is streaming, host should still see the button (to start their own or end theirs)
   const showLocalCenter = (isStreaming || isWebcamOn || isScreenSharing) && !focusedStream && remoteStreams.length === 0;
@@ -1679,7 +1739,7 @@ export default function App() {
             </>
           )}
           {someoneIsLive && (
-            <div title={`${viewerCount} watching from a watch link`} style={{ background: "rgba(255,0,128,0.18)", padding: "4px 9px", borderRadius: 14, fontSize: 11, fontWeight: 700, color: "#ff88aa", border: "1px solid #ff4488" }}>
+            <div title={`${viewerCount} ${viewerCount === 1 ? "person is" : "people are"} watching the stream right now`} style={{ background: "rgba(255,0,128,0.18)", padding: "4px 9px", borderRadius: 14, fontSize: 11, fontWeight: 700, color: "#ff88aa", border: "1px solid #ff4488" }}>
               👁️ {viewerCount}
             </div>
           )}
@@ -1938,7 +1998,7 @@ export default function App() {
                 {isScreenSharing ? "🖥️ SCREEN SHARE" : isStreaming ? "🔴 LIVE STREAM" : "🎥 STREAM"}
               </div>
               {someoneIsLive && (
-                <div title={`${viewerCount} ${viewerCount === 1 ? "guest is" : "guests are"} watching from a watch link`} style={{ background: "rgba(255,0,128,0.18)", padding: "3px 10px", borderRadius: 16, fontSize: 10, fontWeight: 700, color: "#ff88aa", border: "1px solid #ff4488" }}>
+                <div title={`${viewerCount} ${viewerCount === 1 ? "person is" : "people are"} watching the stream right now`} style={{ background: "rgba(255,0,128,0.18)", padding: "3px 10px", borderRadius: 16, fontSize: 10, fontWeight: 700, color: "#ff88aa", border: "1px solid #ff4488" }}>
                   👁️ {viewerCount} watching
                 </div>
               )}
