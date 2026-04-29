@@ -329,15 +329,13 @@ export default function App() {
         // Always connect so the host can push video later via renegotiation
         if (connected !== false) connectToPeer(peerId, socket);
         if (streaming && connected !== false) {
-          if (_isViewer) {
-            // Viewers auto-join the active stream — no prompt, that's the whole point of the watch link
-            socket.emit("join-stream-request", { hostPeerId: peerId });
-            addMsg("⚡ SYSTEM", `👁️ Watching ${uid}'s stream`);
-          } else {
-            setJoinStreamPrompt({ hostPeerId: peerId, hostUserId: uid });
-            addMsg("⚡ SYSTEM", `${uid} is streaming — click Join Stream to watch!`);
-            notify(`📡 ${uid} is live in this room!`, "info");
-          }
+          // AUTO-JOIN the stream for everyone — viewers AND members. No "Join" click,
+          // no banner. The WebRTC tracks are already flowing; flipping the gate
+          // immediately makes the host's video visible the moment frames arrive.
+          socket.emit("join-stream-request", { hostPeerId: peerId });
+          setJoinedStreamHostId(peerId);
+          addMsg("⚡ SYSTEM", _isViewer ? `👁️ Watching ${uid}'s stream` : `🔴 ${uid} is LIVE — auto-joined`);
+          if (!_isViewer) notify(`📡 ${uid} is live in this room!`, "info");
         }
       });
     });
@@ -385,16 +383,14 @@ export default function App() {
       setMembers(p => p.map(m => m.peerId === peerId ? { ...m, isStreaming: true } : m));
       // Establish WebRTC connection now so tracks are ready immediately
       if (!pcsRef.current.has(peerId)) connectToPeer(peerId, socket);
-      if (_isViewer) {
-        // Viewer auto-joins — they came here specifically to watch
-        socket.emit("join-stream-request", { hostPeerId: peerId });
-        addMsg("⚡ SYSTEM", `👁️ ${uid} went live — auto-joining`);
-      } else {
-        // Show join/skip prompt — do NOT auto-join; member decides
-        setJoinStreamPrompt({ hostPeerId: peerId, hostUserId: uid });
-        addMsg("⚡ SYSTEM", `${uid} started streaming — click Join Stream to watch!`);
-        notify(`📡 ${uid} started streaming!`, "info");
-      }
+      // AUTO-JOIN for everyone — viewers AND members. The track is already on its way
+      // via WebRTC; flipping the gate now means the picture appears the instant frames
+      // arrive (no "click JOIN" step). This is what users expect from a live stream.
+      socket.emit("join-stream-request", { hostPeerId: peerId });
+      setJoinedStreamHostId(peerId);
+      setJoinStreamPrompt(null);
+      addMsg("⚡ SYSTEM", _isViewer ? `👁️ ${uid} went live` : `🔴 ${uid} is LIVE`);
+      notify(`📡 ${uid} is now LIVE!`, "info");
     });
 
     socket.on("peer-stopped-stream", ({ peerId }: { peerId: string }) => {
@@ -629,6 +625,25 @@ export default function App() {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
       stream.getAudioTracks().forEach(t => { t.enabled = false; }); // default muted until user enables
       audioStreamRef.current = stream;
+      // CRITICAL: attach the freshly-acquired mic track to every existing peer
+      // connection's audio sender. Those senders were pre-created in
+      // getOrCreatePC() with a `null` track because the mic wasn't ready yet —
+      // without this re-attach, toggling the mic later only flips `enabled`
+      // on a track that's not even being sent, and nobody hears anything.
+      const micTrack = stream.getAudioTracks()[0];
+      if (micTrack) {
+        pcsRef.current.forEach(pc => {
+          // Skip if we're currently screen-sharing with a mixed audio track —
+          // that one carries mic + system audio and must not be replaced.
+          if (isScreenSharingRef.current && mixedAudioTrackRef.current) return;
+          const audioSender =
+            pc.getSenders().find(s => s.track?.kind === "audio")
+            ?? pc.getSenders().find(s => s.track === null);
+          if (audioSender && audioSender.track !== micTrack) {
+            audioSender.replaceTrack(micTrack).catch(() => {});
+          }
+        });
+      }
     } catch { /* mic not available */ }
   }
 
@@ -1275,17 +1290,36 @@ export default function App() {
     }
   }
 
-  function toggleMic() {
+  async function toggleMic() {
     if (isMuted) { notify("You are muted by host. Please wait.", "warning"); return; }
-    // Use audioStreamRef (room audio mesh) — fallback to localStreamRef
+    // If we have no mic stream yet (member never started a stream), acquire it now.
+    // initRoomAudio() will also wire the fresh mic track into every existing PC's
+    // audio sender, so members can talk back to the host even without streaming.
+    if (!audioStreamRef.current && !localStreamRef.current) {
+      await initRoomAudio();
+    }
     const stream = audioStreamRef.current || localStreamRef.current;
-    if (!stream) { notify("No microphone available", "error"); return; }
+    if (!stream) { notify("No microphone available — please allow mic access", "error"); return; }
     const audioTrack = stream.getAudioTracks()[0];
     if (!audioTrack) { notify("No microphone found", "error"); return; }
     const next = !isMicOn;
     audioTrack.enabled = next;
     // Also toggle localStream audio if available
     localStreamRef.current?.getAudioTracks().forEach(t => { t.enabled = next; });
+    // SAFETY NET: make sure every PC's audio sender is actually transmitting THIS
+    // track. The sender may have been pre-created with track=null, in which case
+    // toggling `enabled` does nothing. Replace it now so audio actually flows.
+    if (next) {
+      pcsRef.current.forEach(pc => {
+        if (isScreenSharingRef.current && mixedAudioTrackRef.current) return;
+        const audioSender =
+          pc.getSenders().find(s => s.track?.kind === "audio")
+          ?? pc.getSenders().find(s => s.track === null);
+        if (audioSender && audioSender.track !== audioTrack) {
+          audioSender.replaceTrack(audioTrack).catch(() => {});
+        }
+      });
+    }
     setIsMicOn(next);
     notify(next ? "Mic ON 🎙️" : "Mic muted 🔇", "info");
   }
