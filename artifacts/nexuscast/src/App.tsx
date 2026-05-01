@@ -317,13 +317,17 @@ export default function App() {
         // Always connect so the host can push video later via renegotiation
         if (connected !== false) connectToPeer(peerId, socket);
         if (streaming && connected !== false) {
-          // AUTO-JOIN the stream for everyone — viewers AND members. No "Join" click,
-          // no banner. The WebRTC tracks are already flowing; flipping the gate
-          // immediately makes the host's video visible the moment frames arrive.
-          socket.emit("join-stream-request", { hostPeerId: peerId });
-          setJoinedStreamHostId(peerId);
-          addMsg("⚡ SYSTEM", _isViewer ? `👁️ Watching ${uid}'s stream` : `🔴 ${uid} is LIVE — auto-joined`);
-          if (!_isViewer) notify(`📡 ${uid} is live in this room!`, "info");
+          if (_isViewer) {
+            // Watch-link guests always auto-join — no prompt
+            socket.emit("join-stream-request", { hostPeerId: peerId });
+            setJoinedStreamHostId(peerId);
+            addMsg("⚡ SYSTEM", `👁️ Watching ${uid}'s stream`);
+          } else {
+            // Regular members get a JOIN / Skip banner
+            setJoinStreamPrompt({ hostPeerId: peerId, hostUserId: uid });
+            addMsg("⚡ SYSTEM", `🔴 ${uid} is LIVE — tap JOIN to watch`);
+            notify(`📡 ${uid} is live! Tap JOIN to watch.`, "info");
+          }
         }
       });
     });
@@ -369,16 +373,21 @@ export default function App() {
 
     socket.on("peer-started-stream", ({ peerId, userId: uid }: { peerId: string; userId: string }) => {
       setMembers(p => p.map(m => m.peerId === peerId ? { ...m, isStreaming: true } : m));
-      // Establish WebRTC connection now so tracks are ready immediately
+      // Establish WebRTC connection now so tracks are ready to flow the moment JOIN is clicked
       if (!pcsRef.current.has(peerId)) connectToPeer(peerId, socket);
-      // AUTO-JOIN for everyone — viewers AND members. The track is already on its way
-      // via WebRTC; flipping the gate now means the picture appears the instant frames
-      // arrive (no "click JOIN" step). This is what users expect from a live stream.
-      socket.emit("join-stream-request", { hostPeerId: peerId });
-      setJoinedStreamHostId(peerId);
-      setJoinStreamPrompt(null);
-      addMsg("⚡ SYSTEM", _isViewer ? `👁️ ${uid} went live` : `🔴 ${uid} is LIVE`);
-      notify(`📡 ${uid} is now LIVE!`, "info");
+      if (_isViewer) {
+        // Watch-link guests always auto-join — no prompt
+        socket.emit("join-stream-request", { hostPeerId: peerId });
+        setJoinedStreamHostId(peerId);
+        setJoinStreamPrompt(null);
+        addMsg("⚡ SYSTEM", `👁️ ${uid} went live`);
+        notify(`📡 ${uid} is now LIVE!`, "info");
+      } else {
+        // Regular members see a JOIN / Skip banner
+        setJoinStreamPrompt({ hostPeerId: peerId, hostUserId: uid });
+        addMsg("⚡ SYSTEM", `🔴 ${uid} is LIVE — tap JOIN to watch`);
+        notify(`🔴 ${uid} is LIVE! Tap JOIN to watch.`, "info");
+      }
     });
 
     socket.on("peer-stopped-stream", ({ peerId }: { peerId: string }) => {
@@ -865,12 +874,15 @@ export default function App() {
         }
         // Send to existing peers via the pre-created transceivers — replaceTrack + force renegotiate.
         pcsRef.current.forEach(async (pc, peerId) => {
-          const senders = pc.getSenders();
           stream.getTracks().forEach(track => {
-            const existing = senders.find(s => s.track?.kind === track.kind || s.track === null);
-            if (existing) {
-              existing.replaceTrack(track).catch(err => console.warn("[start-stream:camera] replaceTrack failed:", err));
-              console.log("[start-stream:camera] swapped", track.kind, "track for peer", peerId);
+            // Use getTransceivers() to match by kind reliably — getSenders() alone is ambiguous
+            // when both audio and video senders have null tracks (first null-track sender wins).
+            const sender =
+              pc.getTransceivers().find(t => t.receiver.track?.kind === track.kind)?.sender
+              ?? pc.getSenders().find(s => s.track?.kind === track.kind)
+              ?? null;
+            if (sender) {
+              sender.replaceTrack(track).catch(err => console.warn("[start-stream:camera] replaceTrack failed:", err));
             }
           });
           // Safety net (same reasoning as in screen-share): explicitly renegotiate so the
@@ -1024,9 +1036,13 @@ export default function App() {
 
       // Push the screen track to every connected peer
       for (const [peerId, pc] of pcsRef.current.entries()) {
+        // Use getTransceivers() to reliably find the VIDEO transceiver — getSenders() alone
+        // is ambiguous when both audio and video senders still have null tracks, causing the
+        // screen track to be accidentally sent on the audio sender.
         const videoSender =
-          pc.getSenders().find(s => s.track?.kind === "video")
-          ?? pc.getSenders().find(s => s.track === null);
+          pc.getTransceivers().find(t => t.receiver.track?.kind === "video")?.sender
+          ?? pc.getSenders().find(s => s.track?.kind === "video")
+          ?? null;
         if (videoSender) {
           await videoSender.replaceTrack(screenVideoTrack).catch(() => {});
         }
@@ -1079,8 +1095,9 @@ export default function App() {
     const camTrack = localStreamRef.current?.getVideoTracks()[0] ?? null;
     pcsRef.current.forEach(pc => {
       const videoSender =
-        pc.getSenders().find(s => s.track?.kind === "video")
-        ?? pc.getSenders().find(s => s.track === null);
+        pc.getTransceivers().find(t => t.receiver.track?.kind === "video")?.sender
+        ?? pc.getSenders().find(s => s.track?.kind === "video")
+        ?? null;
       if (videoSender) videoSender.replaceTrack(camTrack).catch(() => {});
       setTimeout(() => applyVideoEncodingParams(pc, false), 250);
     });
