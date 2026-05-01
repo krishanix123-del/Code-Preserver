@@ -616,26 +616,48 @@ export default function App() {
     if (_isViewer) return; // view-only guests don't have a mic
     if (audioStreamRef.current) return;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        video: false,
+      });
       stream.getAudioTracks().forEach(t => { t.enabled = false; }); // default muted until user enables
       audioStreamRef.current = stream;
       // CRITICAL: attach the freshly-acquired mic track to every existing peer
-      // connection's audio sender. Those senders were pre-created in
-      // getOrCreatePC() with a `null` track because the mic wasn't ready yet —
-      // without this re-attach, toggling the mic later only flips `enabled`
-      // on a track that's not even being sent, and nobody hears anything.
+      // connection's audio sender. Those senders were pre-created with track=null;
+      // without this the mic track is never transmitted.
       const micTrack = stream.getAudioTracks()[0];
       if (micTrack) {
-        pcsRef.current.forEach(pc => {
+        const promises: Promise<void>[] = [];
+        pcsRef.current.forEach((pc, peerId) => {
+          // Use getTransceivers() to find the audio transceiver reliably —
+          // getSenders() alone is ambiguous when both senders have null tracks.
           const audioSender =
-            pc.getSenders().find(s => s.track?.kind === "audio")
-            ?? pc.getSenders().find(s => s.track === null);
+            pc.getTransceivers().find(t => t.receiver.track?.kind === "audio")?.sender
+            ?? pc.getSenders().find(s => s.track?.kind === "audio")
+            ?? null;
           if (audioSender && audioSender.track !== micTrack) {
-            audioSender.replaceTrack(micTrack).catch(() => {});
+            promises.push(
+              audioSender.replaceTrack(micTrack)
+                .then(async () => {
+                  // Force renegotiation so mobile browsers (iOS Safari, Android Chrome)
+                  // actually start transmitting audio. replaceTrack alone is not enough
+                  // on mobile when the sender was previously null — no packets flow
+                  // until a fresh offer/answer cycle takes place.
+                  try {
+                    if (pc.signalingState === "stable") {
+                      const offer = await pc.createOffer();
+                      await pc.setLocalDescription(offer);
+                      socketRef.current?.emit("offer", { to: peerId, offer });
+                    }
+                  } catch {}
+                })
+                .catch(() => {})
+            );
           }
         });
+        await Promise.all(promises);
       }
-    } catch { /* mic not available */ }
+    } catch { /* mic permission denied or not available */ }
   }
 
   function getOrCreatePC(peerId: string, socket: Socket): RTCPeerConnection {
@@ -1140,12 +1162,23 @@ export default function App() {
     // track. The sender may have been pre-created with track=null, in which case
     // toggling `enabled` does nothing. Replace it now so audio actually flows.
     if (next) {
-      pcsRef.current.forEach(pc => {
+      pcsRef.current.forEach((pc, peerId) => {
         const audioSender =
-          pc.getSenders().find(s => s.track?.kind === "audio")
-          ?? pc.getSenders().find(s => s.track === null);
+          pc.getTransceivers().find(t => t.receiver.track?.kind === "audio")?.sender
+          ?? pc.getSenders().find(s => s.track?.kind === "audio")
+          ?? null;
         if (audioSender && audioSender.track !== audioTrack) {
-          audioSender.replaceTrack(audioTrack).catch(() => {});
+          audioSender.replaceTrack(audioTrack)
+            .then(async () => {
+              try {
+                if (pc.signalingState === "stable") {
+                  const offer = await pc.createOffer();
+                  await pc.setLocalDescription(offer);
+                  socketRef.current?.emit("offer", { to: peerId, offer });
+                }
+              } catch {}
+            })
+            .catch(() => {});
         }
       });
     }
@@ -1221,8 +1254,13 @@ export default function App() {
     const hostPeerId = overridePeerId ?? joinStreamPrompt?.hostPeerId;
     if (!hostPeerId) return;
     socketRef.current?.emit("join-stream-request", { hostPeerId });
-    notify("Joining stream...", "info");
+    setJoinedStreamHostId(hostPeerId);   // unlock the video gate so the stream becomes visible
     setJoinStreamPrompt(null);
+    notify("Joining stream... 📡", "info");
+    // Initialise mic here — the JOIN button click IS a user gesture, which is exactly
+    // what iOS Safari and Android Chrome require before allowing getUserMedia(audio).
+    // If mic was already acquired this is a fast no-op (early-return inside).
+    initRoomAudio().catch(() => {});
   }
 
   function kickMember(peerId: string) {
