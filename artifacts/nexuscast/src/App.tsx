@@ -63,9 +63,6 @@ export default function App() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [isWebcamOn, setIsWebcamOn] = useState(false);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
-  // While screen-sharing, lets the host briefly hide their screen from viewers
-  // without ending the broadcast. Viewers see a black frame; audio keeps flowing.
-  const [isScreenPaused, setIsScreenPaused] = useState(false);
   // Set of remote peerIds whose outgoing video is currently OFF. WebRTC's
   // replaceTrack(null) leaves a frozen last frame on the receiver, so each peer
   // tells the room when their video stops/starts and we render a placeholder.
@@ -109,8 +106,6 @@ export default function App() {
   const [showTeamModal, setShowTeamModal] = useState(false);
   const [showJoinModal, setShowJoinModal] = useState(false);
   const [showShareModal, setShowShareModal] = useState(false);
-  // Modal that asks the host whether to share the screen WITH audio (system/tab audio) or WITHOUT audio
-  const [showScreenAudioModal, setShowScreenAudioModal] = useState(false);
   const [showEditIdModal, setShowEditIdModal] = useState(false);
   const [showAvatarModal, setShowAvatarModal] = useState(false);
   const [showChangeNameModal, setShowChangeNameModal] = useState<{ peerId: string } | null>(null);
@@ -134,13 +129,6 @@ export default function App() {
   const localStreamRef = useRef<MediaStream | null>(null);
   const screenStreamRef = useRef<MediaStream | null>(null);
   const audioStreamRef = useRef<MediaStream | null>(null); // room mic (mesh audio)
-  // Mixed mic + system audio (used while screen-sharing with audio so the user's voice
-  // doesn't get replaced by the system audio on the audio sender).
-  const mixedAudioCtxRef = useRef<AudioContext | null>(null);
-  const mixedAudioDestRef = useRef<MediaStreamAudioDestinationNode | null>(null);
-  const mixedAudioTrackRef = useRef<MediaStreamTrack | null>(null);
-  // Guard so screenTrack.onended doesn't double-execute stopScreenShareInternal()
-  const stoppingScreenShareRef = useRef(false);
   const miniVideoRef = useRef<HTMLVideoElement>(null);
   const localCenterRef = useRef<HTMLVideoElement>(null);
   const pcsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
@@ -542,11 +530,8 @@ export default function App() {
       pcsRef.current.clear();
       audioStreamRef.current?.getTracks().forEach(t => t.stop());
       audioStreamRef.current = null;
-      try { mixedAudioTrackRef.current?.stop(); } catch {}
-      try { mixedAudioCtxRef.current?.close(); } catch {}
-      mixedAudioTrackRef.current = null;
-      mixedAudioCtxRef.current = null;
-      mixedAudioDestRef.current = null;
+      screenStreamRef.current?.getTracks().forEach(t => t.stop());
+      screenStreamRef.current = null;
       socket.disconnect();
     };
   }, []);
@@ -633,9 +618,6 @@ export default function App() {
       const micTrack = stream.getAudioTracks()[0];
       if (micTrack) {
         pcsRef.current.forEach(pc => {
-          // Skip if we're currently screen-sharing with a mixed audio track —
-          // that one carries mic + system audio and must not be replaced.
-          if (isScreenSharingRef.current && mixedAudioTrackRef.current) return;
           const audioSender =
             pc.getSenders().find(s => s.track?.kind === "audio")
             ?? pc.getSenders().find(s => s.track === null);
@@ -668,11 +650,9 @@ export default function App() {
     const audioTransceiver = pc.addTransceiver("audio", { direction: "sendrecv", streams: [outboundStream] });
     const videoTransceiver = pc.addTransceiver("video", { direction: "sendrecv", streams: [outboundStream] });
 
-    // Now seed the senders with whatever tracks we already have (mic / camera / screen),
-    // via replaceTrack so no extra renegotiation gets triggered.
+    // Seed the senders with whatever tracks we already have (mic / camera / screen).
     const audioTrackToAdd: MediaStreamTrack | null =
-      (isScreenSharingRef.current && mixedAudioTrackRef.current) ? mixedAudioTrackRef.current
-      : (audioStreamRef.current?.getAudioTracks()[0] ?? null);
+      audioStreamRef.current?.getAudioTracks()[0] ?? null;
     if (audioTrackToAdd) {
       outboundStream.addTrack(audioTrackToAdd);
       audioTransceiver.sender.replaceTrack(audioTrackToAdd).catch(() => {});
@@ -830,28 +810,25 @@ export default function App() {
     setShowStreamStartModal(true);
   }
 
-  // Fix 2/4/7: End stream but STAY in room — keep PCs alive, just stop tracks
+  // End stream but STAY in room — keep PCs alive, just stop tracks
   function endStreamOnly() {
-    // Stop all local media tracks
+    // Stop local camera
     localStreamRef.current?.getTracks().forEach(t => t.stop());
     localStreamRef.current = null;
-    // Detach onended FIRST — otherwise stopping the screen track here re-enters
-    // stopScreenShareInternal asynchronously and bounces UI state.
-    screenStreamRef.current?.getTracks().forEach(t => { t.onended = null; });
-    screenStreamRef.current?.getTracks().forEach(t => { try { t.stop(); } catch {} });
+    // Stop screen share cleanly
+    screenStreamRef.current?.getTracks().forEach(t => { t.onended = null; t.stop(); });
     screenStreamRef.current = null;
-    teardownMixedAudio();
     if (miniVideoRef.current) miniVideoRef.current.srcObject = null;
     if (localCenterRef.current) localCenterRef.current.srcObject = null;
     // Signal stop to server BEFORE touching PCs
     if (currentRoomRef.current) socketRef.current?.emit("stop-stream");
-    // Remove all senders from PCs but keep connections alive (fixes auto-leaving & frozen frames)
+    // Replace all senders with null but keep connections alive (no frozen frames)
     pcsRef.current.forEach(pc => {
       pc.getSenders().forEach(sender => {
-        try { pc.removeTrack(sender); } catch {}
+        sender.replaceTrack(null).catch(() => {});
       });
     });
-    setIsStreaming(false); setIsWebcamOn(false); setIsScreenSharing(false); setIsScreenPaused(false); setIsMicOn(false);
+    setIsStreaming(false); setIsWebcamOn(false); setIsScreenSharing(false); setIsMicOn(false);
     addMsg("⚡ SYSTEM", "Stream ended. You are still in the room.");
     notify("Stream ended. Still in room.", "info");
   }
@@ -918,107 +895,11 @@ export default function App() {
     }
 
     if (option === "screen" || option === "both") {
-      const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
-      const isAndroidWebView = _isNativeApp || /wv/.test(navigator.userAgent) || (/Android/.test(navigator.userAgent) && /Version\/[\d.]+/.test(navigator.userAgent));
-      if (!navigator.mediaDevices?.getDisplayMedia || isIOS || isAndroidWebView) {
-        if (isAndroidWebView && !isIOS) {
-          // Tell the native app to open this room in Chrome where getDisplayMedia works
-          postToNative({ type: "open_in_browser_for_screen_share", url: window.location.href });
-        } else {
-          const msg = isIOS
-            ? "Screen sharing is not available on iOS. Use Camera instead."
-            : "Screen sharing is not supported on this browser. Try Chrome or Firefox on desktop.";
-          notify(msg, "error");
-        }
-        if (!cameraStarted) return;
-      } else {
-        try {
-          const isMob = /Android|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
-          // Screen share: 30fps so motion (videos, scrolling) stays smooth.
-          // Audio: requested so users can pick "Share tab audio" if they want — we mix it with mic.
-          const screenConstraints: DisplayMediaStreamOptions = isMob
-            ? { video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 15, max: 15 } } }
-            : { video: { frameRate: { ideal: 30, max: 30 } }, audio: true };
-          const screenStream = await navigator.mediaDevices.getDisplayMedia(screenConstraints);
-          screenStreamRef.current = screenStream;
-          // Fix 6: attach FIRST before state update
-          if (localCenterRef.current) {
-            localCenterRef.current.srcObject = screenStream;
-            localCenterRef.current.muted = true; // never echo own captured audio in local preview
-            localCenterRef.current.play().catch(() => {});
-          }
-          // Attach camera to mini player if camera is also active
-          if (cameraStarted && localStreamRef.current && miniVideoRef.current) {
-            miniVideoRef.current.srcObject = localStreamRef.current;
-            miniVideoRef.current.play().catch(() => {});
-          }
-          const screenVideoTrack = screenStream.getVideoTracks()[0];
-          const screenAudio = screenStream.getAudioTracks()[0] ?? null;
-          // Mix mic + system audio so the user's voice keeps going through during screen share
-          const audioToSend: MediaStreamTrack | null = screenAudio
-            ? (buildMixedAudioTrack(screenAudio) ?? screenAudio)
-            : null;
-          pcsRef.current.forEach(async (pc, peerId) => {
-            // Both transceivers were pre-created in getOrCreatePC, so the senders exist already.
-            // Step 1: swap in the screen video track + (optional) mixed audio via replaceTrack.
-            const videoSender = pc.getTransceivers().find(t => t.sender.track?.kind === "video" || (!t.sender.track && t.receiver.track.kind === "video"))?.sender
-              ?? pc.getSenders().find(s => s.track?.kind === "video" || s.track === null);
-            if (videoSender) {
-              try {
-                await videoSender.replaceTrack(screenVideoTrack);
-                console.log("[screen] swapped video track for peer", peerId);
-              } catch (err) {
-                console.warn("[screen] replaceTrack(video) failed for", peerId, err);
-              }
-            } else {
-              console.warn("[screen] no video sender on peer", peerId);
-            }
-            if (audioToSend) {
-              const audioSender = pc.getSenders().find(s => s.track?.kind === "audio" || s.track === null);
-              if (audioSender) audioSender.replaceTrack(audioToSend).catch(() => {});
-            }
-            // Step 2: SAFETY NET — explicitly renegotiate now. replaceTrack alone does NOT
-            // trigger onnegotiationneeded in any browser, and on PCs whose video sender was
-            // never previously transmitting, the receiver's <video> element won't begin
-            // rendering frames until a fresh offer/answer round confirms the active sender.
-            // Without this, viewers stay on a black frame forever even though the screen
-            // track is technically being sent. We only renegotiate if we're in stable state;
-            // otherwise the existing in-flight negotiation will pick up the new track.
-            try {
-              if (pc.signalingState === "stable") {
-                const offer = await pc.createOffer();
-                await pc.setLocalDescription(offer);
-                socketRef.current?.emit("offer", { to: peerId, offer });
-                console.log("[screen] forced renegotiation for peer", peerId);
-              } else {
-                console.log("[screen] skip force renegotiate (state =", pc.signalingState, ") for peer", peerId);
-              }
-            } catch (err) {
-              console.warn("[screen] forced renegotiation failed for", peerId, err);
-            }
-            // Apply screen share encoding caps shortly after — give ICE a moment first
-            setTimeout(() => applyVideoEncodingParams(pc, true), 250);
-          });
-          screenStarted = true;
-          setIsScreenSharing(true);
-          // Outgoing video is now active (screen) — clear the "off" placeholder for us.
-          emitVideoOffState(false);
-          // When the browser-level "Stop sharing" button is clicked, route through the
-          // single canonical stop path so the camera / encoding caps / mixed audio teardown
-          // all happen exactly once (no double-bounce, no lag).
-          screenVideoTrack.onended = () => stopScreenShareInternal();
-        } catch (err: unknown) {
-          const name = err instanceof Error ? err.name : "";
-          if (name === "NotAllowedError") notify("Screen sharing permission denied.", "error");
-          else if (name !== "AbortError") notify("Screen sharing not available on this device/browser.", "error");
-          else notify("Screen share cancelled.", "info");
-          if (!cameraStarted) return;
-        }
-      }
+      const screenOk = await startScreenShare();
+      if (!screenOk && !cameraStarted) return;
     }
 
-    if (!cameraStarted && !screenStarted) return;
-    // Fix 6: state update AFTER media attached
+    if (!cameraStarted && option !== "screen") return;
     setIsStreaming(true);
     if (currentRoomRef.current) socketRef.current?.emit("start-stream");
     addMsg("⚡ SYSTEM", `Stream started${currentRoomRef.current ? ` in room ${currentRoomRef.current}` : " (local)"}`);
@@ -1111,91 +992,80 @@ export default function App() {
     return _isNativeApp || /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
   }, []);
 
-  // Briefly hide the screen from viewers without ending the broadcast. Disabling the
-  // outgoing video track causes WebRTC to deliver black frames to receivers, while
-  // the connection (and any audio we're sending) stays fully alive. Toggling it back
-  // resumes the live screen content instantly — no renegotiation needed.
-  function togglePauseScreen() {
-    if (!isScreenSharing || !screenStreamRef.current) return;
-    const next = !isScreenPaused;
-    screenStreamRef.current.getVideoTracks().forEach(t => { t.enabled = !next; });
-    setIsScreenPaused(next);
-    notify(next ? "Screen share paused — viewers see a black frame ⏸" : "Screen share resumed ▶", "info");
-  }
+  // ─── FRESH SCREEN SHARING ────────────────────────────────────────────────────
+  // Clean, simple implementation: capture → replaceTrack on all PCs → renegotiate.
+  // No mixed audio, no pause modal, no re-entrancy guards.
 
-  // Screen share toggle — does NOT end stream. When turning ON, opens a modal so the host can pick "with audio" or "without audio" first.
-  function toggleScreenShare() {
-    if (isScreenSharing) {
-      stopScreenShareInternal();
-      return;
+  async function startScreenShare(): Promise<boolean> {
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+      notify("Screen sharing is not supported on this browser. Use Chrome or Firefox on desktop.", "error");
+      return false;
     }
-    if (hostIsActivelyStreaming()) {
-      notify("The host is streaming — only the host can share their screen right now.", "warning");
-      return;
-    }
-    if (isMobileDevice || !navigator.mediaDevices?.getDisplayMedia) {
-      notify("Screen sharing only works on a desktop browser (Chrome / Edge / Firefox / Safari). Use the camera here, or share your screen from a laptop in this same room.", "warning");
-      return;
-    }
-    setShowScreenAudioModal(true);
-  }
-
-  // Build a mixed audio track that contains the user's mic + the captured system/screen audio.
-  // We use Web Audio because WebRTC senders only carry one audio track — without mixing,
-  // sending the system audio would silence the user's voice for the whole screen share.
-  function buildMixedAudioTrack(screenAudio: MediaStreamTrack): MediaStreamTrack | null {
     try {
-      const AC: typeof AudioContext = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      if (!AC) return null;
-      const ctx = new AC();
-      const dest = ctx.createMediaStreamDestination();
-      // Mic side — only if we have a mic stream
-      const micTrack = audioStreamRef.current?.getAudioTracks()[0] ?? localStreamRef.current?.getAudioTracks()[0] ?? null;
-      if (micTrack) {
-        const micSrc = ctx.createMediaStreamSource(new MediaStream([micTrack]));
-        const micGain = ctx.createGain();
-        micGain.gain.value = 1.0;
-        micSrc.connect(micGain).connect(dest);
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: { ideal: 30, max: 30 } },
+        audio: false,
+      });
+      screenStreamRef.current = stream;
+
+      // Show the captured screen in the local preview
+      if (localCenterRef.current) {
+        localCenterRef.current.srcObject = stream;
+        localCenterRef.current.muted = true;
+        localCenterRef.current.play().catch(() => {});
       }
-      // System audio side
-      const sysSrc = ctx.createMediaStreamSource(new MediaStream([screenAudio]));
-      const sysGain = ctx.createGain();
-      sysGain.gain.value = 0.9; // slight ducking so voice stays audible
-      sysSrc.connect(sysGain).connect(dest);
-      mixedAudioCtxRef.current = ctx;
-      mixedAudioDestRef.current = dest;
-      const mixedTrack = dest.stream.getAudioTracks()[0] ?? null;
-      mixedAudioTrackRef.current = mixedTrack;
-      return mixedTrack;
-    } catch {
-      return null;
+      // Keep camera visible in mini player while screen is sharing
+      if (localStreamRef.current && miniVideoRef.current) {
+        miniVideoRef.current.srcObject = localStreamRef.current;
+        miniVideoRef.current.play().catch(() => {});
+      }
+
+      const screenVideoTrack = stream.getVideoTracks()[0];
+
+      // Push the screen track to every connected peer
+      for (const [peerId, pc] of pcsRef.current.entries()) {
+        const videoSender =
+          pc.getSenders().find(s => s.track?.kind === "video")
+          ?? pc.getSenders().find(s => s.track === null);
+        if (videoSender) {
+          await videoSender.replaceTrack(screenVideoTrack).catch(() => {});
+        }
+        // Force a new offer so the receiver's <video> starts rendering immediately.
+        // replaceTrack alone does not trigger onnegotiationneeded in any browser.
+        try {
+          if (pc.signalingState === "stable") {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            socketRef.current?.emit("offer", { to: peerId, offer });
+          }
+        } catch {}
+        setTimeout(() => applyVideoEncodingParams(pc, true), 300);
+      }
+
+      setIsScreenSharing(true);
+      emitVideoOffState(false);
+
+      // When the browser "Stop sharing" button is clicked
+      screenVideoTrack.onended = () => stopScreenShare();
+
+      notify("Screen sharing active 🖥️", "success");
+      return true;
+    } catch (err: unknown) {
+      const name = err instanceof Error ? err.name : "";
+      if (name === "NotAllowedError") notify("Screen sharing permission denied.", "error");
+      else if (name !== "AbortError") notify("Screen sharing not available on this device.", "error");
+      else notify("Screen share cancelled.", "info");
+      return false;
     }
   }
 
-  function teardownMixedAudio() {
-    try { mixedAudioTrackRef.current?.stop(); } catch {}
-    mixedAudioTrackRef.current = null;
-    try { mixedAudioCtxRef.current?.close(); } catch {}
-    mixedAudioCtxRef.current = null;
-    mixedAudioDestRef.current = null;
-  }
-
-  function stopScreenShareInternal() {
-    // Re-entrancy guard: track.stop() below fires onended which also calls this
-    // function. Without the guard, every state update + video re-attach happens twice
-    // and that double-bounce is exactly what the user experiences as the "stop lag".
-    if (stoppingScreenShareRef.current) return;
+  function stopScreenShare() {
     if (!screenStreamRef.current && !isScreenSharingRef.current) return;
-    stoppingScreenShareRef.current = true;
-
-    // Detach onended FIRST so stop() below doesn't re-trigger us
-    screenStreamRef.current?.getVideoTracks().forEach(t => { t.onended = null; });
-    screenStreamRef.current?.getAudioTracks().forEach(t => { t.onended = null; });
-    screenStreamRef.current?.getTracks().forEach(t => { try { t.stop(); } catch {} });
+    // Detach onended first to prevent double-firing
+    screenStreamRef.current?.getTracks().forEach(t => { t.onended = null; t.stop(); });
     screenStreamRef.current = null;
 
-    // Restore the local preview without pause()/load() — those cause a black-flash.
-    // Just swap srcObject; the browser handles the transition smoothly.
+    // Restore local preview: back to camera if active, else blank
     if (localCenterRef.current) {
       if (localStreamRef.current) {
         localCenterRef.current.srcObject = localStreamRef.current;
@@ -1205,89 +1075,32 @@ export default function App() {
       }
     }
 
+    // Restore the camera video track (or null) on all peer senders
     const camTrack = localStreamRef.current?.getVideoTracks()[0] ?? null;
-    const micTrack = audioStreamRef.current?.getAudioTracks()[0] ?? localStreamRef.current?.getAudioTracks()[0] ?? null;
     pcsRef.current.forEach(pc => {
-      const videoSender = pc.getSenders().find(s => s.track?.kind === "video") ?? pc.getSenders().find(s => s.track === null);
+      const videoSender =
+        pc.getSenders().find(s => s.track?.kind === "video")
+        ?? pc.getSenders().find(s => s.track === null);
       if (videoSender) videoSender.replaceTrack(camTrack).catch(() => {});
-      // Restore the mic audio (we may have been sending the mixed mic+system track)
-      const audioSender = pc.getSenders().find(s => s.track?.kind === "audio");
-      if (audioSender && micTrack) audioSender.replaceTrack(micTrack).catch(() => {});
-      // Re-apply CAMERA encoding caps (sender was configured for screen-share — higher
-      // bitrate, 24 fps cap — which makes the camera feel laggy / low fps).
       setTimeout(() => applyVideoEncodingParams(pc, false), 250);
     });
 
-    teardownMixedAudio();
     setIsScreenSharing(false);
-    setIsScreenPaused(false);
-    // If the camera isn't on either, our outgoing video is now off — tell peers
-    // so they paint a placeholder instead of the frozen last screen frame.
-    if (!localStreamRef.current?.getVideoTracks().length) emitVideoOffState(true);
-    notify("Screen share stopped. Stream continues.", "info");
-    // Release the guard after the state has settled
-    setTimeout(() => { stoppingScreenShareRef.current = false; }, 300);
+    if (!camTrack) emitVideoOffState(true);
+    notify("Screen sharing stopped.", "info");
   }
 
-  // Called from the with/without audio modal
-  async function startScreenShareWithAudio(withAudio: boolean) {
-    setShowScreenAudioModal(false);
-    try {
-      // Higher fps cap (30) so motion on the shared screen stays smooth.
-      const screenConstraints: DisplayMediaStreamOptions = {
-        video: { frameRate: { ideal: 30, max: 30 } },
-        audio: withAudio,
-      };
-      const screenStream = await navigator.mediaDevices.getDisplayMedia(screenConstraints);
-      screenStreamRef.current = screenStream;
-      if (localCenterRef.current) {
-        localCenterRef.current.srcObject = screenStream;
-        localCenterRef.current.muted = true; // never echo own captured audio in local preview
-        localCenterRef.current.play().catch(() => {});
-      }
-      if (localStreamRef.current && miniVideoRef.current) {
-        miniVideoRef.current.srcObject = localStreamRef.current;
-        miniVideoRef.current.play().catch(() => {});
-      }
-      const screenTrack = screenStream.getVideoTracks()[0];
-      const screenAudio = withAudio ? screenStream.getAudioTracks()[0] : null;
-
-      // If we got system audio, mix it with the mic so the user's voice keeps going through.
-      const audioToSend: MediaStreamTrack | null = screenAudio
-        ? (buildMixedAudioTrack(screenAudio) ?? screenAudio)
-        : null;
-
-      pcsRef.current.forEach((pc, peerId) => {
-        const ob = outboundStreamsRef.current.get(peerId) ?? (() => {
-          const s = new MediaStream(); outboundStreamsRef.current.set(peerId, s); return s;
-        })();
-        const videoSender = pc.getSenders().find(s => s.track?.kind === "video") ?? pc.getSenders().find(s => s.track === null);
-        if (videoSender) videoSender.replaceTrack(screenTrack).catch(() => {});
-        else { try { ob.addTrack(screenTrack); } catch {} pc.addTrack(screenTrack, ob); }
-        if (audioToSend) {
-          const audioSender = pc.getSenders().find(s => s.track?.kind === "audio");
-          if (audioSender) audioSender.replaceTrack(audioToSend).catch(() => {});
-          else { try { ob.addTrack(audioToSend); } catch {} pc.addTrack(audioToSend, ob); }
-        }
-        setTimeout(() => applyVideoEncodingParams(pc, true), 250);
-      });
-
-      setIsScreenSharing(true);
-      // Outgoing video is now active (screen) — clear the "off" placeholder for us.
-      emitVideoOffState(false);
-      if (withAudio && !screenAudio) {
-        notify("Screen shared 🖥️ — but your browser/source didn't share audio. Tip: in Chrome pick a Tab and tick 'Share tab audio'.", "warning");
-      } else {
-        notify(withAudio ? "Screen + audio sharing active 🔊🖥️ (your mic is mixed in)" : "Screen sharing active 🖥️", "success");
-      }
-
-      screenTrack.onended = () => stopScreenShareInternal();
-    } catch (err: unknown) {
-      const name = err instanceof Error ? err.name : "";
-      if (name === "NotAllowedError") notify("Screen sharing permission denied.", "error");
-      else if (name !== "AbortError") notify("Screen sharing not available on this device/browser.", "error");
-      else notify("Screen share cancelled.", "info");
+  function toggleScreenShare() {
+    if (isScreenSharing) { stopScreenShare(); return; }
+    if (hostIsActivelyStreaming()) {
+      notify("The host is streaming — only the host can share their screen right now.", "warning");
+      return;
     }
+    if (isMobileDevice || !navigator.mediaDevices?.getDisplayMedia) {
+      notify("Screen sharing only works on a desktop browser (Chrome / Edge / Firefox).", "warning");
+      return;
+    }
+    startScreenShare();
   }
 
   async function toggleMic() {
@@ -1311,7 +1124,6 @@ export default function App() {
     // toggling `enabled` does nothing. Replace it now so audio actually flows.
     if (next) {
       pcsRef.current.forEach(pc => {
-        if (isScreenSharingRef.current && mixedAudioTrackRef.current) return;
         const audioSender =
           pc.getSenders().find(s => s.track?.kind === "audio")
           ?? pc.getSenders().find(s => s.track === null);
@@ -1371,7 +1183,7 @@ export default function App() {
     screenStreamRef.current?.getTracks().forEach(t => t.stop()); screenStreamRef.current = null;
     setRemoteStreams([]); setFocusedStream(null); setMembers([]);
     setCurrentRoom(null); setJoinedStreamHostId(null); setIAmRoomHost(false);
-    setIsMicOn(false); setIsWebcamOn(false); setIsScreenSharing(false); setIsScreenPaused(false); setIsStreaming(false);
+    setIsMicOn(false); setIsWebcamOn(false); setIsScreenSharing(false); setIsStreaming(false);
     addMsg("⚡ SYSTEM", amHost ? "You deleted the room." : "You left the room.");
     notify(amHost ? "Room deleted" : "Left the room", "info");
     if (_isNativeApp) postToNative({ type: "leave_room" });
@@ -1538,24 +1350,6 @@ export default function App() {
           </ModalOverlay>
         );
       })()}
-
-      {showScreenAudioModal && <ModalOverlay onClose={() => setShowScreenAudioModal(false)}>
-        <ModalBox title="🖥️ SHARE YOUR SCREEN">
-          <div style={{ fontSize: 12, color: "#a0b0d0", marginBottom: 14, lineHeight: 1.5, textAlign: "center" }}>
-            Do you want to share the audio that's playing on your screen along with the video?
-          </div>
-          <button onClick={() => startScreenShareWithAudio(true)} style={{ ...btnSt, display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
-            <span style={{ fontSize: 20 }}>🔊🖥️</span> Share with audio
-          </button>
-          <div style={{ fontSize: 10, color: "#7a8aa0", margin: "4px 0 10px", textAlign: "center", lineHeight: 1.4 }}>
-            Captures sound from a Chrome tab or system audio. In the next dialog pick a <b>Tab</b> and tick <b>"Share tab audio"</b> for best results.
-          </div>
-          <button onClick={() => startScreenShareWithAudio(false)} style={{ ...btnSt, display: "flex", alignItems: "center", justifyContent: "center", gap: 10, background: "rgba(0,212,255,0.1)" }}>
-            <span style={{ fontSize: 20 }}>🔇🖥️</span> Share without audio
-          </button>
-          <button onClick={() => setShowScreenAudioModal(false)} style={btn2St}>CANCEL</button>
-        </ModalBox>
-      </ModalOverlay>}
 
       {showTeamModal && <ModalOverlay onClose={() => setShowTeamModal(false)}>
         <ModalBox title="👥 TEAM">
@@ -1734,13 +1528,6 @@ export default function App() {
             </div>
           )}
           {isStreaming && <div style={{ position: "absolute", top: 8, right: 8, background: "rgba(255,0,0,0.25)", padding: "3px 8px", borderRadius: 12, fontSize: 9, fontWeight: 700, color: "#ff4444", border: "1px solid #ff4444", animation: "statusBlink 1s infinite" }}>● LIVE</div>}
-          {isScreenSharing && isScreenPaused && (
-            <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 6, background: "rgba(0,0,0,0.8)", color: "#ffaa00", fontWeight: 800, fontSize: 14, letterSpacing: 2, pointerEvents: "none" }}>
-              <div style={{ fontSize: 28 }}>⏸</div>
-              <div>SCREEN PAUSED</div>
-              <div style={{ fontSize: 9, color: "#a0b0d0", letterSpacing: 1, fontWeight: 500 }}>Viewers see a black frame</div>
-            </div>
-          )}
           {!audioUnlocked && remoteStreams.length > 0 && (
             <div onClick={unlockAudio} style={{ position: "absolute", bottom: 8, left: "50%", transform: "translateX(-50%)", background: "rgba(0,212,255,0.2)", border: "1px solid #00d4ff", borderRadius: 16, padding: "6px 16px", fontSize: 10, color: "#00d4ff" }}>🔊 Tap to enable audio</div>
           )}
@@ -1956,14 +1743,6 @@ export default function App() {
                   ...(canStartStream ? [{ icon: isStreaming ? "⏹" : "▶", label: "STREAM", active: isStreaming, onClick: handleStreamButtonClick, color: isStreaming ? "#ff4444" : "#00d4ff" }] : []),
                   { icon: "📹", label: "CAMERA", active: isWebcamOn, onClick: toggleWebcam, color: "#00d4ff" },
                   { icon: "🖥️", label: "SCREEN", active: isScreenSharing, onClick: toggleScreenShare, color: "#00d4ff" },
-                  // Only show the PAUSE/RESUME toggle while a screen share is actually active
-                  ...(isScreenSharing ? [{
-                    icon: isScreenPaused ? "▶" : "⏸",
-                    label: isScreenPaused ? "RESUME" : "PAUSE",
-                    active: isScreenPaused,
-                    onClick: togglePauseScreen,
-                    color: "#ffaa00",
-                  }] : []),
                 ]),
                 { icon: "👥", label: "TEAM", active: false, onClick: () => setShowTeamModal(true), color: "#00d4ff" },
               ].map(btn => (
@@ -2040,14 +1819,6 @@ export default function App() {
             {isStreaming && <div style={{ position: "absolute", top: 10, right: 10, background: "rgba(255,0,0,0.25)", padding: "3px 10px", borderRadius: 16, fontSize: 10, fontWeight: 700, color: "#ff4444", border: "1px solid #ff4444", animation: "statusBlink 1s infinite", zIndex: 15 }}>● LIVE</div>}
 
             <video ref={localCenterRef} autoPlay muted playsInline style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: isScreenSharing ? "contain" : "cover", display: showLocalCenter ? "block" : "none", background: "#000" }} />
-
-            {showLocalCenter && isScreenSharing && isScreenPaused && (
-              <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10, background: "rgba(0,0,0,0.8)", color: "#ffaa00", fontWeight: 800, letterSpacing: 3, pointerEvents: "none", zIndex: 16 }}>
-                <div style={{ fontSize: 56 }}>⏸</div>
-                <div style={{ fontSize: 20 }}>SCREEN PAUSED</div>
-                <div style={{ fontSize: 11, color: "#a0b0d0", letterSpacing: 1, fontWeight: 500, marginTop: 4 }}>Viewers see a black frame · click RESUME to continue</div>
-              </div>
-            )}
 
             {showRemoteCenter && (
               focusedStream
