@@ -72,6 +72,8 @@ export default function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [isRecordingPaused, setIsRecordingPaused] = useState(false);
   const [recordingSec, setRecordingSec] = useState(0);
+  const [recordedBytes, setRecordedBytes] = useState(0);
+  const [showRecordingSaveModal, setShowRecordingSaveModal] = useState(false);
   const [streamSec, setStreamSec] = useState(0);
   const [currentRoom, setCurrentRoom] = useState<string | null>(null);
   const [iAmRoomHost, setIAmRoomHost] = useState(false);
@@ -137,6 +139,7 @@ export default function App() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
   const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pendingRecordingBlobRef = useRef<{ blob: Blob; mimeType: string } | null>(null);
   const miniVideoRef = useRef<HTMLVideoElement>(null);
   const localCenterRef = useRef<HTMLVideoElement>(null);
   const pcsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
@@ -1272,22 +1275,22 @@ export default function App() {
     try {
       recordedChunksRef.current = [];
       const mr = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-      mr.ondataavailable = e => { if (e.data.size > 0) recordedChunksRef.current.push(e.data); };
+      mr.ondataavailable = e => {
+        if (e.data.size > 0) {
+          recordedChunksRef.current.push(e.data);
+          setRecordedBytes(b => b + e.data.size);
+        }
+      };
       mr.onstop = () => {
         if (recordingTimerRef.current) { clearInterval(recordingTimerRef.current); recordingTimerRef.current = null; }
         const blob = new Blob(recordedChunksRef.current, { type: mimeType || "video/webm" });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-        a.href = url; a.download = `nexuscast-${ts}.webm`;
-        document.body.appendChild(a); a.click();
-        setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 2000);
-        setIsRecording(false); setIsRecordingPaused(false); setRecordingSec(0);
-        notify("Recording saved! 💾", "success");
+        pendingRecordingBlobRef.current = { blob, mimeType: mimeType || "video/webm" };
+        setIsRecording(false); setIsRecordingPaused(false);
+        setShowRecordingSaveModal(true);
       };
       mr.start(1000); // collect chunks every 1 s so data isn't lost on crash
       mediaRecorderRef.current = mr;
-      setRecordingSec(0);
+      setRecordingSec(0); setRecordedBytes(0);
       recordingTimerRef.current = setInterval(() => setRecordingSec(s => s + 1), 1000);
       setIsRecording(true); setIsRecordingPaused(false);
       notify("Recording started 🔴", "info");
@@ -1321,8 +1324,34 @@ export default function App() {
   function stopAndDownloadRecording() {
     const mr = mediaRecorderRef.current;
     if (!mr || !isRecording) return;
-    mr.stop(); // triggers onstop → download
+    mr.stop(); // triggers onstop → shows save modal
     mediaRecorderRef.current = null;
+  }
+
+  function downloadRecording() {
+    const pending = pendingRecordingBlobRef.current;
+    if (!pending) return;
+    const url = URL.createObjectURL(pending.blob);
+    const a = document.createElement("a");
+    const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    a.href = url; a.download = `nexuscast-${ts}.webm`;
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 2000);
+    pendingRecordingBlobRef.current = null;
+    setShowRecordingSaveModal(false); setRecordingSec(0); setRecordedBytes(0);
+    notify("Recording downloaded! 💾", "success");
+  }
+
+  function discardRecording() {
+    pendingRecordingBlobRef.current = null;
+    setShowRecordingSaveModal(false); setRecordingSec(0); setRecordedBytes(0);
+    notify("Recording discarded.", "info");
+  }
+
+  function fmtBytes(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 
   async function toggleMic() {
@@ -1648,6 +1677,27 @@ export default function App() {
         </ModalBox>
       </ModalOverlay>}
 
+      {showRecordingSaveModal && <ModalOverlay onClose={discardRecording}>
+        <ModalBox title="⏹ RECORDING STOPPED">
+          <div style={{ textAlign: "center", margin: "10px 0 18px" }}>
+            <div style={{ fontSize: 12, color: "#a0b0d0", marginBottom: 6 }}>Your recording is ready</div>
+            <div style={{ display: "flex", justifyContent: "center", gap: 24, marginBottom: 4 }}>
+              <div style={{ textAlign: "center" }}>
+                <div style={{ fontSize: 26, fontWeight: 800, fontFamily: "monospace", color: "#00d4ff" }}>{fmt(recordingSec)}</div>
+                <div style={{ fontSize: 9, color: "#7a8aa0", letterSpacing: 1 }}>DURATION</div>
+              </div>
+              <div style={{ textAlign: "center" }}>
+                <div style={{ fontSize: 26, fontWeight: 800, fontFamily: "monospace", color: "#00d4ff" }}>{fmtBytes(recordedBytes)}</div>
+                <div style={{ fontSize: 9, color: "#7a8aa0", letterSpacing: 1 }}>FILE SIZE</div>
+              </div>
+            </div>
+            <div style={{ fontSize: 10, color: "#556070", marginTop: 6 }}>nexuscast-[timestamp].webm</div>
+          </div>
+          <button onClick={downloadRecording} style={{ ...btnSt, background: "linear-gradient(135deg, #00d4ff, #0099ff)", color: "#0a0e27" }}>💾 DOWNLOAD RECORDING</button>
+          <button onClick={discardRecording} style={{ ...btn2St, color: "#ff6666", borderColor: "#ff4444" }}>🗑️ DISCARD</button>
+        </ModalBox>
+      </ModalOverlay>}
+
       {showChangeNameModal && <ModalOverlay onClose={() => setShowChangeNameModal(null)}>
         <ModalBox title="✏️ CHANGE MEMBER NAME">
           <p style={{ fontSize: 11, color: "#a0b0d0", margin: "0 0 4px" }}>This nickname is only visible to you.</p>
@@ -1854,6 +1904,7 @@ export default function App() {
                     <div style={{ textAlign: "center", marginBottom: 8, padding: "6px 0", background: "rgba(255,0,0,0.08)", borderRadius: 8, border: `1px solid ${isRecordingPaused ? "#ffaa00" : "#ff4444"}` }}>
                       <div style={{ fontSize: 8, color: "#a0b0d0", letterSpacing: 1, marginBottom: 2 }}>{isRecordingPaused ? "⏸ PAUSED" : "⏺ RECORDING"}</div>
                       <div style={{ fontSize: 22, fontWeight: 800, fontFamily: "monospace", color: isRecordingPaused ? "#ffaa00" : "#ff4444", opacity: isRecordingPaused ? 0.7 : 1 }}>{fmt(recordingSec)}</div>
+                      <div style={{ fontSize: 9, color: "#7a8aa0", marginTop: 2 }}>~{fmtBytes(recordedBytes)} recorded</div>
                     </div>
                   )}
                   {!isRecording ? (
@@ -1865,7 +1916,7 @@ export default function App() {
                       ) : (
                         <button onClick={resumeRecording} style={{ flex: 1, padding: "10px 0", background: "rgba(0,212,255,0.15)", border: "1px solid #00d4ff", color: "#00d4ff", cursor: "pointer", borderRadius: 8, fontSize: 12, fontWeight: 700 }}>▶ RESUME</button>
                       )}
-                      <button onClick={stopAndDownloadRecording} style={{ flex: 1, padding: "10px 0", background: "rgba(255,0,0,0.15)", border: "1px solid #ff4444", color: "#ff6666", cursor: "pointer", borderRadius: 8, fontSize: 12, fontWeight: 700 }}>⏹ SAVE</button>
+                      <button onClick={stopAndDownloadRecording} style={{ flex: 1, padding: "10px 0", background: "rgba(255,0,0,0.15)", border: "1px solid #ff4444", color: "#ff6666", cursor: "pointer", borderRadius: 8, fontSize: 12, fontWeight: 700 }}>⏹ STOP</button>
                     </div>
                   )}
                   {!isRecording && <div style={{ fontSize: 9, color: "#7a8aa0", marginTop: 5, textAlign: "center" }}>Records your stream locally as .webm</div>}
@@ -2038,6 +2089,7 @@ export default function App() {
                 <div style={{ textAlign: "center", marginBottom: 8, padding: "6px 0", background: "rgba(255,0,0,0.08)", borderRadius: 8, border: `1px solid ${isRecordingPaused ? "#ffaa00" : "#ff4444"}` }}>
                   <div style={{ fontSize: 8, color: "#a0b0d0", letterSpacing: 1, marginBottom: 2 }}>{isRecordingPaused ? "⏸ PAUSED" : "⏺ RECORDING"}</div>
                   <div style={{ fontSize: 22, fontWeight: 800, fontFamily: "monospace", color: isRecordingPaused ? "#ffaa00" : "#ff4444", opacity: isRecordingPaused ? 0.7 : 1 }}>{fmt(recordingSec)}</div>
+                  <div style={{ fontSize: 9, color: "#7a8aa0", marginTop: 2 }}>~{fmtBytes(recordedBytes)} recorded</div>
                 </div>
               )}
               {!isRecording ? (
@@ -2049,7 +2101,7 @@ export default function App() {
                   ) : (
                     <button onClick={resumeRecording} style={{ flex: 1, padding: "8px 0", background: "rgba(0,212,255,0.15)", border: "1px solid #00d4ff", color: "#00d4ff", cursor: "pointer", borderRadius: 8, fontSize: 11, fontWeight: 700 }}>▶ RESUME</button>
                   )}
-                  <button onClick={stopAndDownloadRecording} style={{ flex: 1, padding: "8px 0", background: "rgba(255,0,0,0.15)", border: "1px solid #ff4444", color: "#ff6666", cursor: "pointer", borderRadius: 8, fontSize: 11, fontWeight: 700 }}>⏹ SAVE</button>
+                  <button onClick={stopAndDownloadRecording} style={{ flex: 1, padding: "8px 0", background: "rgba(255,0,0,0.15)", border: "1px solid #ff4444", color: "#ff6666", cursor: "pointer", borderRadius: 8, fontSize: 11, fontWeight: 700 }}>⏹ STOP</button>
                 </div>
               )}
               {!isRecording && <div style={{ fontSize: 9, color: "#7a8aa0", marginTop: 5, textAlign: "center" }}>Records your stream locally as .webm</div>}
