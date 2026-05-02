@@ -646,11 +646,8 @@ export default function App() {
         pcsRef.current.forEach((pc, peerId) => {
           // Use getTransceivers() to find the audio transceiver reliably —
           // getSenders() alone is ambiguous when both senders have null tracks.
-          const _tc0 = pc.getTransceivers();
           const audioSender =
-            _tc0.find(t => t.sender.track?.kind === "audio")?.sender
-            ?? _tc0.find(t => t.receiver.track?.kind === "audio")?.sender
-            ?? _tc0[0]?.sender
+            pc.getTransceivers().find(t => t.receiver.track?.kind === "audio")?.sender
             ?? pc.getSenders().find(s => s.track?.kind === "audio")
             ?? null;
           if (audioSender && audioSender.track !== micTrack) {
@@ -917,12 +914,8 @@ export default function App() {
           stream.getTracks().forEach(track => {
             // Use getTransceivers() to match by kind reliably — getSenders() alone is ambiguous
             // when both audio and video senders have null tracks (first null-track sender wins).
-            const _tc = pc.getTransceivers();
-            const isVideo = track.kind === "video";
             const sender =
-              _tc.find(t => t.sender.track?.kind === track.kind)?.sender
-              ?? _tc.find(t => t.receiver.track?.kind === track.kind)?.sender
-              ?? (isVideo ? _tc[1]?.sender : _tc[0]?.sender)
+              pc.getTransceivers().find(t => t.receiver.track?.kind === track.kind)?.sender
               ?? pc.getSenders().find(s => s.track?.kind === track.kind)
               ?? null;
             if (sender) {
@@ -1129,14 +1122,9 @@ export default function App() {
 
       // Push video (and optionally mixed audio) to every connected peer
       for (const [peerId, pc] of pcsRef.current.entries()) {
-        const transceivers = pc.getTransceivers();
         // ── Video ──────────────────────────────────────────────────────────────
-        // Look for: (1) sender already carrying video, (2) receiver carrying video,
-        // (3) positional fallback — video transceiver is always index 1 (we addTransceiver audio then video).
         const videoSender =
-          transceivers.find(t => t.sender.track?.kind === "video")?.sender
-          ?? transceivers.find(t => t.receiver.track?.kind === "video")?.sender
-          ?? transceivers[1]?.sender
+          pc.getTransceivers().find(t => t.receiver.track?.kind === "video")?.sender
           ?? pc.getSenders().find(s => s.track?.kind === "video")
           ?? null;
         if (videoSender) {
@@ -1146,9 +1134,7 @@ export default function App() {
         // ── Audio ──────────────────────────────────────────────────────────────
         if (audioToSend) {
           const audioSender =
-            transceivers.find(t => t.sender.track?.kind === "audio")?.sender
-            ?? transceivers.find(t => t.receiver.track?.kind === "audio")?.sender
-            ?? transceivers[0]?.sender
+            pc.getTransceivers().find(t => t.receiver.track?.kind === "audio")?.sender
             ?? pc.getSenders().find(s => s.track?.kind === "audio")
             ?? null;
           if (audioSender) {
@@ -1215,11 +1201,8 @@ export default function App() {
       ?? null;
 
     pcsRef.current.forEach(pc => {
-      const transceivers = pc.getTransceivers();
       const videoSender =
-        transceivers.find(t => t.sender.track?.kind === "video")?.sender
-        ?? transceivers.find(t => t.receiver.track?.kind === "video")?.sender
-        ?? transceivers[1]?.sender
+        pc.getTransceivers().find(t => t.receiver.track?.kind === "video")?.sender
         ?? pc.getSenders().find(s => s.track?.kind === "video")
         ?? null;
       if (videoSender) videoSender.replaceTrack(camTrack).catch(() => {});
@@ -1227,9 +1210,7 @@ export default function App() {
       // Restore mic track — we may have been sending the mixed system+mic track
       if (micTrack) {
         const audioSender =
-          transceivers.find(t => t.sender.track?.kind === "audio")?.sender
-          ?? transceivers.find(t => t.receiver.track?.kind === "audio")?.sender
-          ?? transceivers[0]?.sender
+          pc.getTransceivers().find(t => t.receiver.track?.kind === "audio")?.sender
           ?? pc.getSenders().find(s => s.track?.kind === "audio")
           ?? null;
         if (audioSender) audioSender.replaceTrack(micTrack).catch(() => {});
@@ -1394,11 +1375,8 @@ export default function App() {
     // toggling `enabled` does nothing. Replace it now so audio actually flows.
     if (next) {
       pcsRef.current.forEach((pc, peerId) => {
-        const _tc1 = pc.getTransceivers();
         const audioSender =
-          _tc1.find(t => t.sender.track?.kind === "audio")?.sender
-          ?? _tc1.find(t => t.receiver.track?.kind === "audio")?.sender
-          ?? _tc1[0]?.sender
+          pc.getTransceivers().find(t => t.receiver.track?.kind === "audio")?.sender
           ?? pc.getSenders().find(s => s.track?.kind === "audio")
           ?? null;
         if (audioSender && audioSender.track !== audioTrack) {
