@@ -69,6 +69,8 @@ export default function App() {
   const [peerVideoOff, setPeerVideoOff] = useState<Set<string>>(new Set());
   const [isMicOn, setIsMicOn] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isRecordingPaused, setIsRecordingPaused] = useState(false);
   const [streamSec, setStreamSec] = useState(0);
   const [currentRoom, setCurrentRoom] = useState<string | null>(null);
   const [iAmRoomHost, setIAmRoomHost] = useState(false);
@@ -131,6 +133,8 @@ export default function App() {
   const audioStreamRef = useRef<MediaStream | null>(null); // room mic (mesh audio)
   const screenAudioCtxRef = useRef<AudioContext | null>(null);  // Web Audio ctx for screen-share mixing
   const screenMixedTrackRef = useRef<MediaStreamTrack | null>(null); // mixed mic+system track
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
   const miniVideoRef = useRef<HTMLVideoElement>(null);
   const localCenterRef = useRef<HTMLVideoElement>(null);
   const pcsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
@@ -1228,6 +1232,92 @@ export default function App() {
     startScreenShare();
   }
 
+  // ─── RECORDING ────────────────────────────────────────────────────────────────
+  // Records whatever the host is broadcasting (screen+audio or camera+mic).
+  // Uses the browser's MediaRecorder API — no server, downloads locally as .webm.
+
+  function buildRecordingStream(): MediaStream | null {
+    const tracks: MediaStreamTrack[] = [];
+    // Video: prefer screen share, fall back to camera
+    const videoTrack =
+      screenStreamRef.current?.getVideoTracks()[0]
+      ?? localStreamRef.current?.getVideoTracks()[0]
+      ?? null;
+    if (videoTrack) tracks.push(videoTrack);
+    // Audio: prefer the mixed screen audio, fall back to mic
+    const audioTrack =
+      screenMixedTrackRef.current
+      ?? audioStreamRef.current?.getAudioTracks()[0]
+      ?? localStreamRef.current?.getAudioTracks()[0]
+      ?? null;
+    if (audioTrack) tracks.push(audioTrack);
+    if (tracks.length === 0) return null;
+    return new MediaStream(tracks);
+  }
+
+  function startRecording() {
+    if (isRecording) return;
+    const stream = buildRecordingStream();
+    if (!stream) {
+      notify("Nothing to record — start your camera or screen share first.", "warning");
+      return;
+    }
+    const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus")
+      ? "video/webm;codecs=vp9,opus"
+      : MediaRecorder.isTypeSupported("video/webm")
+      ? "video/webm"
+      : "";
+    try {
+      recordedChunksRef.current = [];
+      const mr = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      mr.ondataavailable = e => { if (e.data.size > 0) recordedChunksRef.current.push(e.data); };
+      mr.onstop = () => {
+        const blob = new Blob(recordedChunksRef.current, { type: mimeType || "video/webm" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+        a.href = url; a.download = `nexuscast-${ts}.webm`;
+        document.body.appendChild(a); a.click();
+        setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 2000);
+        setIsRecording(false); setIsRecordingPaused(false);
+        notify("Recording saved! 💾", "success");
+      };
+      mr.start(1000); // collect chunks every 1 s so data isn't lost on crash
+      mediaRecorderRef.current = mr;
+      setIsRecording(true); setIsRecordingPaused(false);
+      notify("Recording started 🔴", "info");
+    } catch {
+      notify("Recording not supported on this browser.", "error");
+    }
+  }
+
+  function pauseRecording() {
+    const mr = mediaRecorderRef.current;
+    if (!mr || !isRecording) return;
+    if (mr.state === "recording") {
+      mr.pause();
+      setIsRecordingPaused(true);
+      notify("Recording paused ⏸", "info");
+    }
+  }
+
+  function resumeRecording() {
+    const mr = mediaRecorderRef.current;
+    if (!mr || !isRecording) return;
+    if (mr.state === "paused") {
+      mr.resume();
+      setIsRecordingPaused(false);
+      notify("Recording resumed ▶", "info");
+    }
+  }
+
+  function stopAndDownloadRecording() {
+    const mr = mediaRecorderRef.current;
+    if (!mr || !isRecording) return;
+    mr.stop(); // triggers onstop → download
+    mediaRecorderRef.current = null;
+  }
+
   async function toggleMic() {
     if (isMuted) { notify("You are muted by host. Please wait.", "warning"); return; }
     // If we have no mic stream yet (member never started a stream), acquire it now.
@@ -1746,7 +1836,28 @@ export default function App() {
                 <div>• Use Chat tab for messages</div>
                 <div>• Use Members tab to manage users</div>
               </div>
-              {/* multi-stream thumbnail picker removed */}
+              {/* RECORDING PANEL — mobile */}
+              {!_isViewer && (isStreaming || isWebcamOn || isScreenSharing) && (
+                <div style={{ ...panelSt, padding: "10px 12px" }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: "#ff4444", marginBottom: 8, display: "flex", alignItems: "center", gap: 6 }}>
+                    <span style={{ animation: isRecording && !isRecordingPaused ? "statusBlink 1s infinite" : "none" }}>⏺</span> RECORDING
+                    {isRecording && <span style={{ marginLeft: "auto", fontSize: 9, color: isRecordingPaused ? "#ffaa00" : "#ff4444", fontWeight: 800 }}>{isRecordingPaused ? "PAUSED" : "● REC"}</span>}
+                  </div>
+                  {!isRecording ? (
+                    <button onClick={startRecording} style={{ width: "100%", padding: "10px 0", background: "linear-gradient(135deg, #ff2222, #cc0000)", border: "none", color: "#fff", cursor: "pointer", borderRadius: 8, fontSize: 13, fontWeight: 800, letterSpacing: 1 }}>⏺ START RECORDING</button>
+                  ) : (
+                    <div style={{ display: "flex", gap: 8 }}>
+                      {!isRecordingPaused ? (
+                        <button onClick={pauseRecording} style={{ flex: 1, padding: "10px 0", background: "rgba(255,170,0,0.15)", border: "1px solid #ffaa00", color: "#ffaa00", cursor: "pointer", borderRadius: 8, fontSize: 12, fontWeight: 700 }}>⏸ PAUSE</button>
+                      ) : (
+                        <button onClick={resumeRecording} style={{ flex: 1, padding: "10px 0", background: "rgba(0,212,255,0.15)", border: "1px solid #00d4ff", color: "#00d4ff", cursor: "pointer", borderRadius: 8, fontSize: 12, fontWeight: 700 }}>▶ RESUME</button>
+                      )}
+                      <button onClick={stopAndDownloadRecording} style={{ flex: 1, padding: "10px 0", background: "rgba(255,0,0,0.15)", border: "1px solid #ff4444", color: "#ff6666", cursor: "pointer", borderRadius: 8, fontSize: 12, fontWeight: 700 }}>⏹ SAVE</button>
+                    </div>
+                  )}
+                  {!isRecording && <div style={{ fontSize: 9, color: "#7a8aa0", marginTop: 5, textAlign: "center" }}>Records your stream locally as .webm</div>}
+                </div>
+              )}
             </div>
           )}
 
@@ -1902,6 +2013,29 @@ export default function App() {
               <button onClick={endStreamOnly} style={{ marginTop: 8, width: "100%", padding: 7, background: "rgba(255,0,0,0.15)", border: "1px solid #ff4444", color: "#ff6666", cursor: "pointer", borderRadius: 8, fontSize: 11, fontWeight: 700 }}>⏹️ END STREAM</button>
             )}
           </div>
+
+          {/* RECORDING PANEL — desktop */}
+          {!_isViewer && (isStreaming || isWebcamOn || isScreenSharing) && (
+            <div style={panelSt}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: "#ff4444", marginBottom: 8, display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ animation: isRecording && !isRecordingPaused ? "statusBlink 1s infinite" : "none" }}>⏺</span> RECORDING
+                {isRecording && <span style={{ marginLeft: "auto", fontSize: 9, color: isRecordingPaused ? "#ffaa00" : "#ff4444", fontWeight: 800 }}>{isRecordingPaused ? "PAUSED" : "● REC"}</span>}
+              </div>
+              {!isRecording ? (
+                <button onClick={startRecording} style={{ width: "100%", padding: "9px 0", background: "linear-gradient(135deg, #ff2222, #cc0000)", border: "none", color: "#fff", cursor: "pointer", borderRadius: 8, fontSize: 12, fontWeight: 800, letterSpacing: 1 }}>⏺ START RECORDING</button>
+              ) : (
+                <div style={{ display: "flex", gap: 6 }}>
+                  {!isRecordingPaused ? (
+                    <button onClick={pauseRecording} style={{ flex: 1, padding: "8px 0", background: "rgba(255,170,0,0.15)", border: "1px solid #ffaa00", color: "#ffaa00", cursor: "pointer", borderRadius: 8, fontSize: 11, fontWeight: 700 }}>⏸ PAUSE</button>
+                  ) : (
+                    <button onClick={resumeRecording} style={{ flex: 1, padding: "8px 0", background: "rgba(0,212,255,0.15)", border: "1px solid #00d4ff", color: "#00d4ff", cursor: "pointer", borderRadius: 8, fontSize: 11, fontWeight: 700 }}>▶ RESUME</button>
+                  )}
+                  <button onClick={stopAndDownloadRecording} style={{ flex: 1, padding: "8px 0", background: "rgba(255,0,0,0.15)", border: "1px solid #ff4444", color: "#ff6666", cursor: "pointer", borderRadius: 8, fontSize: 11, fontWeight: 700 }}>⏹ SAVE</button>
+                </div>
+              )}
+              {!isRecording && <div style={{ fontSize: 9, color: "#7a8aa0", marginTop: 5, textAlign: "center" }}>Records your stream locally as .webm</div>}
+            </div>
+          )}
 
           {!_isViewer && (isStreaming || joinedStreamHostId !== null) && (
             <div style={panelSt}>
