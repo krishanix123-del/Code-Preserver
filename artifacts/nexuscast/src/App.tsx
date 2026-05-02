@@ -190,10 +190,11 @@ export default function App() {
     };
   }, []);
 
-  // Sync camera stream into miniVideoRef whenever screen sharing turns on with camera active
+  // Sync screen-share stream into miniVideoRef whenever screen sharing turns on while camera is active.
+  // The camera stays in the main view; the screen capture moves to the PiP overlay.
   useEffect(() => {
-    if (isWebcamOn && isScreenSharing && miniVideoRef.current && localStreamRef.current) {
-      miniVideoRef.current.srcObject = localStreamRef.current;
+    if (isWebcamOn && isScreenSharing && miniVideoRef.current && screenStreamRef.current) {
+      miniVideoRef.current.srcObject = screenStreamRef.current;
       miniVideoRef.current.play().catch(() => {});
     }
   }, [isWebcamOn, isScreenSharing]);
@@ -211,9 +212,12 @@ export default function App() {
     // and there's no remote stream taking over the center view.
     if (!(isStreaming || isWebcamOn || isScreenSharing)) return;
     if (focusedStream || remoteStreams.length > 0) return;
-    // Screen share takes priority over camera in the center preview.
-    const desired = isScreenSharing
-      ? (screenStreamRef.current ?? localStreamRef.current)
+    // Camera takes priority in the main view. Screen share only goes to
+    // main when the camera is off — otherwise it lives in the PiP overlay.
+    const desired = isWebcamOn
+      ? localStreamRef.current
+      : isScreenSharing
+      ? (screenStreamRef.current ?? null)
       : localStreamRef.current;
     if (!desired) return;
     if (vid.srcObject !== desired) vid.srcObject = desired;
@@ -903,11 +907,15 @@ export default function App() {
           audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
         });
         localStreamRef.current = stream;
-        // Fix 6: attach FIRST, then update state
-        if (miniVideoRef.current) { miniVideoRef.current.srcObject = stream; miniVideoRef.current.play().catch(() => {}); }
-        if (localCenterRef.current && !isScreenSharingRef.current) {
+        // Camera always goes to main view. If screen sharing is already active,
+        // move the screen share to the PiP so camera can take the main slot.
+        if (localCenterRef.current) {
           localCenterRef.current.srcObject = stream;
           localCenterRef.current.play().catch(() => {});
+        }
+        if (isScreenSharingRef.current && miniVideoRef.current && screenStreamRef.current) {
+          miniVideoRef.current.srcObject = screenStreamRef.current;
+          miniVideoRef.current.play().catch(() => {});
         }
         // Send to existing peers via the pre-created transceivers — replaceTrack + force renegotiate.
         pcsRef.current.forEach(async (pc, peerId) => {
@@ -971,16 +979,23 @@ export default function App() {
     if (isWebcamOn) {
       localStreamRef.current?.getTracks().forEach(t => t.stop());
       localStreamRef.current = null;
-      // Pause BEFORE clearing srcObject to prevent frozen-frame artifacts
+      // Camera was in main view. If screen sharing is still active, move it back to main.
+      // The PiP (miniVideoRef) was showing screen share — clear it since PiP hides when camera is off.
       if (miniVideoRef.current) {
         miniVideoRef.current.pause();
         miniVideoRef.current.srcObject = null;
         miniVideoRef.current.load();
       }
-      if (!isScreenSharingRef.current && localCenterRef.current) {
-        localCenterRef.current.pause();
-        localCenterRef.current.srcObject = null;
-        localCenterRef.current.load();
+      if (localCenterRef.current) {
+        if (isScreenSharingRef.current && screenStreamRef.current) {
+          // Screen share takes over the main view now that camera is off
+          localCenterRef.current.srcObject = screenStreamRef.current;
+          localCenterRef.current.play().catch(() => {});
+        } else {
+          localCenterRef.current.pause();
+          localCenterRef.current.srcObject = null;
+          localCenterRef.current.load();
+        }
       }
       // Replace video sender with null track so remote side doesn't freeze
       pcsRef.current.forEach(pc => {
@@ -1002,10 +1017,14 @@ export default function App() {
           audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
         });
         localStreamRef.current = stream;
-        if (miniVideoRef.current) { miniVideoRef.current.srcObject = stream; miniVideoRef.current.play().catch(() => {}); }
-        if (!isScreenSharingRef.current && localCenterRef.current) {
+        // Camera always in main. Screen share (if active) moves to PiP.
+        if (localCenterRef.current) {
           localCenterRef.current.srcObject = stream;
           localCenterRef.current.play().catch(() => {});
+        }
+        if (isScreenSharingRef.current && miniVideoRef.current && screenStreamRef.current) {
+          miniVideoRef.current.srcObject = screenStreamRef.current;
+          miniVideoRef.current.play().catch(() => {});
         }
         pcsRef.current.forEach(async (pc, peerId) => {
           const senders = pc.getSenders();
@@ -1100,16 +1119,23 @@ export default function App() {
       });
       screenStreamRef.current = stream;
 
-      // Show the captured screen in the local preview
-      if (localCenterRef.current) {
-        localCenterRef.current.srcObject = stream;
-        localCenterRef.current.muted = true; // never echo captured audio locally
-        localCenterRef.current.play().catch(() => {});
-      }
-      // Keep camera visible in mini player while screen is sharing
-      if (localStreamRef.current && miniVideoRef.current) {
-        miniVideoRef.current.srcObject = localStreamRef.current;
-        miniVideoRef.current.play().catch(() => {});
+      // Layout: camera stays in main view; screen share goes to PiP when camera is on.
+      // If camera is off, screen share fills the main view instead.
+      if (isWebcamOnRef.current) {
+        // Camera already in main — put screen share in PiP
+        if (miniVideoRef.current) {
+          miniVideoRef.current.srcObject = stream;
+          miniVideoRef.current.muted = true;
+          miniVideoRef.current.play().catch(() => {});
+        }
+        // Keep the camera in localCenterRef (don't touch it)
+      } else {
+        // No camera — put screen share in main view
+        if (localCenterRef.current) {
+          localCenterRef.current.srcObject = stream;
+          localCenterRef.current.muted = true;
+          localCenterRef.current.play().catch(() => {});
+        }
       }
 
       const screenVideoTrack = stream.getVideoTracks()[0];
@@ -1183,7 +1209,12 @@ export default function App() {
     // Tear down the Web Audio mix graph (mic + system audio)
     teardownScreenAudio();
 
-    // Restore local preview: back to camera if active, else blank
+    // Restore local preview: camera back to main, clear PiP (screen share ended)
+    if (miniVideoRef.current) {
+      miniVideoRef.current.pause();
+      miniVideoRef.current.srcObject = null;
+      miniVideoRef.current.load();
+    }
     if (localCenterRef.current) {
       if (localStreamRef.current) {
         localCenterRef.current.srcObject = localStreamRef.current;
@@ -1789,7 +1820,7 @@ export default function App() {
 
         {/* VIDEO AREA */}
         <div style={{ position: "relative", background: "#000", aspectRatio: "16/9", flexShrink: 0, overflow: "hidden" }}>
-          <video ref={localCenterRef} autoPlay muted playsInline style={{ width: "100%", height: "100%", objectFit: isScreenSharing ? "contain" : "cover", display: showLocalCenter ? "block" : "none", background: "#000" }} />
+          <video ref={localCenterRef} autoPlay muted playsInline style={{ width: "100%", height: "100%", objectFit: (!isWebcamOn && isScreenSharing) ? "contain" : "cover", display: showLocalCenter ? "block" : "none", background: "#000" }} />
           {showRemoteCenter && (
             focusedStream
               ? <RemoteVideoEl key={focusedStream.peerId} stream={focusedStream.stream} peerId={focusedStream.peerId} videoRefs={remoteVideoRefs} videoOff={peerVideoOff.has(focusedStream.peerId)} />
@@ -1821,8 +1852,9 @@ export default function App() {
             <div onClick={unlockAudio} style={{ position: "absolute", bottom: 8, left: "50%", transform: "translateX(-50%)", background: "rgba(0,212,255,0.2)", border: "1px solid #00d4ff", borderRadius: 16, padding: "6px 16px", fontSize: 10, color: "#00d4ff" }}>🔊 Tap to enable audio</div>
           )}
           {isWebcamOn && isScreenSharing && (
-            <div style={{ position: "absolute", bottom: 8, right: 8, width: 90, height: 68, border: "2px solid #00d4ff", borderRadius: 8, overflow: "hidden" }}>
-              <video ref={miniVideoRef} autoPlay muted playsInline style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+            <div style={{ position: "absolute", bottom: 8, right: 8, width: 110, height: 72, border: "2px solid #00d4ff", borderRadius: 8, overflow: "hidden", background: "#000" }}>
+              <div style={{ fontSize: 7, color: "#00d4ff", background: "rgba(0,212,255,0.15)", padding: "2px 5px", borderBottom: "1px solid #00d4ff" }}>🖥️ SCREEN</div>
+              <video ref={miniVideoRef} autoPlay muted playsInline style={{ width: "100%", height: "calc(100% - 14px)", objectFit: "contain", background: "#000" }} />
             </div>
           )}
         </div>
@@ -2155,7 +2187,7 @@ export default function App() {
           <div style={{ flex: 1, position: "relative", borderRadius: 16, overflow: "hidden", border: `3px solid ${isStreaming ? "#ff0000" : "#00d4ff"}`, background: "#000", boxShadow: isStreaming ? "0 0 40px rgba(255,0,0,0.3)" : "0 0 20px rgba(0,212,255,0.2)", transition: "all .3s" }}>
             <div style={{ position: "absolute", top: 10, left: 10, display: "flex", gap: 6, zIndex: 15 }}>
               <div style={{ background: "rgba(0,14,39,0.85)", padding: "3px 10px", borderRadius: 16, fontSize: 10, fontWeight: 600, color: "#00d4ff", border: "1px solid #004d7f" }}>
-                {isScreenSharing ? "🖥️ SCREEN SHARE" : isStreaming ? "🔴 LIVE STREAM" : "🎥 STREAM"}
+                {isWebcamOn ? "📹 CAMERA" : isScreenSharing ? "🖥️ SCREEN SHARE" : isStreaming ? "🔴 LIVE STREAM" : "🎥 STREAM"}
               </div>
               {someoneIsLive && (
                 <div title={`${viewerCount} ${viewerCount === 1 ? "person is" : "people are"} watching the stream right now`} style={{ background: "rgba(255,0,128,0.18)", padding: "3px 10px", borderRadius: 16, fontSize: 10, fontWeight: 700, color: "#ff88aa", border: "1px solid #ff4488" }}>
@@ -2165,7 +2197,7 @@ export default function App() {
             </div>
             {isStreaming && <div style={{ position: "absolute", top: 10, right: 10, background: "rgba(255,0,0,0.25)", padding: "3px 10px", borderRadius: 16, fontSize: 10, fontWeight: 700, color: "#ff4444", border: "1px solid #ff4444", animation: "statusBlink 1s infinite", zIndex: 15 }}>● LIVE</div>}
 
-            <video ref={localCenterRef} autoPlay muted playsInline style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: isScreenSharing ? "contain" : "cover", display: showLocalCenter ? "block" : "none", background: "#000" }} />
+            <video ref={localCenterRef} autoPlay muted playsInline style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: (!isWebcamOn && isScreenSharing) ? "contain" : "cover", display: showLocalCenter ? "block" : "none", background: "#000" }} />
 
             {showRemoteCenter && (
               focusedStream
@@ -2300,14 +2332,14 @@ export default function App() {
         </div>
       </div>
 
-      {/* DRAGGABLE MINI WEBCAM — only visible when screen sharing is active */}
+      {/* DRAGGABLE MINI SCREEN SHARE — visible when both camera and screen sharing are active */}
       {isWebcamOn && isScreenSharing && (
-        <div ref={miniPlayerRef} style={{ ...miniStyle, width: 200, height: 155, background: "#0a0e27", border: "2px solid #00d4ff", borderRadius: 12, overflow: "hidden", boxShadow: "0 0 20px rgba(0,212,255,0.4)", userSelect: "none", zIndex: 900 }}>
+        <div ref={miniPlayerRef} style={{ ...miniStyle, width: 240, height: 160, background: "#0a0e27", border: "2px solid #00d4ff", borderRadius: 12, overflow: "hidden", boxShadow: "0 0 20px rgba(0,212,255,0.4)", userSelect: "none", zIndex: 900 }}>
           <div onPointerDown={onMiniPointerDown} onPointerMove={onMiniPointerMove} onPointerUp={onMiniPointerUp} style={{ background: "rgba(0,212,255,0.15)", padding: "4px 8px", borderBottom: "1px solid #00d4ff", display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 9, color: "#00d4ff", cursor: "grab" }}>
-            <span>⠿ 📹 YOUR CAM</span>
+            <span>⠿ 🖥️ SCREEN SHARE</span>
             <span style={{ fontSize: 7, opacity: 0.6 }}>drag to move</span>
           </div>
-          <video ref={miniVideoRef} autoPlay muted playsInline style={{ width: "100%", height: "calc(100% - 26px)", objectFit: "cover", background: "#000", display: "block" }} />
+          <video ref={miniVideoRef} autoPlay muted playsInline style={{ width: "100%", height: "calc(100% - 26px)", objectFit: "contain", background: "#000", display: "block" }} />
         </div>
       )}
 
