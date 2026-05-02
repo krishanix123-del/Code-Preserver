@@ -71,6 +71,7 @@ export default function App() {
   const [isMuted, setIsMuted] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [isRecordingPaused, setIsRecordingPaused] = useState(false);
+  const [recordingSec, setRecordingSec] = useState(0);
   const [streamSec, setStreamSec] = useState(0);
   const [currentRoom, setCurrentRoom] = useState<string | null>(null);
   const [iAmRoomHost, setIAmRoomHost] = useState(false);
@@ -135,6 +136,7 @@ export default function App() {
   const screenMixedTrackRef = useRef<MediaStreamTrack | null>(null); // mixed mic+system track
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
+  const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const miniVideoRef = useRef<HTMLVideoElement>(null);
   const localCenterRef = useRef<HTMLVideoElement>(null);
   const pcsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
@@ -1272,6 +1274,7 @@ export default function App() {
       const mr = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
       mr.ondataavailable = e => { if (e.data.size > 0) recordedChunksRef.current.push(e.data); };
       mr.onstop = () => {
+        if (recordingTimerRef.current) { clearInterval(recordingTimerRef.current); recordingTimerRef.current = null; }
         const blob = new Blob(recordedChunksRef.current, { type: mimeType || "video/webm" });
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
@@ -1279,11 +1282,13 @@ export default function App() {
         a.href = url; a.download = `nexuscast-${ts}.webm`;
         document.body.appendChild(a); a.click();
         setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 2000);
-        setIsRecording(false); setIsRecordingPaused(false);
+        setIsRecording(false); setIsRecordingPaused(false); setRecordingSec(0);
         notify("Recording saved! 💾", "success");
       };
       mr.start(1000); // collect chunks every 1 s so data isn't lost on crash
       mediaRecorderRef.current = mr;
+      setRecordingSec(0);
+      recordingTimerRef.current = setInterval(() => setRecordingSec(s => s + 1), 1000);
       setIsRecording(true); setIsRecordingPaused(false);
       notify("Recording started 🔴", "info");
     } catch {
@@ -1296,6 +1301,7 @@ export default function App() {
     if (!mr || !isRecording) return;
     if (mr.state === "recording") {
       mr.pause();
+      if (recordingTimerRef.current) { clearInterval(recordingTimerRef.current); recordingTimerRef.current = null; }
       setIsRecordingPaused(true);
       notify("Recording paused ⏸", "info");
     }
@@ -1306,6 +1312,7 @@ export default function App() {
     if (!mr || !isRecording) return;
     if (mr.state === "paused") {
       mr.resume();
+      recordingTimerRef.current = setInterval(() => setRecordingSec(s => s + 1), 1000);
       setIsRecordingPaused(false);
       notify("Recording resumed ▶", "info");
     }
@@ -1843,6 +1850,12 @@ export default function App() {
                     <span style={{ animation: isRecording && !isRecordingPaused ? "statusBlink 1s infinite" : "none" }}>⏺</span> RECORDING
                     {isRecording && <span style={{ marginLeft: "auto", fontSize: 9, color: isRecordingPaused ? "#ffaa00" : "#ff4444", fontWeight: 800 }}>{isRecordingPaused ? "PAUSED" : "● REC"}</span>}
                   </div>
+                  {isRecording && (
+                    <div style={{ textAlign: "center", marginBottom: 8, padding: "6px 0", background: "rgba(255,0,0,0.08)", borderRadius: 8, border: `1px solid ${isRecordingPaused ? "#ffaa00" : "#ff4444"}` }}>
+                      <div style={{ fontSize: 8, color: "#a0b0d0", letterSpacing: 1, marginBottom: 2 }}>{isRecordingPaused ? "⏸ PAUSED" : "⏺ RECORDING"}</div>
+                      <div style={{ fontSize: 22, fontWeight: 800, fontFamily: "monospace", color: isRecordingPaused ? "#ffaa00" : "#ff4444", opacity: isRecordingPaused ? 0.7 : 1 }}>{fmt(recordingSec)}</div>
+                    </div>
+                  )}
                   {!isRecording ? (
                     <button onClick={startRecording} style={{ width: "100%", padding: "10px 0", background: "linear-gradient(135deg, #ff2222, #cc0000)", border: "none", color: "#fff", cursor: "pointer", borderRadius: 8, fontSize: 13, fontWeight: 800, letterSpacing: 1 }}>⏺ START RECORDING</button>
                   ) : (
@@ -2021,6 +2034,12 @@ export default function App() {
                 <span style={{ animation: isRecording && !isRecordingPaused ? "statusBlink 1s infinite" : "none" }}>⏺</span> RECORDING
                 {isRecording && <span style={{ marginLeft: "auto", fontSize: 9, color: isRecordingPaused ? "#ffaa00" : "#ff4444", fontWeight: 800 }}>{isRecordingPaused ? "PAUSED" : "● REC"}</span>}
               </div>
+              {isRecording && (
+                <div style={{ textAlign: "center", marginBottom: 8, padding: "6px 0", background: "rgba(255,0,0,0.08)", borderRadius: 8, border: `1px solid ${isRecordingPaused ? "#ffaa00" : "#ff4444"}` }}>
+                  <div style={{ fontSize: 8, color: "#a0b0d0", letterSpacing: 1, marginBottom: 2 }}>{isRecordingPaused ? "⏸ PAUSED" : "⏺ RECORDING"}</div>
+                  <div style={{ fontSize: 22, fontWeight: 800, fontFamily: "monospace", color: isRecordingPaused ? "#ffaa00" : "#ff4444", opacity: isRecordingPaused ? 0.7 : 1 }}>{fmt(recordingSec)}</div>
+                </div>
+              )}
               {!isRecording ? (
                 <button onClick={startRecording} style={{ width: "100%", padding: "9px 0", background: "linear-gradient(135deg, #ff2222, #cc0000)", border: "none", color: "#fff", cursor: "pointer", borderRadius: 8, fontSize: 12, fontWeight: 800, letterSpacing: 1 }}>⏺ START RECORDING</button>
               ) : (
