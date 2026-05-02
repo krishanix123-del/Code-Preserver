@@ -129,6 +129,8 @@ export default function App() {
   const localStreamRef = useRef<MediaStream | null>(null);
   const screenStreamRef = useRef<MediaStream | null>(null);
   const audioStreamRef = useRef<MediaStream | null>(null); // room mic (mesh audio)
+  const screenAudioCtxRef = useRef<AudioContext | null>(null);  // Web Audio ctx for screen-share mixing
+  const screenMixedTrackRef = useRef<MediaStreamTrack | null>(null); // mixed mic+system track
   const miniVideoRef = useRef<HTMLVideoElement>(null);
   const localCenterRef = useRef<HTMLVideoElement>(null);
   const pcsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
@@ -541,6 +543,10 @@ export default function App() {
       audioStreamRef.current = null;
       screenStreamRef.current?.getTracks().forEach(t => t.stop());
       screenStreamRef.current = null;
+      try { screenMixedTrackRef.current?.stop(); } catch {}
+      screenMixedTrackRef.current = null;
+      try { screenAudioCtxRef.current?.close(); } catch {}
+      screenAudioCtxRef.current = null;
       socket.disconnect();
     };
   }, []);
@@ -1026,9 +1032,52 @@ export default function App() {
     return _isNativeApp || /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
   }, []);
 
-  // ─── FRESH SCREEN SHARING ────────────────────────────────────────────────────
-  // Clean, simple implementation: capture → replaceTrack on all PCs → renegotiate.
-  // No mixed audio, no pause modal, no re-entrancy guards.
+  // ─── SCREEN SHARING WITH SYSTEM AUDIO ───────────────────────────────────────
+  // Requests both screen video and system audio from getDisplayMedia.
+  // If system audio is granted, mixes it with the host's mic via Web Audio so
+  // viewers hear both voices AND whatever is playing on the host's screen.
+  // If the browser/source doesn't share audio, falls back to mic-only silently.
+
+  /** Build a single mixed MediaStreamTrack from mic + system audio via Web Audio. */
+  function buildScreenMixedAudio(systemAudioTrack: MediaStreamTrack): MediaStreamTrack | null {
+    try {
+      const AC = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      if (!AC) return null;
+      const ctx = new AC();
+      const dest = ctx.createMediaStreamDestination();
+
+      // System audio side (tab / desktop audio)
+      const sysNode = ctx.createMediaStreamSource(new MediaStream([systemAudioTrack]));
+      const sysGain = ctx.createGain(); sysGain.gain.value = 1.0;
+      sysNode.connect(sysGain).connect(dest);
+
+      // Mic side — blend in if available (keeps host's voice audible)
+      const micTrack =
+        audioStreamRef.current?.getAudioTracks()[0]
+        ?? localStreamRef.current?.getAudioTracks()[0]
+        ?? null;
+      if (micTrack) {
+        const micNode = ctx.createMediaStreamSource(new MediaStream([micTrack]));
+        const micGain = ctx.createGain(); micGain.gain.value = 0.85;
+        micNode.connect(micGain).connect(dest);
+      }
+
+      screenAudioCtxRef.current = ctx;
+      const mixed = dest.stream.getAudioTracks()[0] ?? null;
+      screenMixedTrackRef.current = mixed;
+      return mixed;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Tear down the Web Audio graph created during screen share. */
+  function teardownScreenAudio() {
+    try { screenMixedTrackRef.current?.stop(); } catch {}
+    screenMixedTrackRef.current = null;
+    try { screenAudioCtxRef.current?.close(); } catch {}
+    screenAudioCtxRef.current = null;
+  }
 
   async function startScreenShare(): Promise<boolean> {
     if (!navigator.mediaDevices?.getDisplayMedia) {
@@ -1038,14 +1087,14 @@ export default function App() {
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({
         video: { frameRate: { ideal: 30, max: 30 } },
-        audio: false,
+        audio: true, // ask for system/tab audio — browser may or may not grant it
       });
       screenStreamRef.current = stream;
 
       // Show the captured screen in the local preview
       if (localCenterRef.current) {
         localCenterRef.current.srcObject = stream;
-        localCenterRef.current.muted = true;
+        localCenterRef.current.muted = true; // never echo captured audio locally
         localCenterRef.current.play().catch(() => {});
       }
       // Keep camera visible in mini player while screen is sharing
@@ -1055,12 +1104,16 @@ export default function App() {
       }
 
       const screenVideoTrack = stream.getVideoTracks()[0];
+      const systemAudioTrack = stream.getAudioTracks()[0] ?? null;
 
-      // Push the screen track to every connected peer
+      // Build the audio track to send: mixed (system+mic) if system audio was granted,
+      // otherwise keep using the existing mic track (no change to audio sender needed).
+      const mixedAudio = systemAudioTrack ? buildScreenMixedAudio(systemAudioTrack) : null;
+      const audioToSend = mixedAudio ?? systemAudioTrack ?? null;
+
+      // Push video (and optionally mixed audio) to every connected peer
       for (const [peerId, pc] of pcsRef.current.entries()) {
-        // Use getTransceivers() to reliably find the VIDEO transceiver — getSenders() alone
-        // is ambiguous when both audio and video senders still have null tracks, causing the
-        // screen track to be accidentally sent on the audio sender.
+        // ── Video ──────────────────────────────────────────────────────────────
         const videoSender =
           pc.getTransceivers().find(t => t.receiver.track?.kind === "video")?.sender
           ?? pc.getSenders().find(s => s.track?.kind === "video")
@@ -1068,8 +1121,19 @@ export default function App() {
         if (videoSender) {
           await videoSender.replaceTrack(screenVideoTrack).catch(() => {});
         }
-        // Force a new offer so the receiver's <video> starts rendering immediately.
-        // replaceTrack alone does not trigger onnegotiationneeded in any browser.
+
+        // ── Audio ──────────────────────────────────────────────────────────────
+        if (audioToSend) {
+          const audioSender =
+            pc.getTransceivers().find(t => t.receiver.track?.kind === "audio")?.sender
+            ?? pc.getSenders().find(s => s.track?.kind === "audio")
+            ?? null;
+          if (audioSender) {
+            await audioSender.replaceTrack(audioToSend).catch(() => {});
+          }
+        }
+
+        // Force renegotiation — replaceTrack alone is not enough on all browsers
         try {
           if (pc.signalingState === "stable") {
             const offer = await pc.createOffer();
@@ -1086,7 +1150,11 @@ export default function App() {
       // When the browser "Stop sharing" button is clicked
       screenVideoTrack.onended = () => stopScreenShare();
 
-      notify("Screen sharing active 🖥️", "success");
+      if (systemAudioTrack) {
+        notify("Screen sharing active with audio 🔊🖥️", "success");
+      } else {
+        notify("Screen sharing active 🖥️ (no system audio — in Chrome, pick a Tab and tick 'Share tab audio')", "info");
+      }
       return true;
     } catch (err: unknown) {
       const name = err instanceof Error ? err.name : "";
@@ -1103,6 +1171,9 @@ export default function App() {
     screenStreamRef.current?.getTracks().forEach(t => { t.onended = null; t.stop(); });
     screenStreamRef.current = null;
 
+    // Tear down the Web Audio mix graph (mic + system audio)
+    teardownScreenAudio();
+
     // Restore local preview: back to camera if active, else blank
     if (localCenterRef.current) {
       if (localStreamRef.current) {
@@ -1113,14 +1184,29 @@ export default function App() {
       }
     }
 
-    // Restore the camera video track (or null) on all peer senders
+    // Restore camera video track and mic audio track on all peer senders
     const camTrack = localStreamRef.current?.getVideoTracks()[0] ?? null;
+    const micTrack =
+      audioStreamRef.current?.getAudioTracks()[0]
+      ?? localStreamRef.current?.getAudioTracks()[0]
+      ?? null;
+
     pcsRef.current.forEach(pc => {
       const videoSender =
         pc.getTransceivers().find(t => t.receiver.track?.kind === "video")?.sender
         ?? pc.getSenders().find(s => s.track?.kind === "video")
         ?? null;
       if (videoSender) videoSender.replaceTrack(camTrack).catch(() => {});
+
+      // Restore mic track — we may have been sending the mixed system+mic track
+      if (micTrack) {
+        const audioSender =
+          pc.getTransceivers().find(t => t.receiver.track?.kind === "audio")?.sender
+          ?? pc.getSenders().find(s => s.track?.kind === "audio")
+          ?? null;
+        if (audioSender) audioSender.replaceTrack(micTrack).catch(() => {});
+      }
+
       setTimeout(() => applyVideoEncodingParams(pc, false), 250);
     });
 
@@ -1231,6 +1317,7 @@ export default function App() {
     // Also stop local camera/screen if still active
     localStreamRef.current?.getTracks().forEach(t => t.stop()); localStreamRef.current = null;
     screenStreamRef.current?.getTracks().forEach(t => t.stop()); screenStreamRef.current = null;
+    teardownScreenAudio();
     setRemoteStreams([]); setFocusedStream(null); setMembers([]);
     setCurrentRoom(null); setJoinedStreamHostId(null); setIAmRoomHost(false);
     setIsMicOn(false); setIsWebcamOn(false); setIsScreenSharing(false); setIsStreaming(false);
