@@ -648,11 +648,10 @@ export default function App() {
       if (micTrack) {
         const promises: Promise<void>[] = [];
         pcsRef.current.forEach((pc, peerId) => {
-          // Use getTransceivers() to find the audio transceiver reliably —
-          // getSenders() alone is ambiguous when both senders have null tracks.
+          const trs = pc.getTransceivers();
           const audioSender =
-            pc.getTransceivers().find(t => t.receiver.track?.kind === "audio")?.sender
-            ?? pc.getSenders().find(s => s.track?.kind === "audio")
+            trs.find(t => t.sender.track?.kind === "audio" || t.receiver.track?.kind === "audio")?.sender
+            ?? trs[0]?.sender
             ?? null;
           if (audioSender && audioSender.track !== micTrack) {
             promises.push(
@@ -919,13 +918,13 @@ export default function App() {
         }
         // Send to existing peers via the pre-created transceivers — replaceTrack + force renegotiate.
         pcsRef.current.forEach(async (pc, peerId) => {
+          const trs = pc.getTransceivers();
+          const findSender = (kind: "audio" | "video"): RTCRtpSender | null =>
+            trs.find(t => t.sender.track?.kind === kind || t.receiver.track?.kind === kind)?.sender
+            ?? (kind === "video" ? trs[1]?.sender : trs[0]?.sender)
+            ?? null;
           stream.getTracks().forEach(track => {
-            // Use getTransceivers() to match by kind reliably — getSenders() alone is ambiguous
-            // when both audio and video senders have null tracks (first null-track sender wins).
-            const sender =
-              pc.getTransceivers().find(t => t.receiver.track?.kind === track.kind)?.sender
-              ?? pc.getSenders().find(s => s.track?.kind === track.kind)
-              ?? null;
+            const sender = findSender(track.kind as "audio" | "video");
             if (sender) {
               sender.replaceTrack(track).catch(err => console.warn("[start-stream:camera] replaceTrack failed:", err));
             }
@@ -999,7 +998,11 @@ export default function App() {
       }
       // Replace video sender with null track so remote side doesn't freeze
       pcsRef.current.forEach(pc => {
-        const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
+        const trs = pc.getTransceivers();
+        const videoSender =
+          trs.find(t => t.sender.track?.kind === "video" || t.receiver.track?.kind === "video")?.sender
+          ?? trs[1]?.sender
+          ?? null;
         if (videoSender) videoSender.replaceTrack(null).catch(() => {});
       });
       setIsWebcamOn(false);
@@ -1148,21 +1151,26 @@ export default function App() {
 
       // Push video (and optionally mixed audio) to every connected peer
       for (const [peerId, pc] of pcsRef.current.entries()) {
+        // Reliable transceiver lookup: check sender/receiver track kind first,
+        // then fall back to index (audio=0, video=1 — guaranteed by getOrCreatePC).
+        const trs = pc.getTransceivers();
+        const findSender = (kind: "audio" | "video"): RTCRtpSender | null => {
+          return (
+            trs.find(t => t.sender.track?.kind === kind || t.receiver.track?.kind === kind)?.sender
+            ?? (kind === "video" ? trs[1]?.sender : trs[0]?.sender)
+            ?? null
+          );
+        };
+
         // ── Video ──────────────────────────────────────────────────────────────
-        const videoSender =
-          pc.getTransceivers().find(t => t.receiver.track?.kind === "video")?.sender
-          ?? pc.getSenders().find(s => s.track?.kind === "video")
-          ?? null;
+        const videoSender = findSender("video");
         if (videoSender) {
           await videoSender.replaceTrack(screenVideoTrack).catch(() => {});
         }
 
         // ── Audio ──────────────────────────────────────────────────────────────
         if (audioToSend) {
-          const audioSender =
-            pc.getTransceivers().find(t => t.receiver.track?.kind === "audio")?.sender
-            ?? pc.getSenders().find(s => s.track?.kind === "audio")
-            ?? null;
+          const audioSender = findSender("audio");
           if (audioSender) {
             await audioSender.replaceTrack(audioToSend).catch(() => {});
           }
@@ -1232,18 +1240,18 @@ export default function App() {
       ?? null;
 
     pcsRef.current.forEach(pc => {
-      const videoSender =
-        pc.getTransceivers().find(t => t.receiver.track?.kind === "video")?.sender
-        ?? pc.getSenders().find(s => s.track?.kind === "video")
+      const trs = pc.getTransceivers();
+      const findSender = (kind: "audio" | "video"): RTCRtpSender | null =>
+        trs.find(t => t.sender.track?.kind === kind || t.receiver.track?.kind === kind)?.sender
+        ?? (kind === "video" ? trs[1]?.sender : trs[0]?.sender)
         ?? null;
+
+      const videoSender = findSender("video");
       if (videoSender) videoSender.replaceTrack(camTrack).catch(() => {});
 
       // Restore mic track — we may have been sending the mixed system+mic track
       if (micTrack) {
-        const audioSender =
-          pc.getTransceivers().find(t => t.receiver.track?.kind === "audio")?.sender
-          ?? pc.getSenders().find(s => s.track?.kind === "audio")
-          ?? null;
+        const audioSender = findSender("audio");
         if (audioSender) audioSender.replaceTrack(micTrack).catch(() => {});
       }
 
@@ -1406,9 +1414,10 @@ export default function App() {
     // toggling `enabled` does nothing. Replace it now so audio actually flows.
     if (next) {
       pcsRef.current.forEach((pc, peerId) => {
+        const trs = pc.getTransceivers();
         const audioSender =
-          pc.getTransceivers().find(t => t.receiver.track?.kind === "audio")?.sender
-          ?? pc.getSenders().find(s => s.track?.kind === "audio")
+          trs.find(t => t.sender.track?.kind === "audio" || t.receiver.track?.kind === "audio")?.sender
+          ?? trs[0]?.sender
           ?? null;
         if (audioSender && audioSender.track !== audioTrack) {
           audioSender.replaceTrack(audioTrack)
