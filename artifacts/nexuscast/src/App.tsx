@@ -971,6 +971,10 @@ export default function App() {
 
   // Camera toggle — independent of stream, with adaptive constraints to prevent lag
   async function toggleWebcam() {
+    if (isScreenSharing && isStreaming) {
+      notify("Stop screen sharing before switching to camera.", "warning");
+      return;
+    }
     if (!isWebcamOn && hostIsActivelyStreaming()) {
       notify("The host is streaming — only the host can broadcast right now.", "warning");
       return;
@@ -1882,7 +1886,7 @@ export default function App() {
                   {isStreaming ? "⏹ END" : "▶ STREAM"}
                 </button>
               )}
-              <button onClick={toggleWebcam} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isWebcamOn ? "#00d4ff" : "#334"}`, background: isWebcamOn ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isWebcamOn ? "#00d4ff" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>📹</button>
+              <button onClick={toggleWebcam} disabled={isScreenSharing && isStreaming} title={isScreenSharing && isStreaming ? "Stop screen sharing to use camera" : "Toggle camera"} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isScreenSharing && isStreaming ? "#334" : isWebcamOn ? "#00d4ff" : "#334"}`, background: isScreenSharing && isStreaming ? "rgba(0,0,0,0.15)" : isWebcamOn ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isScreenSharing && isStreaming ? "#445" : isWebcamOn ? "#00d4ff" : "#667", fontSize: 18, cursor: isScreenSharing && isStreaming ? "not-allowed" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", opacity: isScreenSharing && isStreaming ? 0.4 : 1 }}>📹</button>
               <button onClick={toggleScreenShare} title={isMobileDevice ? "Screen share is desktop-only" : "Share your screen"} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isScreenSharing ? "#00d4ff" : "#334"}`, background: isScreenSharing ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isScreenSharing ? "#00d4ff" : (isMobileDevice ? "#445" : "#667"), fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", opacity: isMobileDevice ? 0.45 : 1, position: "relative" }}>🖥️{isMobileDevice && <span style={{ position: "absolute", top: -3, right: -3, fontSize: 10, color: "#a0b0d0", background: "#0a0e27", borderRadius: "50%", width: 14, height: 14, display: "flex", alignItems: "center", justifyContent: "center", border: "1px solid #334" }}>💻</span>}</button>
               {(isStreaming || joinedStreamHostId) && (
                 <button onClick={toggleMic} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#334"}`, background: isMuted ? "rgba(255,170,0,0.15)" : isMicOn ? "rgba(0,255,0,0.15)" : "rgba(0,0,0,0.3)", color: isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>{isMuted ? "🔇" : isMicOn ? "🎙️" : "🔇"}</button>
@@ -2099,14 +2103,14 @@ export default function App() {
                 // Viewers can't broadcast — hide STREAM/CAMERA/SCREEN entirely
                 ...(_isViewer ? [] : [
                   ...(canStartStream ? [{ icon: isStreaming ? "⏹" : "▶", label: "STREAM", active: isStreaming, onClick: handleStreamButtonClick, color: isStreaming ? "#ff4444" : "#00d4ff" }] : []),
-                  { icon: "📹", label: "CAMERA", active: isWebcamOn, onClick: toggleWebcam, color: "#00d4ff" },
+                  { icon: "📹", label: "CAMERA", active: isWebcamOn, onClick: toggleWebcam, color: "#00d4ff", disabled: isScreenSharing && isStreaming },
                   { icon: "🖥️", label: "SCREEN", active: isScreenSharing, onClick: toggleScreenShare, color: "#00d4ff" },
                 ]),
                 { icon: "👥", label: "TEAM", active: false, onClick: () => setShowTeamModal(true), color: "#00d4ff" },
               ].map(btn => (
-                <div key={btn.label} onClick={btn.onClick} title={btn.label} style={{ width: 56, height: 56, borderRadius: "50%", cursor: "pointer", userSelect: "none", background: btn.active ? `linear-gradient(135deg, ${btn.color}, ${btn.color}aa)` : "rgba(0,212,255,0.1)", border: `2px solid ${btn.color}`, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", boxShadow: btn.active ? `0 0 28px ${btn.color}88` : `0 0 6px ${btn.color}22`, transition: "all .3s" }}>
+                <div key={btn.label} onClick={('disabled' in btn && btn.disabled) ? undefined : btn.onClick} title={('disabled' in btn && btn.disabled) ? "Stop screen sharing to use camera" : btn.label} style={{ width: 56, height: 56, borderRadius: "50%", cursor: ('disabled' in btn && btn.disabled) ? "not-allowed" : "pointer", userSelect: "none", background: ('disabled' in btn && btn.disabled) ? "rgba(0,0,0,0.15)" : btn.active ? `linear-gradient(135deg, ${btn.color}, ${btn.color}aa)` : "rgba(0,212,255,0.1)", border: `2px solid ${('disabled' in btn && btn.disabled) ? "#334" : btn.color}`, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", boxShadow: btn.active ? `0 0 28px ${btn.color}88` : `0 0 6px ${btn.color}22`, transition: "all .3s", opacity: ('disabled' in btn && btn.disabled) ? 0.4 : 1 }}>
                   <div style={{ fontSize: 20 }}>{btn.icon}</div>
-                  <div style={{ fontSize: 7, marginTop: 2, fontWeight: 700, color: btn.active ? "#0a0e27" : btn.color }}>{btn.label}</div>
+                  <div style={{ fontSize: 7, marginTop: 2, fontWeight: 700, color: ('disabled' in btn && btn.disabled) ? "#445" : btn.active ? "#0a0e27" : btn.color }}>{btn.label}</div>
                 </div>
               ))}
             </div>
