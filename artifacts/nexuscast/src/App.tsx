@@ -63,6 +63,7 @@ export default function App() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [isWebcamOn, setIsWebcamOn] = useState(false);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
+  const [pipSwapped, setPipSwapped] = useState(false); // false=camera in main, true=screen in main
   // Set of remote peerIds whose outgoing video is currently OFF. WebRTC's
   // replaceTrack(null) leaves a frozen last frame on the receiver, so each peer
   // tells the room when their video stops/starts and we render a placeholder.
@@ -190,14 +191,15 @@ export default function App() {
     };
   }, []);
 
-  // Sync screen-share stream into miniVideoRef whenever screen sharing turns on while camera is active.
-  // The camera stays in the main view; the screen capture moves to the PiP overlay.
+  // Sync PiP video whenever camera+screen are both on, respecting the swap state.
   useEffect(() => {
-    if (isWebcamOn && isScreenSharing && miniVideoRef.current && screenStreamRef.current) {
-      miniVideoRef.current.srcObject = screenStreamRef.current;
+    if (isWebcamOn && isScreenSharing && miniVideoRef.current) {
+      miniVideoRef.current.srcObject = pipSwapped
+        ? (localStreamRef.current ?? null)
+        : (screenStreamRef.current ?? null);
       miniVideoRef.current.play().catch(() => {});
     }
-  }, [isWebcamOn, isScreenSharing]);
+  }, [isWebcamOn, isScreenSharing, pipSwapped]);
 
   // Keep the local-center <video> attached to the right stream and PLAYING whenever
   // it becomes visible. Browsers pause hidden videos (display:none) for performance,
@@ -212,9 +214,10 @@ export default function App() {
     // and there's no remote stream taking over the center view.
     if (!(isStreaming || isWebcamOn || isScreenSharing)) return;
     if (focusedStream || remoteStreams.length > 0) return;
-    // Camera takes priority in the main view. Screen share only goes to
-    // main when the camera is off — otherwise it lives in the PiP overlay.
-    const desired = isWebcamOn
+    // When both camera + screen are on, pipSwapped decides which fills the main view.
+    const desired = (isWebcamOn && isScreenSharing)
+      ? (pipSwapped ? screenStreamRef.current : localStreamRef.current)
+      : isWebcamOn
       ? localStreamRef.current
       : isScreenSharing
       ? (screenStreamRef.current ?? null)
@@ -223,7 +226,7 @@ export default function App() {
     if (vid.srcObject !== desired) vid.srcObject = desired;
     vid.muted = true; // never echo our own audio in local preview
     vid.play().catch(() => {});
-  }, [isScreenSharing, isStreaming, isWebcamOn, focusedStream, remoteStreams.length]);
+  }, [isScreenSharing, isStreaming, isWebcamOn, focusedStream, remoteStreams.length, pipSwapped]);
 
   // Fix 8: mobile detection
   useEffect(() => {
@@ -1010,6 +1013,7 @@ export default function App() {
         if (videoSender) videoSender.replaceTrack(null).catch(() => {});
       });
       setIsWebcamOn(false);
+      setPipSwapped(false);
       // Tell peers our outgoing video is now off (unless we're still screen-sharing) so
       // they can show a "Camera off" placeholder instead of the frozen last frame.
       if (!isScreenSharingRef.current) emitVideoOffState(true);
@@ -1263,8 +1267,26 @@ export default function App() {
     });
 
     setIsScreenSharing(false);
+    setPipSwapped(false);
     if (!camTrack) emitVideoOffState(true);
     notify("Screen sharing stopped.", "info");
+  }
+
+  function swapPip() {
+    const next = !pipSwapped;
+    setPipSwapped(next);
+    if (localCenterRef.current) {
+      localCenterRef.current.srcObject = next
+        ? (screenStreamRef.current ?? null)
+        : (localStreamRef.current ?? null);
+      localCenterRef.current.play().catch(() => {});
+    }
+    if (miniVideoRef.current) {
+      miniVideoRef.current.srcObject = next
+        ? (localStreamRef.current ?? null)
+        : (screenStreamRef.current ?? null);
+      miniVideoRef.current.play().catch(() => {});
+    }
   }
 
   function toggleScreenShare() {
@@ -1833,7 +1855,7 @@ export default function App() {
 
         {/* VIDEO AREA */}
         <div style={{ position: "relative", background: "#000", aspectRatio: "16/9", flexShrink: 0, overflow: "hidden" }}>
-          <video ref={localCenterRef} autoPlay muted playsInline style={{ width: "100%", height: "100%", objectFit: (!isWebcamOn && isScreenSharing) ? "contain" : "cover", display: showLocalCenter ? "block" : "none", background: "#000" }} />
+          <video ref={localCenterRef} autoPlay muted playsInline style={{ width: "100%", height: "100%", objectFit: (isScreenSharing && (!isWebcamOn || pipSwapped)) ? "contain" : "cover", display: showLocalCenter ? "block" : "none", background: "#000" }} />
           {showRemoteCenter && (
             focusedStream
               ? <RemoteVideoEl key={focusedStream.peerId} stream={focusedStream.stream} peerId={focusedStream.peerId} videoRefs={remoteVideoRefs} videoOff={peerVideoOff.has(focusedStream.peerId)} />
@@ -1865,9 +1887,12 @@ export default function App() {
             <div onClick={unlockAudio} style={{ position: "absolute", bottom: 8, left: "50%", transform: "translateX(-50%)", background: "rgba(0,212,255,0.2)", border: "1px solid #00d4ff", borderRadius: 16, padding: "6px 16px", fontSize: 10, color: "#00d4ff" }}>🔊 Tap to enable audio</div>
           )}
           {isWebcamOn && isScreenSharing && (
-            <div style={{ position: "absolute", bottom: 8, right: 8, width: 110, height: 72, border: "2px solid #00d4ff", borderRadius: 8, overflow: "hidden", background: "#000" }}>
-              <div style={{ fontSize: 7, color: "#00d4ff", background: "rgba(0,212,255,0.15)", padding: "2px 5px", borderBottom: "1px solid #00d4ff" }}>🖥️ SCREEN</div>
-              <video ref={miniVideoRef} autoPlay muted playsInline style={{ width: "100%", height: "calc(100% - 14px)", objectFit: "contain", background: "#000" }} />
+            <div style={{ position: "absolute", bottom: 8, right: 8, width: 120, height: 80, border: "2px solid #00d4ff", borderRadius: 8, overflow: "hidden", background: "#000" }}>
+              <div style={{ fontSize: 7, color: "#00d4ff", background: "rgba(0,212,255,0.15)", padding: "2px 5px", borderBottom: "1px solid #00d4ff", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span>{pipSwapped ? "📹 CAM" : "🖥️ SCREEN"}</span>
+                <button onClick={swapPip} title="Swap main / PiP" style={{ background: "rgba(0,212,255,0.25)", border: "1px solid #00d4ff", borderRadius: 4, color: "#00d4ff", fontSize: 8, cursor: "pointer", padding: "1px 4px", lineHeight: 1 }}>⇄</button>
+              </div>
+              <video ref={miniVideoRef} autoPlay muted playsInline style={{ width: "100%", height: "calc(100% - 16px)", objectFit: pipSwapped ? "cover" : "contain", background: "#000" }} />
             </div>
           )}
         </div>
@@ -2200,7 +2225,7 @@ export default function App() {
           <div style={{ flex: 1, position: "relative", borderRadius: 16, overflow: "hidden", border: `3px solid ${isStreaming ? "#ff0000" : "#00d4ff"}`, background: "#000", boxShadow: isStreaming ? "0 0 40px rgba(255,0,0,0.3)" : "0 0 20px rgba(0,212,255,0.2)", transition: "all .3s" }}>
             <div style={{ position: "absolute", top: 10, left: 10, display: "flex", gap: 6, zIndex: 15 }}>
               <div style={{ background: "rgba(0,14,39,0.85)", padding: "3px 10px", borderRadius: 16, fontSize: 10, fontWeight: 600, color: "#00d4ff", border: "1px solid #004d7f" }}>
-                {isWebcamOn ? "📹 CAMERA" : isScreenSharing ? "🖥️ SCREEN SHARE" : isStreaming ? "🔴 LIVE STREAM" : "🎥 STREAM"}
+                {(isWebcamOn && isScreenSharing) ? (pipSwapped ? "🖥️ SCREEN SHARE" : "📹 CAMERA") : isWebcamOn ? "📹 CAMERA" : isScreenSharing ? "🖥️ SCREEN SHARE" : isStreaming ? "🔴 LIVE STREAM" : "🎥 STREAM"}
               </div>
               {someoneIsLive && (
                 <div title={`${viewerCount} ${viewerCount === 1 ? "person is" : "people are"} watching the stream right now`} style={{ background: "rgba(255,0,128,0.18)", padding: "3px 10px", borderRadius: 16, fontSize: 10, fontWeight: 700, color: "#ff88aa", border: "1px solid #ff4488" }}>
@@ -2210,7 +2235,7 @@ export default function App() {
             </div>
             {isStreaming && <div style={{ position: "absolute", top: 10, right: 10, background: "rgba(255,0,0,0.25)", padding: "3px 10px", borderRadius: 16, fontSize: 10, fontWeight: 700, color: "#ff4444", border: "1px solid #ff4444", animation: "statusBlink 1s infinite", zIndex: 15 }}>● LIVE</div>}
 
-            <video ref={localCenterRef} autoPlay muted playsInline style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: (!isWebcamOn && isScreenSharing) ? "contain" : "cover", display: showLocalCenter ? "block" : "none", background: "#000" }} />
+            <video ref={localCenterRef} autoPlay muted playsInline style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: (isScreenSharing && (!isWebcamOn || pipSwapped)) ? "contain" : "cover", display: showLocalCenter ? "block" : "none", background: "#000" }} />
 
             {showRemoteCenter && (
               focusedStream
@@ -2345,14 +2370,19 @@ export default function App() {
         </div>
       </div>
 
-      {/* DRAGGABLE MINI SCREEN SHARE — visible when both camera and screen sharing are active */}
+      {/* DRAGGABLE MINI PiP — visible when both camera and screen sharing are active */}
       {isWebcamOn && isScreenSharing && (
         <div ref={miniPlayerRef} style={{ ...miniStyle, width: 240, height: 160, background: "#0a0e27", border: "2px solid #00d4ff", borderRadius: 12, overflow: "hidden", boxShadow: "0 0 20px rgba(0,212,255,0.4)", userSelect: "none", zIndex: 900 }}>
           <div onPointerDown={onMiniPointerDown} onPointerMove={onMiniPointerMove} onPointerUp={onMiniPointerUp} style={{ background: "rgba(0,212,255,0.15)", padding: "4px 8px", borderBottom: "1px solid #00d4ff", display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 9, color: "#00d4ff", cursor: "grab" }}>
-            <span>⠿ 🖥️ SCREEN SHARE</span>
-            <span style={{ fontSize: 7, opacity: 0.6 }}>drag to move</span>
+            <span>⠿ {pipSwapped ? "📹 CAMERA" : "🖥️ SCREEN SHARE"}</span>
+            <button
+              onClick={swapPip}
+              title="Swap main / PiP"
+              onPointerDown={e => e.stopPropagation()}
+              style={{ background: "rgba(0,212,255,0.25)", border: "1px solid #00d4ff", borderRadius: 6, color: "#00d4ff", fontSize: 11, cursor: "pointer", padding: "2px 7px", lineHeight: 1, fontWeight: 700 }}
+            >⇄ swap</button>
           </div>
-          <video ref={miniVideoRef} autoPlay muted playsInline style={{ width: "100%", height: "calc(100% - 26px)", objectFit: "contain", background: "#000", display: "block" }} />
+          <video ref={miniVideoRef} autoPlay muted playsInline style={{ width: "100%", height: "calc(100% - 26px)", objectFit: pipSwapped ? "cover" : "contain", background: "#000", display: "block" }} />
         </div>
       )}
 
