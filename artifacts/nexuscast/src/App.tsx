@@ -466,12 +466,28 @@ export default function App() {
     socket.on("offer", async ({ from, offer }: { from: string; offer: RTCSessionDescriptionInit }) => {
       initRoomAudio().catch(() => {}); // start mic in background, don't block answer
       const pc = getOrCreatePC(from, socket);
+      const isRenegotiation = pcsRef.current.has(from);
       try {
         await pc.setRemoteDescription(new RTCSessionDescription(offer));
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         socket.emit("answer", { to: from, answer });
       } catch (err) { console.error("offer err:", err); }
+      // After renegotiation (host started/stopped screen share), any remote video
+      // element that is still black (videoWidth===0) needs a srcObject reset so the
+      // browser picks up the new video data flowing through the receiver track.
+      if (isRenegotiation) {
+        setTimeout(() => {
+          remoteVideoRefs.current.forEach(vid => {
+            if (vid.videoWidth === 0 && vid.srcObject) {
+              const s = vid.srcObject as MediaStream;
+              vid.srcObject = null;
+              vid.srcObject = s;
+              vid.play().catch(() => {});
+            }
+          });
+        }, 400);
+      }
     });
 
     socket.on("answer", async ({ from, answer }: { from: string; answer: RTCSessionDescriptionInit }) => {
@@ -743,6 +759,12 @@ export default function App() {
       });
       // Only re-attach the <video> element when the new stream actually carries video.
       if (incomingHasVideo) attachStreamToVideo(peerId, stream);
+      // KEY FIX: when the sender does replaceTrack (e.g. host starts screen share),
+      // the receiver track transitions from muted→unmuted. onunmute fires on the
+      // member's side — use it to force re-attach and play the now-live video.
+      if (e.track.kind === "video") {
+        e.track.onunmute = () => attachStreamToVideo(peerId, stream);
+      }
       // Lagless: shrink the receive jitter buffer so frames render the moment they arrive
       applyLowLatencyToReceivers(pc);
       // Also listen for new tracks added later (e.g., screen share added mid-stream)
