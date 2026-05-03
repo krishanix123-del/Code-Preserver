@@ -214,7 +214,10 @@ export default function App() {
     // We only want the local preview when WE are the one broadcasting
     // and there's no remote stream taking over the center view.
     if (!(isStreaming || isWebcamOn || isScreenSharing)) return;
-    if (focusedStream || remoteStreams.length > 0) return;
+    // Screen-only share ALWAYS fills the main view — even when remote streams exist.
+    // All other local preview cases yield to remote streams.
+    const isScreenOnly = isScreenSharing && !isWebcamOn;
+    if (!isScreenOnly && (focusedStream || remoteStreams.length > 0)) return;
     // Camera takes priority in the main view. Screen share only goes to
     // main when the camera is off — otherwise it lives in the PiP overlay.
     const desired = isWebcamOn
@@ -1277,7 +1280,7 @@ export default function App() {
     notify("Screen sharing stopped.", "info");
   }
 
-  function toggleScreenShare() {
+  async function toggleScreenShare() {
     if (isScreenSharing) { stopScreenShare(); return; }
     if (hostIsActivelyStreaming()) {
       notify("The host is streaming — only the host can share their screen right now.", "warning");
@@ -1287,7 +1290,13 @@ export default function App() {
       notify("Screen sharing only works on a desktop browser (Chrome / Edge / Firefox).", "warning");
       return;
     }
-    startScreenShare();
+    const ok = await startScreenShare();
+    // If screen share started successfully and we're not already streaming,
+    // notify peers so they know a stream is now active in the room.
+    if (ok && !isStreamingRef.current && currentRoomRef.current) {
+      setIsStreaming(true);
+      socketRef.current?.emit("start-stream");
+    }
   }
 
   // ─── RECORDING ────────────────────────────────────────────────────────────────
