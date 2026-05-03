@@ -63,6 +63,8 @@ export default function App() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [isWebcamOn, setIsWebcamOn] = useState(false);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
+  const [isSystemAudioEnabled, setIsSystemAudioEnabled] = useState(false);
+  const [hasSystemAudio, setHasSystemAudio] = useState(false); // true when getDisplayMedia granted system audio
   // Set of remote peerIds whose outgoing video is currently OFF. WebRTC's
   // replaceTrack(null) leaves a frozen last frame on the receiver, so each peer
   // tells the room when their video stops/starts and we render a placeholder.
@@ -136,6 +138,7 @@ export default function App() {
   const audioStreamRef = useRef<MediaStream | null>(null); // room mic (mesh audio)
   const screenAudioCtxRef = useRef<AudioContext | null>(null);  // Web Audio ctx for screen-share mixing
   const screenMixedTrackRef = useRef<MediaStreamTrack | null>(null); // mixed mic+system track
+  const systemAudioTrackRef = useRef<MediaStreamTrack | null>(null); // raw system audio track
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
   const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -1061,50 +1064,43 @@ export default function App() {
   }, []);
 
   // ─── SCREEN SHARING WITH SYSTEM AUDIO ───────────────────────────────────────
-  // Requests both screen video and system audio from getDisplayMedia.
-  // If system audio is granted, mixes it with the host's mic via Web Audio so
-  // viewers hear both voices AND whatever is playing on the host's screen.
-  // If the browser/source doesn't share audio, falls back to mic-only silently.
+  // Requests screen video + optional system audio from getDisplayMedia.
+  // System audio is sent DIRECTLY (no Web Audio mixing) to preserve the
+  // browser's echo cancellation on the mic track. The mic remains on its own
+  // audio sender so there is zero echo feedback loop.
 
-  /** Build a single mixed MediaStreamTrack from mic + system audio via Web Audio. */
-  function buildScreenMixedAudio(systemAudioTrack: MediaStreamTrack): MediaStreamTrack | null {
-    try {
-      const AC = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      if (!AC) return null;
-      const ctx = new AC();
-      const dest = ctx.createMediaStreamDestination();
-
-      // System audio side (tab / desktop audio)
-      const sysNode = ctx.createMediaStreamSource(new MediaStream([systemAudioTrack]));
-      const sysGain = ctx.createGain(); sysGain.gain.value = 1.0;
-      sysNode.connect(sysGain).connect(dest);
-
-      // Mic side — blend in if available (keeps host's voice audible)
-      const micTrack =
-        audioStreamRef.current?.getAudioTracks()[0]
-        ?? localStreamRef.current?.getAudioTracks()[0]
-        ?? null;
-      if (micTrack) {
-        const micNode = ctx.createMediaStreamSource(new MediaStream([micTrack]));
-        const micGain = ctx.createGain(); micGain.gain.value = 0.85;
-        micNode.connect(micGain).connect(dest);
-      }
-
-      screenAudioCtxRef.current = ctx;
-      const mixed = dest.stream.getAudioTracks()[0] ?? null;
-      screenMixedTrackRef.current = mixed;
-      return mixed;
-    } catch {
-      return null;
-    }
-  }
-
-  /** Tear down the Web Audio graph created during screen share. */
+  /** Tear down any Web Audio graph created during screen share (legacy cleanup). */
   function teardownScreenAudio() {
     try { screenMixedTrackRef.current?.stop(); } catch {}
     screenMixedTrackRef.current = null;
     try { screenAudioCtxRef.current?.close(); } catch {}
     screenAudioCtxRef.current = null;
+  }
+
+  /** Switch all peer audio senders between system audio track and mic track. */
+  function applySystemAudioState(enabled: boolean) {
+    const sysTrack = systemAudioTrackRef.current;
+    const micTrack =
+      audioStreamRef.current?.getAudioTracks()[0]
+      ?? localStreamRef.current?.getAudioTracks()[0]
+      ?? null;
+    const trackToSend = (enabled && sysTrack) ? sysTrack : micTrack;
+    pcsRef.current.forEach(pc => {
+      const trs = pc.getTransceivers();
+      const audioSender =
+        trs.find(t => t.sender.track?.kind === "audio" || t.receiver.track?.kind === "audio")?.sender
+        ?? trs[0]?.sender
+        ?? null;
+      if (audioSender) audioSender.replaceTrack(trackToSend).catch(() => {});
+    });
+  }
+
+  function toggleSystemAudio() {
+    if (!systemAudioTrackRef.current) return;
+    const next = !isSystemAudioEnabled;
+    setIsSystemAudioEnabled(next);
+    applySystemAudioState(next);
+    notify(next ? "System audio ON 🔊" : "System audio OFF 🔇", "info");
   }
 
   async function startScreenShare(): Promise<boolean> {
@@ -1139,41 +1135,29 @@ export default function App() {
       }
 
       const screenVideoTrack = stream.getVideoTracks()[0];
-      const systemAudioTrack = stream.getAudioTracks()[0] ?? null;
+      const capturedSystemAudio = stream.getAudioTracks()[0] ?? null;
 
-      // Build the audio track to send: mixed (system+mic) if system audio was granted,
-      // otherwise keep using the existing mic track (no change to audio sender needed).
-      const mixedAudio = systemAudioTrack ? buildScreenMixedAudio(systemAudioTrack) : null;
-      const audioToSend = mixedAudio ?? systemAudioTrack ?? null;
+      // Store the raw system audio track so the toggle can switch it on/off
+      systemAudioTrackRef.current = capturedSystemAudio;
+      setHasSystemAudio(!!capturedSystemAudio);
+      // Start with system audio OFF — user must explicitly turn it on.
+      // This avoids surprising echo / unexpected audio being broadcast.
+      setIsSystemAudioEnabled(false);
 
-      // Push video (and optionally mixed audio) to every connected peer
+      // Push only the video track to every connected peer.
+      // Audio sender stays on the mic track (echo-cancelled at capture time).
+      // System audio can be enabled via the toggle button at any time.
       for (const [peerId, pc] of pcsRef.current.entries()) {
-        // Reliable transceiver lookup: check sender/receiver track kind first,
-        // then fall back to index (audio=0, video=1 — guaranteed by getOrCreatePC).
         const trs = pc.getTransceivers();
-        const findSender = (kind: "audio" | "video"): RTCRtpSender | null => {
-          return (
-            trs.find(t => t.sender.track?.kind === kind || t.receiver.track?.kind === kind)?.sender
-            ?? (kind === "video" ? trs[1]?.sender : trs[0]?.sender)
-            ?? null
-          );
-        };
+        const findSender = (kind: "audio" | "video"): RTCRtpSender | null =>
+          trs.find(t => t.sender.track?.kind === kind || t.receiver.track?.kind === kind)?.sender
+          ?? (kind === "video" ? trs[1]?.sender : trs[0]?.sender)
+          ?? null;
 
-        // ── Video ──────────────────────────────────────────────────────────────
         const videoSender = findSender("video");
-        if (videoSender) {
-          await videoSender.replaceTrack(screenVideoTrack).catch(() => {});
-        }
+        if (videoSender) await videoSender.replaceTrack(screenVideoTrack).catch(() => {});
 
-        // ── Audio ──────────────────────────────────────────────────────────────
-        if (audioToSend) {
-          const audioSender = findSender("audio");
-          if (audioSender) {
-            await audioSender.replaceTrack(audioToSend).catch(() => {});
-          }
-        }
-
-        // Force renegotiation — replaceTrack alone is not enough on all browsers
+        // Force renegotiation so peers render the new video immediately
         try {
           if (pc.signalingState === "stable") {
             const offer = await pc.createOffer();
@@ -1193,8 +1177,8 @@ export default function App() {
       // When the browser "Stop sharing" button is clicked
       screenVideoTrack.onended = () => stopScreenShare();
 
-      if (systemAudioTrack) {
-        notify("Screen sharing active with audio 🔊🖥️", "success");
+      if (capturedSystemAudio) {
+        notify("Screen sharing active 🖥️ — use the 🔊 button to broadcast system audio", "success");
       } else {
         notify("Screen sharing active 🖥️ (no system audio — in Chrome, pick a Tab and tick 'Share tab audio')", "info");
       }
@@ -1214,7 +1198,11 @@ export default function App() {
     screenStreamRef.current?.getTracks().forEach(t => { t.onended = null; t.stop(); });
     screenStreamRef.current = null;
 
-    // Tear down the Web Audio mix graph (mic + system audio)
+    // Clear system audio track ref and reset toggle state
+    systemAudioTrackRef.current = null;
+    setHasSystemAudio(false);
+    setIsSystemAudioEnabled(false);
+    // Tear down any legacy Web Audio graph
     teardownScreenAudio();
 
     // Restore local preview: camera back to main, clear PiP (screen share ended)
@@ -1884,6 +1872,9 @@ export default function App() {
               )}
               <button onClick={toggleWebcam} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isWebcamOn ? "#00d4ff" : "#334"}`, background: isWebcamOn ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isWebcamOn ? "#00d4ff" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>📹</button>
               <button onClick={toggleScreenShare} title={isMobileDevice ? "Screen share is desktop-only" : "Share your screen"} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isScreenSharing ? "#00d4ff" : "#334"}`, background: isScreenSharing ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isScreenSharing ? "#00d4ff" : (isMobileDevice ? "#445" : "#667"), fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", opacity: isMobileDevice ? 0.45 : 1, position: "relative" }}>🖥️{isMobileDevice && <span style={{ position: "absolute", top: -3, right: -3, fontSize: 10, color: "#a0b0d0", background: "#0a0e27", borderRadius: "50%", width: 14, height: 14, display: "flex", alignItems: "center", justifyContent: "center", border: "1px solid #334" }}>💻</span>}</button>
+              {isScreenSharing && hasSystemAudio && (
+                <button onClick={toggleSystemAudio} title={isSystemAudioEnabled ? "Turn off system audio" : "Turn on system audio"} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isSystemAudioEnabled ? "#00ff88" : "#334"}`, background: isSystemAudioEnabled ? "rgba(0,255,136,0.2)" : "rgba(0,0,0,0.3)", color: isSystemAudioEnabled ? "#00ff88" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>{isSystemAudioEnabled ? "🔊" : "🔇"}</button>
+              )}
               {(isStreaming || joinedStreamHostId) && (
                 <button onClick={toggleMic} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#334"}`, background: isMuted ? "rgba(255,170,0,0.15)" : isMicOn ? "rgba(0,255,0,0.15)" : "rgba(0,0,0,0.3)", color: isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>{isMuted ? "🔇" : isMicOn ? "🎙️" : "🔇"}</button>
               )}
@@ -2101,6 +2092,7 @@ export default function App() {
                   ...(canStartStream ? [{ icon: isStreaming ? "⏹" : "▶", label: "STREAM", active: isStreaming, onClick: handleStreamButtonClick, color: isStreaming ? "#ff4444" : "#00d4ff" }] : []),
                   { icon: "📹", label: "CAMERA", active: isWebcamOn, onClick: toggleWebcam, color: "#00d4ff" },
                   { icon: "🖥️", label: "SCREEN", active: isScreenSharing, onClick: toggleScreenShare, color: "#00d4ff" },
+                  ...(isScreenSharing && hasSystemAudio ? [{ icon: isSystemAudioEnabled ? "🔊" : "🔇", label: "SYS AUD", active: isSystemAudioEnabled, onClick: toggleSystemAudio, color: isSystemAudioEnabled ? "#00ff88" : "#556" }] : []),
                 ]),
                 { icon: "👥", label: "TEAM", active: false, onClick: () => setShowTeamModal(true), color: "#00d4ff" },
               ].map(btn => (
