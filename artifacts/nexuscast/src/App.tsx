@@ -332,17 +332,11 @@ export default function App() {
         // Always connect so the host can push video later via renegotiation
         if (connected !== false) connectToPeer(peerId, socket);
         if (streaming && connected !== false) {
-          if (_isViewer) {
-            // Watch-link guests always auto-join — no prompt
-            socket.emit("join-stream-request", { hostPeerId: peerId });
-            setJoinedStreamHostId(peerId);
-            addMsg("⚡ SYSTEM", `👁️ Watching ${uid}'s stream`);
-          } else {
-            // Regular members get a JOIN / Skip banner
-            setJoinStreamPrompt({ hostPeerId: peerId, hostUserId: uid });
-            addMsg("⚡ SYSTEM", `🔴 ${uid} is LIVE — tap JOIN to watch`);
-            notify(`📡 ${uid} is live! Tap JOIN to watch.`, "info");
-          }
+          // Auto-join for ALL users — no manual JOIN click required
+          socket.emit("join-stream-request", { hostPeerId: peerId });
+          setJoinedStreamHostId(peerId);
+          addMsg("⚡ SYSTEM", _isViewer ? `👁️ Watching ${uid}'s stream` : `🔴 ${uid} is LIVE!`);
+          notify(_isViewer ? `Watching ${uid} as a guest` : `📡 ${uid} is live!`, "success");
         }
       });
     });
@@ -388,21 +382,14 @@ export default function App() {
 
     socket.on("peer-started-stream", ({ peerId, userId: uid }: { peerId: string; userId: string }) => {
       setMembers(p => p.map(m => m.peerId === peerId ? { ...m, isStreaming: true } : m));
-      // Establish WebRTC connection now so tracks are ready to flow the moment JOIN is clicked
+      // Establish WebRTC connection now so tracks are ready immediately
       if (!pcsRef.current.has(peerId)) connectToPeer(peerId, socket);
-      if (_isViewer) {
-        // Watch-link guests always auto-join — no prompt
-        socket.emit("join-stream-request", { hostPeerId: peerId });
-        setJoinedStreamHostId(peerId);
-        setJoinStreamPrompt(null);
-        addMsg("⚡ SYSTEM", `👁️ ${uid} went live`);
-        notify(`📡 ${uid} is now LIVE!`, "info");
-      } else {
-        // Regular members see a JOIN / Skip banner
-        setJoinStreamPrompt({ hostPeerId: peerId, hostUserId: uid });
-        addMsg("⚡ SYSTEM", `🔴 ${uid} is LIVE — tap JOIN to watch`);
-        notify(`🔴 ${uid} is LIVE! Tap JOIN to watch.`, "info");
-      }
+      // Auto-join for ALL users — no manual JOIN click required
+      socket.emit("join-stream-request", { hostPeerId: peerId });
+      setJoinedStreamHostId(peerId);
+      setJoinStreamPrompt(null);
+      addMsg("⚡ SYSTEM", _isViewer ? `👁️ ${uid} went live` : `🔴 ${uid} is LIVE!`);
+      notify(`📡 ${uid} is now LIVE!`, "info");
     });
 
     socket.on("peer-stopped-stream", ({ peerId }: { peerId: string }) => {
@@ -609,15 +596,19 @@ export default function App() {
     } catch {}
   }
 
-  function attachStreamToVideo(peerId: string, stream: MediaStream) {
+  function attachStreamToVideo(peerId: string, stream: MediaStream, attempt = 0) {
     const vid = remoteVideoRefs.current.get(peerId);
-    if (!vid) return;
+    if (!vid) {
+      // Video element not mounted yet — retry until it is (up to ~3s)
+      if (attempt < 15) setTimeout(() => attachStreamToVideo(peerId, stream, attempt + 1), 200);
+      return;
+    }
     if (vid.srcObject !== stream) {
       vid.srcObject = stream;
     }
-    const tryPlay = (attempt = 0) => {
+    const tryPlay = (a = 0) => {
       vid.play().catch(() => {
-        if (attempt < 5) setTimeout(() => tryPlay(attempt + 1), 500);
+        if (a < 5) setTimeout(() => tryPlay(a + 1), 500);
       });
     };
     tryPlay();
@@ -629,6 +620,12 @@ export default function App() {
         vid.play().catch(() => {});
       }
     }, 2000);
+  }
+
+  function replayAllRemoteVideos() {
+    remoteVideoRefs.current.forEach(vid => {
+      if (vid.paused) vid.play().catch(() => {});
+    });
   }
 
   async function initRoomAudio() {
@@ -1189,6 +1186,9 @@ export default function App() {
 
       setIsScreenSharing(true);
       emitVideoOffState(false);
+
+      // Re-play any remote video elements that paused while waiting for data
+      setTimeout(() => replayAllRemoteVideos(), 500);
 
       // When the browser "Stop sharing" button is clicked
       screenVideoTrack.onended = () => stopScreenShare();
@@ -2364,9 +2364,19 @@ function RemoteVideoEl({ stream, peerId, videoRefs, small, videoOff }: { stream:
   const ref = useRef<HTMLVideoElement>(null);
   useEffect(() => {
     if (!ref.current) return;
-    videoRefs.current.set(peerId, ref.current);
-    if (ref.current.srcObject !== stream) { ref.current.srcObject = stream; ref.current.play().catch(() => {}); }
-    return () => { videoRefs.current.delete(peerId); };
+    const vid = ref.current;
+    videoRefs.current.set(peerId, vid);
+    if (vid.srcObject !== stream) {
+      vid.srcObject = stream;
+    }
+    vid.play().catch(() => {});
+    // Auto-resume whenever data starts/resumes flowing (e.g. after replaceTrack)
+    const onCanPlay = () => { vid.play().catch(() => {}); };
+    vid.addEventListener("canplay", onCanPlay);
+    return () => {
+      vid.removeEventListener("canplay", onCanPlay);
+      videoRefs.current.delete(peerId);
+    };
   }, [stream, peerId]);
   return (
     <>
