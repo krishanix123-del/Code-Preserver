@@ -706,9 +706,13 @@ export default function App() {
       outboundStream.addTrack(audioTrackToAdd);
       audioTransceiver.sender.replaceTrack(audioTrackToAdd).catch(() => {});
     }
-    const videoTrackToAdd: MediaStreamTrack | null = isScreenSharingRef.current
-      ? (screenStreamRef.current?.getVideoTracks()[0] ?? null)
-      : (localStreamRef.current?.getVideoTracks()[0] ?? null);
+    // Prefer screen-share track (synchronous ref) over camera track so that newly
+    // joining members always receive whatever the host is currently sharing, even
+    // when isScreenSharingRef hasn't updated yet (it's async via useEffect).
+    const videoTrackToAdd: MediaStreamTrack | null =
+      screenStreamRef.current?.getVideoTracks()[0]
+      ?? localStreamRef.current?.getVideoTracks()[0]
+      ?? null;
     if (videoTrackToAdd) {
       outboundStream.addTrack(videoTrackToAdd);
       videoTransceiver.sender.replaceTrack(videoTrackToAdd).catch(() => {});
@@ -1599,9 +1603,11 @@ export default function App() {
   // When screen-sharing without camera, always fill the main view with the local
   // screen share so the host can see what they're broadcasting (even when members
   // are connected and remoteStreams is non-empty).
+  // Screen-only share always fills the main view for the host — no other condition
+  // can hide it (focusedStream from a member's stream was overriding this before).
   const showLocalScreenShare = isScreenSharing && !isWebcamOn;
-  const showLocalCenter = (isStreaming || isWebcamOn || isScreenSharing) && !focusedStream
-    && (remoteStreams.length === 0 || showLocalScreenShare);
+  const showLocalCenter = showLocalScreenShare
+    || ((isStreaming || isWebcamOn || isScreenSharing) && !focusedStream && remoteStreams.length === 0);
   // Members only see the remote stream after they've joined it; never override the
   // local screen-share view (showLocalCenter takes priority when showLocalScreenShare).
   const hasJoinedStream = iAmRoomHost || joinedStreamHostId !== null;
