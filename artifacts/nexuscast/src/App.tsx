@@ -1596,10 +1596,16 @@ export default function App() {
   const viewerCount = streamViewerCount > 0 ? streamViewerCount : watchLinkOnlyCount;
   const someoneIsLive = isStreaming || members.some(m => m.isStreaming && m.peerId !== "me");
   // If any other member is streaming, host should still see the button (to start their own or end theirs)
-  const showLocalCenter = (isStreaming || isWebcamOn || isScreenSharing) && !focusedStream && remoteStreams.length === 0;
-  // Members only see the remote stream after they've chosen to join it
+  // When screen-sharing without camera, always fill the main view with the local
+  // screen share so the host can see what they're broadcasting (even when members
+  // are connected and remoteStreams is non-empty).
+  const showLocalScreenShare = isScreenSharing && !isWebcamOn;
+  const showLocalCenter = (isStreaming || isWebcamOn || isScreenSharing) && !focusedStream
+    && (remoteStreams.length === 0 || showLocalScreenShare);
+  // Members only see the remote stream after they've joined it; never override the
+  // local screen-share view (showLocalCenter takes priority when showLocalScreenShare).
   const hasJoinedStream = iAmRoomHost || joinedStreamHostId !== null;
-  const showRemoteCenter = (!!focusedStream || remoteStreams.length > 0) && hasJoinedStream;
+  const showRemoteCenter = !showLocalCenter && (!!focusedStream || remoteStreams.length > 0) && hasJoinedStream;
   // Streaming peer detected but current user hasn't joined yet
   const streamingPeer = members.find(m => m.isStreaming && m.peerId !== "me");
   const canWatchStream = !hasJoinedStream && !!streamingPeer;
