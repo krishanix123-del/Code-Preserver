@@ -288,7 +288,11 @@ export default function App() {
   function unlockAudio() {
     if (audioUnlocked) return;
     setAudioUnlocked(true);
-    remoteVideoRefs.current.forEach(vid => { vid.play().catch(() => {}); });
+    // Unmute all remote videos (they start muted for autoplay) then force play
+    remoteVideoRefs.current.forEach(vid => {
+      vid.muted = false;
+      vid.play().catch(() => {});
+    });
   }
 
   // Socket.IO setup
@@ -2437,21 +2441,40 @@ function RemoteVideoEl({ stream, peerId, videoRefs, small, videoOff }: { stream:
     if (!ref.current) return;
     const vid = ref.current;
     videoRefs.current.set(peerId, vid);
-    if (vid.srcObject !== stream) {
-      vid.srcObject = stream;
-    }
+    // Always start muted so autoplay succeeds on every mobile browser.
+    // The user's "Tap to enable audio" action unmutes all videos via unlockAudio().
+    vid.muted = true;
+    vid.srcObject = stream;
     vid.play().catch(() => {});
-    // Auto-resume whenever data starts/resumes flowing (e.g. after replaceTrack)
+
     const onCanPlay = () => { vid.play().catch(() => {}); };
+    const onCanPlayThrough = () => { vid.play().catch(() => {}); };
     vid.addEventListener("canplay", onCanPlay);
+    vid.addEventListener("canplaythrough", onCanPlayThrough);
+
+    // Persistent polling: if the video is still black (no decoded frame yet),
+    // cycle srcObject every second for up to 30 s to un-stick the decoder.
+    // This covers ICE connection delays, replaceTrack renegotiation, and any
+    // case where onunmute didn't fire reliably on the mobile browser.
+    let attempts = 0;
+    const poll = setInterval(() => {
+      attempts++;
+      if (vid.videoWidth > 0 || attempts > 30) { clearInterval(poll); return; }
+      const s = vid.srcObject as MediaStream | null;
+      if (s) { vid.srcObject = null; vid.srcObject = s; }
+      vid.play().catch(() => {});
+    }, 1000);
+
     return () => {
+      clearInterval(poll);
       vid.removeEventListener("canplay", onCanPlay);
+      vid.removeEventListener("canplaythrough", onCanPlayThrough);
       videoRefs.current.delete(peerId);
     };
   }, [stream, peerId]);
   return (
     <>
-      <video ref={ref} autoPlay playsInline style={{ width: "100%", height: "100%", objectFit: small ? "cover" : "contain", position: small ? "relative" : "absolute", inset: 0, background: "#000" }} />
+      <video ref={ref} autoPlay playsInline muted style={{ width: "100%", height: "100%", objectFit: small ? "cover" : "contain", position: small ? "relative" : "absolute", inset: 0, background: "#000" }} />
       {videoOff && (
         // Overlay covers the (otherwise frozen) last frame the moment the broadcaster
         // turned their camera/screen off, so viewers see an explicit "off" state.
