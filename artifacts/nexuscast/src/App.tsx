@@ -160,6 +160,7 @@ export default function App() {
   const iAmRoomHostRef = useRef(iAmRoomHost);
   const isScreenSharingRef = useRef(isScreenSharing);
   const isWebcamOnRef = useRef(isWebcamOn);
+  const audioUnlockedRef = useRef(false);
 
   const notify = useCallback((message: string, type: Notification["type"] = "info") => {
     const id = ++_notifId;
@@ -247,6 +248,7 @@ export default function App() {
   useEffect(() => { iAmRoomHostRef.current = iAmRoomHost; }, [iAmRoomHost]);
   useEffect(() => { isScreenSharingRef.current = isScreenSharing; }, [isScreenSharing]);
   useEffect(() => { isWebcamOnRef.current = isWebcamOn; }, [isWebcamOn]);
+  useEffect(() => { audioUnlockedRef.current = audioUnlocked; }, [audioUnlocked]);
 
   // Generate QR code whenever shareCode changes
   useEffect(() => {
@@ -286,7 +288,10 @@ export default function App() {
   function unlockAudio() {
     if (audioUnlocked) return;
     setAudioUnlocked(true);
-    remoteVideoRefs.current.forEach(vid => { vid.play().catch(() => {}); });
+    remoteVideoRefs.current.forEach(vid => {
+      vid.muted = false;
+      vid.play().catch(() => {});
+    });
   }
 
   // Socket.IO setup
@@ -698,6 +703,10 @@ export default function App() {
     if (vid.srcObject !== stream) {
       vid.srcObject = stream;
     }
+    // Always start muted so Chrome's autoplay policy never blocks play().
+    // The user's "🔊 Tap to enable audio" button calls unlockAudio() which
+    // sets vid.muted = false on every remote video.
+    if (!audioUnlockedRef.current) vid.muted = true;
     const tryPlay = (a = 0) => {
       vid.play().catch(() => {
         if (a < 5) setTimeout(() => tryPlay(a + 1), 500);
@@ -709,6 +718,7 @@ export default function App() {
       if (vid.videoWidth === 0 && vid.srcObject === stream) {
         vid.srcObject = null;
         vid.srcObject = stream;
+        if (!audioUnlockedRef.current) vid.muted = true;
         vid.play().catch(() => {});
       }
     }, 2000);
@@ -716,6 +726,7 @@ export default function App() {
 
   function replayAllRemoteVideos() {
     remoteVideoRefs.current.forEach(vid => {
+      if (audioUnlockedRef.current) vid.muted = false;
       if (vid.paused) vid.play().catch(() => {});
     });
   }
@@ -832,11 +843,15 @@ export default function App() {
       });
       // Only re-attach the <video> element when the new stream actually carries video.
       if (incomingHasVideo) attachStreamToVideo(peerId, stream);
-      // KEY FIX: when the sender does replaceTrack (e.g. host starts screen share),
-      // the receiver track transitions from muted→unmuted. onunmute fires on the
-      // member's side — use it to force re-attach and play the now-live video.
+      // When the sender does replaceTrack (e.g. host starts screen share), the
+      // receiver track transitions from muted→unmuted. Use addEventListener so we
+      // never overwrite a previously-set handler, and check muted immediately in
+      // case the track is already live by the time ontrack fires.
       if (e.track.kind === "video") {
-        e.track.onunmute = () => attachStreamToVideo(peerId, stream);
+        const onUnmute = () => attachStreamToVideo(peerId, stream);
+        e.track.addEventListener("unmute", onUnmute);
+        // If the track is already unmuted (frames already flowing), attach right now.
+        if (!e.track.muted) onUnmute();
       }
       // Lagless: shrink the receive jitter buffer so frames render the moment they arrive
       applyLowLatencyToReceivers(pc);
@@ -1963,9 +1978,9 @@ export default function App() {
           <video ref={localCenterRef} autoPlay muted playsInline style={{ width: "100%", height: "100%", objectFit: (!isWebcamOn && isScreenSharing) ? "contain" : "cover", display: showLocalCenter ? "block" : "none", background: "#000" }} />
           {showRemoteCenter && (
             focusedStream
-              ? <RemoteVideoEl key={focusedStream.peerId} stream={focusedStream.stream} peerId={focusedStream.peerId} videoRefs={remoteVideoRefs} videoOff={peerVideoOff.has(focusedStream.peerId)} />
+              ? <RemoteVideoEl key={focusedStream.peerId} stream={focusedStream.stream} peerId={focusedStream.peerId} videoRefs={remoteVideoRefs} videoOff={peerVideoOff.has(focusedStream.peerId)} audioUnlocked={audioUnlocked} />
               : remoteStreams.length > 0
-                ? <RemoteVideoEl key={remoteStreams[0].peerId} stream={remoteStreams[0].stream} peerId={remoteStreams[0].peerId} videoRefs={remoteVideoRefs} videoOff={peerVideoOff.has(remoteStreams[0].peerId)} />
+                ? <RemoteVideoEl key={remoteStreams[0].peerId} stream={remoteStreams[0].stream} peerId={remoteStreams[0].peerId} videoRefs={remoteVideoRefs} videoOff={peerVideoOff.has(remoteStreams[0].peerId)} audioUnlocked={audioUnlocked} />
                 : null
           )}
           {!showLocalCenter && !showRemoteCenter && (
@@ -2345,9 +2360,9 @@ export default function App() {
 
             {showRemoteCenter && (
               focusedStream
-                ? <RemoteVideoEl key={focusedStream.peerId} stream={focusedStream.stream} peerId={focusedStream.peerId} videoRefs={remoteVideoRefs} videoOff={peerVideoOff.has(focusedStream.peerId)} />
+                ? <RemoteVideoEl key={focusedStream.peerId} stream={focusedStream.stream} peerId={focusedStream.peerId} videoRefs={remoteVideoRefs} videoOff={peerVideoOff.has(focusedStream.peerId)} audioUnlocked={audioUnlocked} />
                 : remoteStreams.length > 0
-                  ? <RemoteVideoEl key={remoteStreams[0].peerId} stream={remoteStreams[0].stream} peerId={remoteStreams[0].peerId} videoRefs={remoteVideoRefs} videoOff={peerVideoOff.has(remoteStreams[0].peerId)} />
+                  ? <RemoteVideoEl key={remoteStreams[0].peerId} stream={remoteStreams[0].stream} peerId={remoteStreams[0].peerId} videoRefs={remoteVideoRefs} videoOff={peerVideoOff.has(remoteStreams[0].peerId)} audioUnlocked={audioUnlocked} />
                   : null
             )}
 
@@ -2495,7 +2510,7 @@ export default function App() {
   );
 }
 
-function RemoteVideoEl({ stream, peerId, videoRefs, small, videoOff }: { stream: MediaStream; peerId: string; videoRefs: React.MutableRefObject<Map<string, HTMLVideoElement>>; small?: boolean; videoOff?: boolean }) {
+function RemoteVideoEl({ stream, peerId, videoRefs, small, videoOff, audioUnlocked }: { stream: MediaStream; peerId: string; videoRefs: React.MutableRefObject<Map<string, HTMLVideoElement>>; small?: boolean; videoOff?: boolean; audioUnlocked?: boolean }) {
   const ref = useRef<HTMLVideoElement>(null);
   useEffect(() => {
     if (!ref.current) return;
@@ -2504,6 +2519,10 @@ function RemoteVideoEl({ stream, peerId, videoRefs, small, videoOff }: { stream:
     if (vid.srcObject !== stream) {
       vid.srcObject = stream;
     }
+    // Start muted so Chrome's autoplay policy never blocks play() for
+    // streams that carry audio (which is always the case — host mic is in the stream).
+    // The parent's "🔊 Tap to enable audio" button unmutes all remote videos.
+    vid.muted = !audioUnlocked;
     vid.play().catch(() => {});
     // Auto-resume whenever data starts/resumes flowing (e.g. after replaceTrack)
     const onCanPlay = () => { vid.play().catch(() => {}); };
@@ -2513,9 +2532,18 @@ function RemoteVideoEl({ stream, peerId, videoRefs, small, videoOff }: { stream:
       videoRefs.current.delete(peerId);
     };
   }, [stream, peerId]);
+
+  // Reactively apply muted state when audioUnlocked changes without remounting
+  useEffect(() => {
+    if (!ref.current) return;
+    ref.current.muted = !audioUnlocked;
+    if (!ref.current.paused) return;
+    ref.current.play().catch(() => {});
+  }, [audioUnlocked]);
+
   return (
     <>
-      <video ref={ref} autoPlay playsInline style={{ width: "100%", height: "100%", objectFit: small ? "cover" : "contain", position: small ? "relative" : "absolute", inset: 0, background: "#000" }} />
+      <video ref={ref} autoPlay playsInline muted style={{ width: "100%", height: "100%", objectFit: small ? "cover" : "contain", position: small ? "relative" : "absolute", inset: 0, background: "#000" }} />
       {videoOff && (
         // Overlay covers the (otherwise frozen) last frame the moment the broadcaster
         // turned their camera/screen off, so viewers see an explicit "off" state.
