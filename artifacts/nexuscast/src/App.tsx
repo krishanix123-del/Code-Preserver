@@ -468,28 +468,32 @@ export default function App() {
 
     socket.on("offer", async ({ from, offer }: { from: string; offer: RTCSessionDescriptionInit }) => {
       initRoomAudio().catch(() => {}); // start mic in background, don't block answer
-      const pc = getOrCreatePC(from, socket);
+      // Check BEFORE getOrCreatePC so the flag is accurate
       const isRenegotiation = pcsRef.current.has(from);
+      const pc = getOrCreatePC(from, socket);
       try {
         await pc.setRemoteDescription(new RTCSessionDescription(offer));
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         socket.emit("answer", { to: from, answer });
       } catch (err) { console.error("offer err:", err); }
-      // After renegotiation (host started/stopped screen share), any remote video
-      // element that is still black (videoWidth===0) needs a srcObject reset so the
-      // browser picks up the new video data flowing through the receiver track.
+      // After renegotiation (host started/stopped screen share), force-reattach
+      // the specific peer's video element so the browser picks up the new video
+      // data. We don't gate on videoWidth===0 because the track may have data
+      // flowing already but the element just needs a srcObject cycle + play().
+      // We retry several times to handle ICE connection delays.
       if (isRenegotiation) {
-        setTimeout(() => {
-          remoteVideoRefs.current.forEach(vid => {
-            if (vid.videoWidth === 0 && vid.srcObject) {
-              const s = vid.srcObject as MediaStream;
-              vid.srcObject = null;
-              vid.srcObject = s;
-              vid.play().catch(() => {});
-            }
-          });
-        }, 400);
+        const forceReattach = (attempt = 0) => {
+          const vid = remoteVideoRefs.current.get(from);
+          if (vid && vid.srcObject) {
+            const s = vid.srcObject as MediaStream;
+            vid.srcObject = null;
+            vid.srcObject = s;
+            vid.play().catch(() => {});
+          }
+          if (attempt < 6) setTimeout(() => forceReattach(attempt + 1), 600);
+        };
+        setTimeout(() => forceReattach(), 300);
       }
     });
 
@@ -539,6 +543,22 @@ export default function App() {
         if (off) next.add(from); else next.delete(from);
         return next;
       });
+      // When a peer's video turns back ON (e.g. host started screen share),
+      // force-reattach their video element so the browser renders the incoming frames.
+      // onunmute alone is unreliable on mobile, so we retry here too.
+      if (!off) {
+        const forceReattach = (attempt = 0) => {
+          const vid = remoteVideoRefs.current.get(from);
+          if (vid && vid.srcObject) {
+            const s = vid.srcObject as MediaStream;
+            vid.srcObject = null;
+            vid.srcObject = s;
+            vid.play().catch(() => {});
+          }
+          if (attempt < 8) setTimeout(() => forceReattach(attempt + 1), 500);
+        };
+        setTimeout(() => forceReattach(), 200);
+      }
     });
 
     socket.on("chat-message", ({ userId: sender, text }: { userId: string; text: string }) => {
@@ -795,6 +815,19 @@ export default function App() {
       if (pc.connectionState === "connected") {
         // Detect whether this PC is carrying screen share or camera
         applyVideoEncodingParams(pc, isScreenSharingRef.current);
+        // When the connection becomes live, force-attach the video element so
+        // members who joined while screen sharing was already active see content.
+        const forceReattach = (attempt = 0) => {
+          const vid = remoteVideoRefs.current.get(peerId);
+          if (vid && vid.srcObject) {
+            const s = vid.srcObject as MediaStream;
+            vid.srcObject = null;
+            vid.srcObject = s;
+            vid.play().catch(() => {});
+          }
+          if (attempt < 5) setTimeout(() => forceReattach(attempt + 1), 700);
+        };
+        setTimeout(() => forceReattach(), 500);
       }
       if (pc.connectionState === "failed") {
         try { pc.restartIce(); } catch {}
