@@ -404,8 +404,20 @@ export default function App() {
 
     socket.on("peer-started-stream", ({ peerId, userId: uid }: { peerId: string; userId: string }) => {
       setMembers(p => p.map(m => m.peerId === peerId ? { ...m, isStreaming: true } : m));
-      // Establish WebRTC connection now so tracks are ready immediately
-      if (!pcsRef.current.has(peerId)) connectToPeer(peerId, socket);
+      // Always tear down any existing PC with this host and start a completely fresh
+      // connection. This is critical: ontrack only fires during initial SDP negotiation,
+      // never on replaceTrack renegotiations. If we reuse the old pre-stream PC, the
+      // member's ontrack fires with a muted null-track stream and never updates —
+      // causing the permanent black screen. A fresh connectToPeer forces a new ontrack
+      // that carries the host's live screen track from the very first offer/answer.
+      const oldPc = pcsRef.current.get(peerId);
+      if (oldPc) {
+        try { oldPc.close(); } catch {}
+        pcsRef.current.delete(peerId);
+        outboundStreamsRef.current.delete(peerId);
+        pendingCandidatesRef.current.delete(peerId);
+      }
+      connectToPeer(peerId, socket);
       // Auto-join for ALL users — no manual JOIN click required
       socket.emit("join-stream-request", { hostPeerId: peerId });
       setJoinedStreamHostId(peerId);
@@ -438,6 +450,8 @@ export default function App() {
       addMsg("⚡ SYSTEM", "You joined the stream!");
       setJoinedStreamHostId(hostPeerId);
       setJoinStreamPrompt(null);
+      // peer-started-stream already tore down and recreated the PC; if it hasn't
+      // (e.g. manual JOIN button path), create one now.
       if (!pcsRef.current.has(hostPeerId)) connectToPeer(hostPeerId, socket);
     });
 
@@ -2486,16 +2500,15 @@ function RemoteVideoEl({ stream, peerId, videoRefs, small, videoOff }: { stream:
     vid.addEventListener("canplaythrough", onCanPlayThrough);
 
     // Persistent polling: if the video is still black (no decoded frame yet),
-    // cycle srcObject every second for up to 30 s to un-stick the decoder.
-    // This covers ICE connection delays, replaceTrack renegotiation, and any
-    // case where onunmute didn't fire reliably on the mobile browser.
+    // retry play() every second for up to 60 s. We do NOT cycle srcObject from
+    // a timer because after unlockAudio() sets muted=false, a timer-based
+    // play() call would be blocked by autoplay policy and kill the video.
+    // Cycling is handled by attachStreamToVideo and the forceReattach paths.
     let attempts = 0;
     const poll = setInterval(() => {
       attempts++;
-      if (vid.videoWidth > 0 || attempts > 30) { clearInterval(poll); return; }
-      const s = vid.srcObject as MediaStream | null;
-      if (s) { vid.srcObject = null; vid.srcObject = s; }
-      vid.play().catch(() => {});
+      if (vid.videoWidth > 0 || attempts > 60) { clearInterval(poll); return; }
+      if (vid.paused) vid.play().catch(() => {});
     }, 1000);
 
     return () => {
