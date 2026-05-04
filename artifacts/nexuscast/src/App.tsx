@@ -13,6 +13,8 @@ const _isNativeApp = _initParams.get("native") === "1";
 // Viewers don't broadcast (no mic, no camera, no screen share), they just watch + chat.
 const _watchCode = (_initParams.get("watch") || "").toUpperCase();
 const _isViewer = _watchCode.length >= 4;
+// Members who arrive via the room share link (?room=CODE) have their mic disabled.
+const _joinedViaLink = !_isViewer && (_initParams.get("room") || "").length >= 4;
 
 /** Post a message to the React Native WebView wrapper (no-op in browser) */
 function postToNative(data: Record<string, unknown>) {
@@ -672,6 +674,7 @@ export default function App() {
 
   async function initRoomAudio() {
     if (_isViewer) return; // view-only guests don't have a mic
+    if (_joinedViaLink) return; // members who joined via share link have mic disabled
     if (audioStreamRef.current) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -1951,7 +1954,7 @@ export default function App() {
               {isScreenSharing && hasSystemAudio && (
                 <button onClick={toggleSystemAudio} title={isSystemAudioEnabled ? "Turn off system audio" : "Turn on system audio"} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isSystemAudioEnabled ? "#00ff88" : "#334"}`, background: isSystemAudioEnabled ? "rgba(0,255,136,0.2)" : "rgba(0,0,0,0.3)", color: isSystemAudioEnabled ? "#00ff88" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>{isSystemAudioEnabled ? "🔊" : "🔇"}</button>
               )}
-              {(isStreaming || joinedStreamHostId) && (
+              {!_joinedViaLink && (isStreaming || joinedStreamHostId) && (
                 <button onClick={toggleMic} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#334"}`, background: isMuted ? "rgba(255,170,0,0.15)" : isMicOn ? "rgba(0,255,0,0.15)" : "rgba(0,0,0,0.3)", color: isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>{isMuted ? "🔇" : isMicOn ? "🎙️" : "🔇"}</button>
               )}
             </>
@@ -2217,7 +2220,7 @@ export default function App() {
             </div>
           )}
 
-          {!_isViewer && (isStreaming || joinedStreamHostId !== null) && (
+          {!_isViewer && !_joinedViaLink && (isStreaming || joinedStreamHostId !== null) && (
             <div style={panelSt}>
               <div style={{ fontSize: 11, fontWeight: 700, color: "#00d4ff", marginBottom: 8 }}>🎙️ MICROPHONE</div>
               <div onClick={toggleMic} style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "11px 0", borderRadius: 12, cursor: isMuted ? "not-allowed" : "pointer", background: isMuted ? "rgba(255,170,0,0.1)" : isMicOn ? "linear-gradient(135deg, rgba(0,255,0,0.18), rgba(0,200,0,0.12))" : "rgba(0,0,0,0.3)", border: `2px solid ${isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#555"}`, boxShadow: isMicOn ? "0 0 18px rgba(0,255,0,0.25)" : "none", transition: "all .3s" }}>
