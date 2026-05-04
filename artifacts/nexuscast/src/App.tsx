@@ -364,7 +364,35 @@ export default function App() {
         ];
       });
       // Don't initiate — the new peer sends offers to existing peers; just notify if we're streaming
-      if (isStreamingRef.current) socket.emit("start-stream");
+      if (isStreamingRef.current) {
+        socket.emit("start-stream");
+        // Safety net: after the initial offer/answer + ICE exchange completes, verify
+        // the new peer's video sender actually has our current track. If replaceTrack
+        // inside getOrCreatePC raced against ICE setup and left the sender null, the
+        // member sees a black screen forever. We push the track + renegotiate here to
+        // guarantee they receive video even in worst-case timing scenarios.
+        setTimeout(async () => {
+          const pc = pcsRef.current.get(peerId);
+          if (!pc || pc.connectionState === "closed") return;
+          const videoTrack = screenStreamRef.current?.getVideoTracks()[0]
+            ?? localStreamRef.current?.getVideoTracks()[0] ?? null;
+          if (!videoTrack) return;
+          const trs = pc.getTransceivers();
+          const videoSender =
+            trs.find(t => t.sender.track?.kind === "video" || t.receiver.track?.kind === "video")?.sender
+            ?? trs[1]?.sender ?? null;
+          if (!videoSender) return;
+          try {
+            // Always replace to ensure the sender has the latest track
+            await videoSender.replaceTrack(videoTrack);
+            if (pc.signalingState === "stable") {
+              const offer = await pc.createOffer();
+              await pc.setLocalDescription(offer);
+              socketRef.current?.emit("offer", { to: peerId, offer });
+            }
+          } catch {}
+        }, 2000);
+      }
     });
 
     // Soft drop: peer's socket died but the server keeps them in the room as offline.
@@ -473,6 +501,28 @@ export default function App() {
       const pc = getOrCreatePC(from, socket);
       try {
         await pc.setRemoteDescription(new RTCSessionDescription(offer));
+        // For NEW connections: re-seed senders with current tracks AFTER setRemoteDescription
+        // but BEFORE createAnswer. getOrCreatePC already calls replaceTrack but fire-and-forget —
+        // awaiting here ensures the sender definitely has the track when ICE connects,
+        // preventing the "black screen for new members" race condition.
+        if (!isRenegotiation) {
+          const trs = pc.getTransceivers();
+          const findSender = (kind: "audio" | "video"): RTCRtpSender | null =>
+            trs.find(t => t.sender.track?.kind === kind || t.receiver.track?.kind === kind)?.sender
+            ?? (kind === "video" ? trs[1]?.sender : trs[0]?.sender)
+            ?? null;
+          const videoTrack = screenStreamRef.current?.getVideoTracks()[0]
+            ?? localStreamRef.current?.getVideoTracks()[0] ?? null;
+          const audioTrack = audioStreamRef.current?.getAudioTracks()[0] ?? null;
+          const videoSender = findSender("video");
+          const audioSender = findSender("audio");
+          if (videoSender && videoTrack && videoSender.track !== videoTrack) {
+            await videoSender.replaceTrack(videoTrack).catch(() => {});
+          }
+          if (audioSender && audioTrack && audioSender.track !== audioTrack) {
+            await audioSender.replaceTrack(audioTrack).catch(() => {});
+          }
+        }
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         socket.emit("answer", { to: from, answer });
@@ -1219,14 +1269,31 @@ export default function App() {
         const videoSender = findSender("video");
         if (videoSender) await videoSender.replaceTrack(screenVideoTrack).catch(() => {});
 
-        // Force renegotiation so peers render the new video immediately
-        try {
-          if (pc.signalingState === "stable") {
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            socketRef.current?.emit("offer", { to: peerId, offer });
-          }
-        } catch {}
+        // Force renegotiation so peers render the new video immediately.
+        // If not currently stable (e.g. mid-handshake when screen share starts),
+        // defer via signalingstatechange so the offer is never silently dropped.
+        const doRenegotiate = async () => {
+          try {
+            if (pc.signalingState === "stable") {
+              const offer = await pc.createOffer();
+              await pc.setLocalDescription(offer);
+              socketRef.current?.emit("offer", { to: peerId, offer });
+            }
+          } catch {}
+        };
+        if (pc.signalingState === "stable") {
+          await doRenegotiate();
+        } else {
+          const onStable = () => {
+            if (pc.signalingState === "stable") {
+              pc.removeEventListener("signalingstatechange", onStable);
+              doRenegotiate();
+            }
+          };
+          pc.addEventListener("signalingstatechange", onStable);
+          // Clean up listener after 15s to prevent leaks if state never settles
+          setTimeout(() => pc.removeEventListener("signalingstatechange", onStable), 15000);
+        }
         setTimeout(() => applyVideoEncodingParams(pc, true), 300);
       }
 
