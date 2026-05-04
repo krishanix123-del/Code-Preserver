@@ -35,6 +35,15 @@ const RTC_CONFIG: RTCConfiguration = {
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
     { urls: "stun:stun2.l.google.com:19302" },
+    { urls: "stun:stun3.l.google.com:19302" },
+    { urls: "stun:stun4.l.google.com:19302" },
+    { urls: "stun:stun.cloudflare.com:3478" },
+    { urls: "stun:stun.stunprotocol.org:3478" },
+    { urls: "stun:stun.voip.blackberry.com:3478" },
+    // freeturn.net — reliable free TURN relay
+    { urls: "turn:freeturn.net:3478", username: "free", credential: "free" },
+    { urls: "turns:freeturn.net:5349", username: "free", credential: "free" },
+    // openrelay — kept as fallback
     { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
     { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
     { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
@@ -42,6 +51,7 @@ const RTC_CONFIG: RTCConfiguration = {
   iceCandidatePoolSize: 10,
   bundlePolicy: "max-bundle",
   rtcpMuxPolicy: "require",
+  iceTransportPolicy: "all",
 };
 
 interface ChatMessage { id: number; sender: string; text: string; }
