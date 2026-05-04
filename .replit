@@ -10,7 +10,7 @@ id = "artifacts/mockup-sandbox"
 router = "application"
 deploymentTarget = "autoscale"
 run = ["bash", "-c", "PORT=8080 NODE_ENV=production node --enable-source-maps artifacts/api-server/dist/index.mjs"]
-build = ["bash", "-c", "PORT=8080 BASE_PATH=/ pnpm --filter @workspace/nexuscast run build && pnpm --filter @workspace/api-server run build"]
+build = ["bash", "-c", "NODE_ENV=production PORT=8080 BASE_PATH=/ pnpm --filter @workspace/nexuscast run build && pnpm --filter @workspace/api-server run build"]
 
 [deployment.postBuild]
 args = ["pnpm", "store", "prune"]
