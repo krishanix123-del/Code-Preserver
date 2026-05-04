@@ -13,8 +13,6 @@ const _isNativeApp = _initParams.get("native") === "1";
 // Viewers don't broadcast (no mic, no camera, no screen share), they just watch + chat.
 const _watchCode = (_initParams.get("watch") || "").toUpperCase();
 const _isViewer = _watchCode.length >= 4;
-// Members who arrive via the room share link (?room=CODE) have their mic disabled.
-const _joinedViaLink = !_isViewer && (_initParams.get("room") || "").length >= 4;
 
 /** Post a message to the React Native WebView wrapper (no-op in browser) */
 function postToNative(data: Record<string, unknown>) {
@@ -34,23 +32,16 @@ const QUICK_MSGS = [
 
 const RTC_CONFIG: RTCConfiguration = {
   iceServers: [
-    // Multiple STUN servers for redundancy
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
     { urls: "stun:stun2.l.google.com:19302" },
-    { urls: "stun:stun3.l.google.com:19302" },
-    { urls: "stun:stun4.l.google.com:19302" },
-    { urls: "stun:stun.cloudflare.com:3478" },
-    // TURN servers for when direct/STUN connection isn't possible (different networks/NATs)
     { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
     { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
     { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
-    { urls: "turn:openrelay.metered.ca:80?transport=udp", username: "openrelayproject", credential: "openrelayproject" },
   ],
   iceCandidatePoolSize: 10,
   bundlePolicy: "max-bundle",
   rtcpMuxPolicy: "require",
-  iceTransportPolicy: "all",
 };
 
 interface ChatMessage { id: number; sender: string; text: string; }
@@ -159,9 +150,6 @@ export default function App() {
   // MediaStream so the receiver always sees one growing stream (avoids the "two-streams,
   // audio-only wins, video element black" race).
   const outboundStreamsRef = useRef<Map<string, MediaStream>>(new Map());
-  // ICE candidates that arrived before setRemoteDescription completed — queued here
-  // and flushed immediately after setRemoteDescription so no candidates are lost.
-  const pendingCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
   const socketRef = useRef<Socket | null>(null);
   const remoteVideoRefs = useRef<Map<string, HTMLVideoElement>>(new Map());
 
@@ -298,11 +286,7 @@ export default function App() {
   function unlockAudio() {
     if (audioUnlocked) return;
     setAudioUnlocked(true);
-    // Unmute all remote videos (they start muted for autoplay) then force play
-    remoteVideoRefs.current.forEach(vid => {
-      vid.muted = false;
-      vid.play().catch(() => {});
-    });
+    remoteVideoRefs.current.forEach(vid => { vid.play().catch(() => {}); });
   }
 
   // Socket.IO setup
@@ -404,20 +388,8 @@ export default function App() {
 
     socket.on("peer-started-stream", ({ peerId, userId: uid }: { peerId: string; userId: string }) => {
       setMembers(p => p.map(m => m.peerId === peerId ? { ...m, isStreaming: true } : m));
-      // Always tear down any existing PC with this host and start a completely fresh
-      // connection. This is critical: ontrack only fires during initial SDP negotiation,
-      // never on replaceTrack renegotiations. If we reuse the old pre-stream PC, the
-      // member's ontrack fires with a muted null-track stream and never updates —
-      // causing the permanent black screen. A fresh connectToPeer forces a new ontrack
-      // that carries the host's live screen track from the very first offer/answer.
-      const oldPc = pcsRef.current.get(peerId);
-      if (oldPc) {
-        try { oldPc.close(); } catch {}
-        pcsRef.current.delete(peerId);
-        outboundStreamsRef.current.delete(peerId);
-        pendingCandidatesRef.current.delete(peerId);
-      }
-      connectToPeer(peerId, socket);
+      // Establish WebRTC connection now so tracks are ready immediately
+      if (!pcsRef.current.has(peerId)) connectToPeer(peerId, socket);
       // Auto-join for ALL users — no manual JOIN click required
       socket.emit("join-stream-request", { hostPeerId: peerId });
       setJoinedStreamHostId(peerId);
@@ -450,8 +422,6 @@ export default function App() {
       addMsg("⚡ SYSTEM", "You joined the stream!");
       setJoinedStreamHostId(hostPeerId);
       setJoinStreamPrompt(null);
-      // peer-started-stream already tore down and recreated the PC; if it hasn't
-      // (e.g. manual JOIN button path), create one now.
       if (!pcsRef.current.has(hostPeerId)) connectToPeer(hostPeerId, socket);
     });
 
@@ -503,12 +473,6 @@ export default function App() {
       const pc = getOrCreatePC(from, socket);
       try {
         await pc.setRemoteDescription(new RTCSessionDescription(offer));
-        // Flush any ICE candidates that raced ahead of this offer
-        const queued = pendingCandidatesRef.current.get(from) ?? [];
-        pendingCandidatesRef.current.delete(from);
-        for (const c of queued) {
-          try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch { }
-        }
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         socket.emit("answer", { to: from, answer });
@@ -536,28 +500,12 @@ export default function App() {
     socket.on("answer", async ({ from, answer }: { from: string; answer: RTCSessionDescriptionInit }) => {
       const pc = pcsRef.current.get(from);
       if (!pc) return;
-      try {
-        await pc.setRemoteDescription(new RTCSessionDescription(answer));
-        // Flush any ICE candidates that arrived before the remote description was ready
-        const queued = pendingCandidatesRef.current.get(from) ?? [];
-        pendingCandidatesRef.current.delete(from);
-        for (const c of queued) {
-          try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch { }
-        }
-      } catch { }
+      try { await pc.setRemoteDescription(new RTCSessionDescription(answer)); } catch { }
     });
 
     socket.on("ice-candidate", async ({ from, candidate }: { from: string; candidate: RTCIceCandidateInit }) => {
       const pc = pcsRef.current.get(from);
       if (!pc || !candidate) return;
-      // If remote description isn't set yet, queue the candidate so it isn't lost.
-      // This is the most common cause of ICE failure: candidates race the answer.
-      if (!pc.remoteDescription) {
-        const q = pendingCandidatesRef.current.get(from) ?? [];
-        q.push(candidate);
-        pendingCandidatesRef.current.set(from, q);
-        return;
-      }
       try { await pc.addIceCandidate(new RTCIceCandidate(candidate)); } catch { }
     });
 
@@ -724,7 +672,6 @@ export default function App() {
 
   async function initRoomAudio() {
     if (_isViewer) return; // view-only guests don't have a mic
-    if (_joinedViaLink) return; // members who joined via share link have mic disabled
     if (audioStreamRef.current) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -951,7 +898,6 @@ export default function App() {
     const pc = pcsRef.current.get(peerId);
     if (pc) { pc.close(); pcsRef.current.delete(peerId); }
     outboundStreamsRef.current.delete(peerId);
-    pendingCandidatesRef.current.delete(peerId);
     // Fix 1/7: clear video srcObject to prevent frozen/black frame ghost
     const vid = remoteVideoRefs.current.get(peerId);
     if (vid) { vid.pause(); vid.srcObject = null; }
@@ -2005,7 +1951,7 @@ export default function App() {
               {isScreenSharing && hasSystemAudio && (
                 <button onClick={toggleSystemAudio} title={isSystemAudioEnabled ? "Turn off system audio" : "Turn on system audio"} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isSystemAudioEnabled ? "#00ff88" : "#334"}`, background: isSystemAudioEnabled ? "rgba(0,255,136,0.2)" : "rgba(0,0,0,0.3)", color: isSystemAudioEnabled ? "#00ff88" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>{isSystemAudioEnabled ? "🔊" : "🔇"}</button>
               )}
-              {!_joinedViaLink && (isStreaming || joinedStreamHostId) && (
+              {(isStreaming || joinedStreamHostId) && (
                 <button onClick={toggleMic} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#334"}`, background: isMuted ? "rgba(255,170,0,0.15)" : isMicOn ? "rgba(0,255,0,0.15)" : "rgba(0,0,0,0.3)", color: isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>{isMuted ? "🔇" : isMicOn ? "🎙️" : "🔇"}</button>
               )}
             </>
@@ -2271,7 +2217,7 @@ export default function App() {
             </div>
           )}
 
-          {!_isViewer && !_joinedViaLink && (isStreaming || joinedStreamHostId !== null) && (
+          {!_isViewer && (isStreaming || joinedStreamHostId !== null) && (
             <div style={panelSt}>
               <div style={{ fontSize: 11, fontWeight: 700, color: "#00d4ff", marginBottom: 8 }}>🎙️ MICROPHONE</div>
               <div onClick={toggleMic} style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "11px 0", borderRadius: 12, cursor: isMuted ? "not-allowed" : "pointer", background: isMuted ? "rgba(255,170,0,0.1)" : isMicOn ? "linear-gradient(135deg, rgba(0,255,0,0.18), rgba(0,200,0,0.12))" : "rgba(0,0,0,0.3)", border: `2px solid ${isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#555"}`, boxShadow: isMicOn ? "0 0 18px rgba(0,255,0,0.25)" : "none", transition: "all .3s" }}>
@@ -2488,39 +2434,21 @@ function RemoteVideoEl({ stream, peerId, videoRefs, small, videoOff }: { stream:
     if (!ref.current) return;
     const vid = ref.current;
     videoRefs.current.set(peerId, vid);
-    // Always start muted so autoplay succeeds on every mobile browser.
-    // The user's "Tap to enable audio" action unmutes all videos via unlockAudio().
-    vid.muted = true;
-    vid.srcObject = stream;
+    if (vid.srcObject !== stream) {
+      vid.srcObject = stream;
+    }
     vid.play().catch(() => {});
-
+    // Auto-resume whenever data starts/resumes flowing (e.g. after replaceTrack)
     const onCanPlay = () => { vid.play().catch(() => {}); };
-    const onCanPlayThrough = () => { vid.play().catch(() => {}); };
     vid.addEventListener("canplay", onCanPlay);
-    vid.addEventListener("canplaythrough", onCanPlayThrough);
-
-    // Persistent polling: if the video is still black (no decoded frame yet),
-    // retry play() every second for up to 60 s. We do NOT cycle srcObject from
-    // a timer because after unlockAudio() sets muted=false, a timer-based
-    // play() call would be blocked by autoplay policy and kill the video.
-    // Cycling is handled by attachStreamToVideo and the forceReattach paths.
-    let attempts = 0;
-    const poll = setInterval(() => {
-      attempts++;
-      if (vid.videoWidth > 0 || attempts > 60) { clearInterval(poll); return; }
-      if (vid.paused) vid.play().catch(() => {});
-    }, 1000);
-
     return () => {
-      clearInterval(poll);
       vid.removeEventListener("canplay", onCanPlay);
-      vid.removeEventListener("canplaythrough", onCanPlayThrough);
       videoRefs.current.delete(peerId);
     };
   }, [stream, peerId]);
   return (
     <>
-      <video ref={ref} autoPlay playsInline muted style={{ width: "100%", height: "100%", objectFit: small ? "cover" : "contain", position: small ? "relative" : "absolute", inset: 0, background: "#000" }} />
+      <video ref={ref} autoPlay playsInline style={{ width: "100%", height: "100%", objectFit: small ? "cover" : "contain", position: small ? "relative" : "absolute", inset: 0, background: "#000" }} />
       {videoOff && (
         // Overlay covers the (otherwise frozen) last frame the moment the broadcaster
         // turned their camera/screen off, so viewers see an explicit "off" state.
