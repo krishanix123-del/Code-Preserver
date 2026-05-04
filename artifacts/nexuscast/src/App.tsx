@@ -34,16 +34,23 @@ const QUICK_MSGS = [
 
 const RTC_CONFIG: RTCConfiguration = {
   iceServers: [
+    // Multiple STUN servers for redundancy
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
     { urls: "stun:stun2.l.google.com:19302" },
+    { urls: "stun:stun3.l.google.com:19302" },
+    { urls: "stun:stun4.l.google.com:19302" },
+    { urls: "stun:stun.cloudflare.com:3478" },
+    // TURN servers for when direct/STUN connection isn't possible (different networks/NATs)
     { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
     { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
     { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
+    { urls: "turn:openrelay.metered.ca:80?transport=udp", username: "openrelayproject", credential: "openrelayproject" },
   ],
   iceCandidatePoolSize: 10,
   bundlePolicy: "max-bundle",
   rtcpMuxPolicy: "require",
+  iceTransportPolicy: "all",
 };
 
 interface ChatMessage { id: number; sender: string; text: string; }
@@ -152,6 +159,9 @@ export default function App() {
   // MediaStream so the receiver always sees one growing stream (avoids the "two-streams,
   // audio-only wins, video element black" race).
   const outboundStreamsRef = useRef<Map<string, MediaStream>>(new Map());
+  // ICE candidates that arrived before setRemoteDescription completed — queued here
+  // and flushed immediately after setRemoteDescription so no candidates are lost.
+  const pendingCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
   const socketRef = useRef<Socket | null>(null);
   const remoteVideoRefs = useRef<Map<string, HTMLVideoElement>>(new Map());
 
@@ -479,6 +489,12 @@ export default function App() {
       const pc = getOrCreatePC(from, socket);
       try {
         await pc.setRemoteDescription(new RTCSessionDescription(offer));
+        // Flush any ICE candidates that raced ahead of this offer
+        const queued = pendingCandidatesRef.current.get(from) ?? [];
+        pendingCandidatesRef.current.delete(from);
+        for (const c of queued) {
+          try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch { }
+        }
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         socket.emit("answer", { to: from, answer });
@@ -506,12 +522,28 @@ export default function App() {
     socket.on("answer", async ({ from, answer }: { from: string; answer: RTCSessionDescriptionInit }) => {
       const pc = pcsRef.current.get(from);
       if (!pc) return;
-      try { await pc.setRemoteDescription(new RTCSessionDescription(answer)); } catch { }
+      try {
+        await pc.setRemoteDescription(new RTCSessionDescription(answer));
+        // Flush any ICE candidates that arrived before the remote description was ready
+        const queued = pendingCandidatesRef.current.get(from) ?? [];
+        pendingCandidatesRef.current.delete(from);
+        for (const c of queued) {
+          try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch { }
+        }
+      } catch { }
     });
 
     socket.on("ice-candidate", async ({ from, candidate }: { from: string; candidate: RTCIceCandidateInit }) => {
       const pc = pcsRef.current.get(from);
       if (!pc || !candidate) return;
+      // If remote description isn't set yet, queue the candidate so it isn't lost.
+      // This is the most common cause of ICE failure: candidates race the answer.
+      if (!pc.remoteDescription) {
+        const q = pendingCandidatesRef.current.get(from) ?? [];
+        q.push(candidate);
+        pendingCandidatesRef.current.set(from, q);
+        return;
+      }
       try { await pc.addIceCandidate(new RTCIceCandidate(candidate)); } catch { }
     });
 
@@ -905,6 +937,7 @@ export default function App() {
     const pc = pcsRef.current.get(peerId);
     if (pc) { pc.close(); pcsRef.current.delete(peerId); }
     outboundStreamsRef.current.delete(peerId);
+    pendingCandidatesRef.current.delete(peerId);
     // Fix 1/7: clear video srcObject to prevent frozen/black frame ghost
     const vid = remoteVideoRefs.current.get(peerId);
     if (vid) { vid.pause(); vid.srcObject = null; }
