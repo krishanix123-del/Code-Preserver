@@ -983,17 +983,14 @@ export default function App() {
     setPeerVideoOff(p => { if (!p.has(peerId)) return p; const n = new Set(p); n.delete(peerId); return n; });
   }
 
-  // Fix 9+4: Stream button handler — show option modal on start, end stream without leaving room
+  // Stream button handler — start screen share directly (camera removed)
   function handleStreamButtonClick() {
     if (isStreaming) { endStreamOnly(); return; }
-    // Block non-hosts from starting any kind of broadcast while the room host is live.
-    // The server already rejects non-host `start-stream`, but tracks travel peer-to-peer,
-    // so we must also gate it client-side or remote peers will still receive the media.
     if (hostIsActivelyStreaming()) {
       notify("The host is streaming — only the host can broadcast right now.", "warning");
       return;
     }
-    setShowStreamStartModal(true);
+    toggleScreenShare();
   }
 
   // End stream but STAY in room — keep PCs alive, just stop tracks
@@ -1777,44 +1774,6 @@ export default function App() {
   // ─── SHARED MODALS ────────────────────────────────────────────────────────────
   const sharedModals = (
     <>
-      {showStreamStartModal && (() => {
-        const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
-        const inWebView = _isNativeApp || /wv/.test(navigator.userAgent) || (/Android/.test(navigator.userAgent) && /Version\/[\d.]+/.test(navigator.userAgent));
-        const canScreen = !isIOS && !inWebView && !!navigator.mediaDevices?.getDisplayMedia;
-        return (
-          <ModalOverlay onClose={() => setShowStreamStartModal(false)}>
-            <ModalBox title="🔴 START STREAMING">
-              <p style={{ fontSize: 12, color: "#a0b0d0", marginBottom: 4 }}>What do you want to broadcast?</p>
-              <button onClick={() => startStreamWithOption("camera")} style={{ ...btnSt, display: "flex", alignItems: "center", gap: 10, justifyContent: "center", padding: "13px 20px" }}>
-                <span style={{ fontSize: 20 }}>📹</span> Camera Only
-              </button>
-              {canScreen ? (
-                <>
-                  <button onClick={() => startStreamWithOption("screen")} style={{ ...btnSt, display: "flex", alignItems: "center", gap: 10, justifyContent: "center", padding: "13px 20px", background: "linear-gradient(135deg, #0099ff, #0066cc)" }}>
-                    <span style={{ fontSize: 20 }}>🖥️</span> Screen Only
-                  </button>
-                  <button onClick={() => startStreamWithOption("both")} style={{ ...btnSt, display: "flex", alignItems: "center", gap: 10, justifyContent: "center", padding: "13px 20px", background: "linear-gradient(135deg, #00d4ff, #9900ff)" }}>
-                    <span style={{ fontSize: 20 }}>📹🖥️</span> Camera + Screen
-                  </button>
-                </>
-              ) : inWebView && !isIOS ? (
-                <button
-                  onClick={() => { setShowStreamStartModal(false); postToNative({ type: "open_in_browser_for_screen_share", url: window.location.href }); }}
-                  style={{ ...btnSt, display: "flex", alignItems: "center", gap: 10, justifyContent: "center", padding: "13px 20px", background: "linear-gradient(135deg, #1a7f3f, #115c2d)" }}
-                >
-                  <span style={{ fontSize: 20 }}>🌐</span> Screen Share via Browser
-                </button>
-              ) : (
-                <p style={{ fontSize: 10, color: "#ffaa00", background: "rgba(255,170,0,0.08)", border: "1px solid #ffaa00", borderRadius: 8, padding: "8px 12px", margin: 0 }}>
-                  {isIOS ? "⚠️ Screen sharing is not available on iOS." : "⚠️ Screen sharing not supported on this browser."}
-                </p>
-              )}
-              <button onClick={() => setShowStreamStartModal(false)} style={btn2St}>CANCEL</button>
-            </ModalBox>
-          </ModalOverlay>
-        );
-      })()}
-
       {showTeamModal && <ModalOverlay onClose={() => setShowTeamModal(false)}>
         <ModalBox title="👥 TEAM">
           <button onClick={createRoom} style={btnSt}>➕ CREATE ROOM</button>
@@ -1870,27 +1829,6 @@ export default function App() {
             ))}
           </div>
           <button onClick={() => setShowAvatarModal(false)} style={btn2St}>CANCEL</button>
-        </ModalBox>
-      </ModalOverlay>}
-
-      {showRecordingSaveModal && <ModalOverlay onClose={discardRecording}>
-        <ModalBox title="⏹ RECORDING STOPPED">
-          <div style={{ textAlign: "center", margin: "10px 0 18px" }}>
-            <div style={{ fontSize: 12, color: "#a0b0d0", marginBottom: 6 }}>Your recording is ready</div>
-            <div style={{ display: "flex", justifyContent: "center", gap: 24, marginBottom: 4 }}>
-              <div style={{ textAlign: "center" }}>
-                <div style={{ fontSize: 26, fontWeight: 800, fontFamily: "monospace", color: "#00d4ff" }}>{fmt(recordingSec)}</div>
-                <div style={{ fontSize: 9, color: "#7a8aa0", letterSpacing: 1 }}>DURATION</div>
-              </div>
-              <div style={{ textAlign: "center" }}>
-                <div style={{ fontSize: 26, fontWeight: 800, fontFamily: "monospace", color: "#00d4ff" }}>{fmtBytes(recordedBytes)}</div>
-                <div style={{ fontSize: 9, color: "#7a8aa0", letterSpacing: 1 }}>FILE SIZE</div>
-              </div>
-            </div>
-            <div style={{ fontSize: 10, color: "#556070", marginTop: 6 }}>nexuscast-[timestamp].webm</div>
-          </div>
-          <button onClick={downloadRecording} style={{ ...btnSt, background: "linear-gradient(135deg, #00d4ff, #0099ff)", color: "#0a0e27" }}>💾 DOWNLOAD RECORDING</button>
-          <button onClick={discardRecording} style={{ ...btn2St, color: "#ff6666", borderColor: "#ff4444" }}>🗑️ DISCARD</button>
         </ModalBox>
       </ModalOverlay>}
 
@@ -2038,7 +1976,6 @@ export default function App() {
                   {isStreaming ? "⏹ END" : "▶ STREAM"}
                 </button>
               )}
-              <button onClick={toggleWebcam} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isWebcamOn ? "#00d4ff" : "#334"}`, background: isWebcamOn ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isWebcamOn ? "#00d4ff" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>📹</button>
               <button onClick={toggleScreenShare} title={isMobileDevice ? "Screen share is desktop-only" : "Share your screen"} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isScreenSharing ? "#00d4ff" : "#334"}`, background: isScreenSharing ? "rgba(0,212,255,0.2)" : "rgba(0,0,0,0.3)", color: isScreenSharing ? "#00d4ff" : (isMobileDevice ? "#445" : "#667"), fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", opacity: isMobileDevice ? 0.45 : 1, position: "relative" }}>🖥️{isMobileDevice && <span style={{ position: "absolute", top: -3, right: -3, fontSize: 10, color: "#a0b0d0", background: "#0a0e27", borderRadius: "50%", width: 14, height: 14, display: "flex", alignItems: "center", justifyContent: "center", border: "1px solid #334" }}>💻</span>}</button>
               {isScreenSharing && hasSystemAudio && (
                 <button onClick={toggleSystemAudio} title={isSystemAudioEnabled ? "Turn off system audio" : "Turn on system audio"} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isSystemAudioEnabled ? "#00ff88" : "#334"}`, background: isSystemAudioEnabled ? "rgba(0,255,136,0.2)" : "rgba(0,0,0,0.3)", color: isSystemAudioEnabled ? "#00ff88" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>{isSystemAudioEnabled ? "🔊" : "🔇"}</button>
@@ -2088,40 +2025,11 @@ export default function App() {
               </div>
               <div style={{ ...panelSt, fontSize: 10, color: "#a0b0d0", lineHeight: 1.9 }}>
                 <div style={{ color: "#00d4ff", fontWeight: 700, marginBottom: 4, fontSize: 11 }}>📡 HOW TO USE</div>
-                <div>• Tap STREAM → choose Camera / Screen / Both</div>
+                <div>• Tap STREAM to share your screen</div>
                 <div>• Share room code with friends to join</div>
                 <div>• Use Chat tab for messages</div>
                 <div>• Use Members tab to manage users</div>
               </div>
-              {/* RECORDING PANEL — mobile */}
-              {!_isViewer && (isStreaming || isWebcamOn || isScreenSharing) && (
-                <div style={{ ...panelSt, padding: "10px 12px" }}>
-                  <div style={{ fontSize: 11, fontWeight: 700, color: "#ff4444", marginBottom: 8, display: "flex", alignItems: "center", gap: 6 }}>
-                    <span style={{ animation: isRecording && !isRecordingPaused ? "statusBlink 1s infinite" : "none" }}>⏺</span> RECORDING
-                    {isRecording && <span style={{ marginLeft: "auto", fontSize: 9, color: isRecordingPaused ? "#ffaa00" : "#ff4444", fontWeight: 800 }}>{isRecordingPaused ? "PAUSED" : "● REC"}</span>}
-                  </div>
-                  {isRecording && (
-                    <div style={{ textAlign: "center", marginBottom: 8, padding: "6px 0", background: "rgba(255,0,0,0.08)", borderRadius: 8, border: `1px solid ${isRecordingPaused ? "#ffaa00" : "#ff4444"}` }}>
-                      <div style={{ fontSize: 8, color: "#a0b0d0", letterSpacing: 1, marginBottom: 2 }}>{isRecordingPaused ? "⏸ PAUSED" : "⏺ RECORDING"}</div>
-                      <div style={{ fontSize: 22, fontWeight: 800, fontFamily: "monospace", color: isRecordingPaused ? "#ffaa00" : "#ff4444", opacity: isRecordingPaused ? 0.7 : 1 }}>{fmt(recordingSec)}</div>
-                      <div style={{ fontSize: 9, color: "#7a8aa0", marginTop: 2 }}>~{fmtBytes(recordedBytes)} recorded</div>
-                    </div>
-                  )}
-                  {!isRecording ? (
-                    <button onClick={startRecording} style={{ width: "100%", padding: "10px 0", background: "linear-gradient(135deg, #ff2222, #cc0000)", border: "none", color: "#fff", cursor: "pointer", borderRadius: 8, fontSize: 13, fontWeight: 800, letterSpacing: 1 }}>⏺ START RECORDING</button>
-                  ) : (
-                    <div style={{ display: "flex", gap: 8 }}>
-                      {!isRecordingPaused ? (
-                        <button onClick={pauseRecording} style={{ flex: 1, padding: "10px 0", background: "rgba(255,170,0,0.15)", border: "1px solid #ffaa00", color: "#ffaa00", cursor: "pointer", borderRadius: 8, fontSize: 12, fontWeight: 700 }}>⏸ PAUSE</button>
-                      ) : (
-                        <button onClick={resumeRecording} style={{ flex: 1, padding: "10px 0", background: "rgba(0,212,255,0.15)", border: "1px solid #00d4ff", color: "#00d4ff", cursor: "pointer", borderRadius: 8, fontSize: 12, fontWeight: 700 }}>▶ RESUME</button>
-                      )}
-                      <button onClick={stopAndDownloadRecording} style={{ flex: 1, padding: "10px 0", background: "rgba(255,0,0,0.15)", border: "1px solid #ff4444", color: "#ff6666", cursor: "pointer", borderRadius: 8, fontSize: 12, fontWeight: 700 }}>⏹ STOP</button>
-                    </div>
-                  )}
-                  {!isRecording && <div style={{ fontSize: 9, color: "#7a8aa0", marginTop: 5, textAlign: "center" }}>Records your stream locally as .webm</div>}
-                </div>
-              )}
             </div>
           )}
 
@@ -2255,10 +2163,9 @@ export default function App() {
             )}
             <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
               {[
-                // Viewers can't broadcast — hide STREAM/CAMERA/SCREEN entirely
+                // Viewers can't broadcast — hide STREAM/SCREEN entirely
                 ...(_isViewer ? [] : [
                   ...(canStartStream ? [{ icon: isStreaming ? "⏹" : "▶", label: "STREAM", active: isStreaming, onClick: handleStreamButtonClick, color: isStreaming ? "#ff4444" : "#00d4ff" }] : []),
-                  { icon: "📹", label: "CAMERA", active: isWebcamOn, onClick: toggleWebcam, color: "#00d4ff" },
                   { icon: "🖥️", label: "SCREEN", active: isScreenSharing, onClick: toggleScreenShare, color: "#00d4ff" },
                   ...(isScreenSharing && hasSystemAudio ? [{ icon: isSystemAudioEnabled ? "🔊" : "🔇", label: "SYS AUD", active: isSystemAudioEnabled, onClick: toggleSystemAudio, color: isSystemAudioEnabled ? "#00ff88" : "#556" }] : []),
                 ]),
@@ -2278,36 +2185,6 @@ export default function App() {
               <button onClick={endStreamOnly} style={{ marginTop: 8, width: "100%", padding: 7, background: "rgba(255,0,0,0.15)", border: "1px solid #ff4444", color: "#ff6666", cursor: "pointer", borderRadius: 8, fontSize: 11, fontWeight: 700 }}>⏹️ END STREAM</button>
             )}
           </div>
-
-          {/* RECORDING PANEL — desktop */}
-          {!_isViewer && (isStreaming || isWebcamOn || isScreenSharing) && (
-            <div style={panelSt}>
-              <div style={{ fontSize: 11, fontWeight: 700, color: "#ff4444", marginBottom: 8, display: "flex", alignItems: "center", gap: 6 }}>
-                <span style={{ animation: isRecording && !isRecordingPaused ? "statusBlink 1s infinite" : "none" }}>⏺</span> RECORDING
-                {isRecording && <span style={{ marginLeft: "auto", fontSize: 9, color: isRecordingPaused ? "#ffaa00" : "#ff4444", fontWeight: 800 }}>{isRecordingPaused ? "PAUSED" : "● REC"}</span>}
-              </div>
-              {isRecording && (
-                <div style={{ textAlign: "center", marginBottom: 8, padding: "6px 0", background: "rgba(255,0,0,0.08)", borderRadius: 8, border: `1px solid ${isRecordingPaused ? "#ffaa00" : "#ff4444"}` }}>
-                  <div style={{ fontSize: 8, color: "#a0b0d0", letterSpacing: 1, marginBottom: 2 }}>{isRecordingPaused ? "⏸ PAUSED" : "⏺ RECORDING"}</div>
-                  <div style={{ fontSize: 22, fontWeight: 800, fontFamily: "monospace", color: isRecordingPaused ? "#ffaa00" : "#ff4444", opacity: isRecordingPaused ? 0.7 : 1 }}>{fmt(recordingSec)}</div>
-                  <div style={{ fontSize: 9, color: "#7a8aa0", marginTop: 2 }}>~{fmtBytes(recordedBytes)} recorded</div>
-                </div>
-              )}
-              {!isRecording ? (
-                <button onClick={startRecording} style={{ width: "100%", padding: "9px 0", background: "linear-gradient(135deg, #ff2222, #cc0000)", border: "none", color: "#fff", cursor: "pointer", borderRadius: 8, fontSize: 12, fontWeight: 800, letterSpacing: 1 }}>⏺ START RECORDING</button>
-              ) : (
-                <div style={{ display: "flex", gap: 6 }}>
-                  {!isRecordingPaused ? (
-                    <button onClick={pauseRecording} style={{ flex: 1, padding: "8px 0", background: "rgba(255,170,0,0.15)", border: "1px solid #ffaa00", color: "#ffaa00", cursor: "pointer", borderRadius: 8, fontSize: 11, fontWeight: 700 }}>⏸ PAUSE</button>
-                  ) : (
-                    <button onClick={resumeRecording} style={{ flex: 1, padding: "8px 0", background: "rgba(0,212,255,0.15)", border: "1px solid #00d4ff", color: "#00d4ff", cursor: "pointer", borderRadius: 8, fontSize: 11, fontWeight: 700 }}>▶ RESUME</button>
-                  )}
-                  <button onClick={stopAndDownloadRecording} style={{ flex: 1, padding: "8px 0", background: "rgba(255,0,0,0.15)", border: "1px solid #ff4444", color: "#ff6666", cursor: "pointer", borderRadius: 8, fontSize: 11, fontWeight: 700 }}>⏹ STOP</button>
-                </div>
-              )}
-              {!isRecording && <div style={{ fontSize: 9, color: "#7a8aa0", marginTop: 5, textAlign: "center" }}>Records your stream locally as .webm</div>}
-            </div>
-          )}
 
           {!_isViewer && (isStreaming || joinedStreamHostId !== null) && (
             <div style={panelSt}>
@@ -2343,8 +2220,8 @@ export default function App() {
 
           <div style={{ background: "rgba(0,0,0,0.2)", border: "1px solid #004d7f", borderRadius: 10, padding: 10, fontSize: 9, color: "#a0b0d0", lineHeight: 1.7 }}>
             <div style={{ color: "#00d4ff", fontWeight: 700, marginBottom: 4 }}>📡 QUICK GUIDE</div>
-            <div>• STREAM → choose Camera / Screen / Both</div>
-            <div>• Camera/Screen OFF won't end stream</div>
+            <div>• STREAM → share your screen live</div>
+            <div>• Screen OFF won't end stream</div>
             <div>• Members get notified when stream starts</div>
             <div>• Works 4G ↔ WiFi via TURN</div>
             <div style={{ marginTop: 6, color: isConnected ? "#00ff44" : "#ff8800", fontWeight: 600 }}>{isConnected ? "✅ Server connected" : "⏳ Reconnecting..."}</div>
