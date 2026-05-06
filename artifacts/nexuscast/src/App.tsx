@@ -1291,13 +1291,19 @@ export default function App() {
         const videoSender = findSender("video");
         if (videoSender) await videoSender.replaceTrack(screenVideoTrack).catch(() => {});
 
+        // Restart ICE first — if the connection was in a failed/degraded state
+        // (common on mismatched NAT networks), this forces a fresh ICE gathering
+        // cycle and picks up TURN relay candidates, which is the #1 reason members
+        // see a black screen when the host starts screen sharing.
+        try { pc.restartIce(); } catch {}
+
         // Force renegotiation so peers render the new video immediately.
         // If not currently stable (e.g. mid-handshake when screen share starts),
         // defer via signalingstatechange so the offer is never silently dropped.
         const doRenegotiate = async () => {
           try {
             if (pc.signalingState === "stable") {
-              const offer = await pc.createOffer();
+              const offer = await pc.createOffer({ iceRestart: true });
               await pc.setLocalDescription(offer);
               socketRef.current?.emit("offer", { to: peerId, offer });
             }
@@ -1786,17 +1792,7 @@ export default function App() {
       {showShareModal && <ModalOverlay onClose={() => setShowShareModal(false)}>
         <ModalBox title="✅ ROOM CREATED">
           <div style={{ fontSize: 34, margin: "10px 0", fontFamily: "monospace", color: "#00d4ff", letterSpacing: 6 }}>{shareCode}</div>
-          <p style={{ fontSize: 11, color: "#a0b0d0", margin: "0 0 8px" }}>Share this code — works across 4G ↔ WiFi</p>
-          {shareQrDataUrl ? (
-            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6, marginBottom: 12 }}>
-              <img src={shareQrDataUrl} alt="Room QR Code" style={{ width: 140, height: 140, borderRadius: 10, border: "2px solid #00d4ff" }} />
-              <span style={{ fontSize: 9, color: "#a0b0d0" }}>📱 Scan with NexusCast mobile app</span>
-            </div>
-          ) : (
-            <div style={{ height: 140, display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 12 }}>
-              <span style={{ fontSize: 11, color: "#a0b0d0" }}>Generating QR code...</span>
-            </div>
-          )}
+          <p style={{ fontSize: 11, color: "#a0b0d0", margin: "0 0 16px" }}>Share this code — works across 4G ↔ WiFi</p>
           <button onClick={() => { navigator.clipboard.writeText(shareCode); notify("Copied!", "success"); }} style={btnSt}>📋 COPY CODE</button>
           <button onClick={() => setShowShareModal(false)} style={btn2St}>START STREAMING</button>
         </ModalBox>
@@ -1808,14 +1804,6 @@ export default function App() {
           <input value={joinCodeInput} onChange={e => setJoinCodeInput(e.target.value.toUpperCase())} placeholder="e.g. ABC123" maxLength={8} style={{ ...inpSt, letterSpacing: 6, fontSize: 20, textAlign: "center" }} onKeyDown={e => e.key === "Enter" && joinTeamFromModal()} />
           <button onClick={joinTeamFromModal} style={btnSt}>JOIN ROOM</button>
           <button onClick={() => setShowJoinModal(false)} style={btn2St}>CANCEL</button>
-        </ModalBox>
-      </ModalOverlay>}
-
-      {showEditIdModal && <ModalOverlay onClose={() => setShowEditIdModal(false)}>
-        <ModalBox title="✏️ EDIT USERNAME">
-          <input value={newUserIdInput} onChange={e => setNewUserIdInput(e.target.value)} placeholder="New username" style={inpSt} maxLength={20} />
-          <button onClick={saveUserId} style={btnSt}>SAVE</button>
-          <button onClick={() => setShowEditIdModal(false)} style={btn2St}>CANCEL</button>
         </ModalBox>
       </ModalOverlay>}
 
@@ -1832,15 +1820,6 @@ export default function App() {
         </ModalBox>
       </ModalOverlay>}
 
-      {showChangeNameModal && <ModalOverlay onClose={() => setShowChangeNameModal(null)}>
-        <ModalBox title="✏️ CHANGE MEMBER NAME">
-          <p style={{ fontSize: 11, color: "#a0b0d0", margin: "0 0 4px" }}>This nickname is only visible to you.</p>
-          <p style={{ fontSize: 10, color: "#ffaa00", margin: "0 0 10px" }}>The member will be notified.</p>
-          <input value={changeNameInput} onChange={e => setChangeNameInput(e.target.value)} placeholder="New nickname..." style={inpSt} maxLength={24} autoFocus onKeyDown={e => e.key === "Enter" && saveLocalNickname()} />
-          <button onClick={saveLocalNickname} style={btnSt}>SAVE NICKNAME</button>
-          <button onClick={() => setShowChangeNameModal(null)} style={btn2St}>CANCEL</button>
-        </ModalBox>
-      </ModalOverlay>}
     </>
   );
 
@@ -1980,9 +1959,6 @@ export default function App() {
               {isScreenSharing && hasSystemAudio && (
                 <button onClick={toggleSystemAudio} title={isSystemAudioEnabled ? "Turn off system audio" : "Turn on system audio"} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isSystemAudioEnabled ? "#00ff88" : "#334"}`, background: isSystemAudioEnabled ? "rgba(0,255,136,0.2)" : "rgba(0,0,0,0.3)", color: isSystemAudioEnabled ? "#00ff88" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>{isSystemAudioEnabled ? "🔊" : "🔇"}</button>
               )}
-              {(isStreaming || joinedStreamHostId) && (
-                <button onClick={toggleMic} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#334"}`, background: isMuted ? "rgba(255,170,0,0.15)" : isMicOn ? "rgba(0,255,0,0.15)" : "rgba(0,0,0,0.3)", color: isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>{isMuted ? "🔇" : isMicOn ? "🎙️" : "🔇"}</button>
-              )}
             </>
           )}
           {someoneIsLive && (
@@ -2020,43 +1996,13 @@ export default function App() {
                     </div>
                     <div style={{ fontSize: 9, color: isConnected ? "#00ff00" : "#ff8800" }}>{isConnected ? "● Connected" : "⏳ Reconnecting..."}</div>
                   </div>
-                  <button onClick={() => { setNewUserIdInput(userId); setShowEditIdModal(true); }} style={{ padding: "4px 8px", background: "rgba(0,212,255,0.15)", border: "1px solid #00d4ff", color: "#00d4ff", borderRadius: 5, fontSize: 9, cursor: "pointer" }}>✏️ Edit</button>
                 </div>
               </div>
               <div style={{ ...panelSt, fontSize: 10, color: "#a0b0d0", lineHeight: 1.9 }}>
                 <div style={{ color: "#00d4ff", fontWeight: 700, marginBottom: 4, fontSize: 11 }}>📡 HOW TO USE</div>
                 <div>• Tap STREAM to share your screen</div>
                 <div>• Share room code with friends to join</div>
-                <div>• Use Chat tab for messages</div>
-                <div>• Use Members tab to manage users</div>
-              </div>
-            </div>
-          )}
-
-          {mobileTab === "chat" && (
-            <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
-              <div className="chat-messages-scroll" style={{ flex: 1, overflowY: "auto", padding: 10, display: "flex", flexDirection: "column", gap: 6 }}>
-                {chatMessages.length === 0
-                  ? <div style={{ color: "#a0b0d0", fontSize: 11, textAlign: "center", marginTop: 20, opacity: 0.6 }}>Chat is empty. Say something!</div>
-                  : chatMessages.map(msg => (
-                    <div key={msg.id} style={{ padding: "8px 12px", background: "rgba(0,99,255,0.1)", borderLeft: "3px solid #00d4ff", borderRadius: 8 }}>
-                      <div style={{ color: "#0099ff", fontWeight: 700, fontSize: 10 }}>{msg.sender}:</div>
-                      <div style={{ color: "#e8f0ff", marginTop: 2, wordBreak: "break-word", fontSize: 13 }}>{msg.text}</div>
-                    </div>
-                  ))}
-                <div ref={chatEndRef} />
-              </div>
-              <div style={{ display: "flex", overflowX: "auto", gap: 6, padding: "8px 10px", borderTop: "1px solid #004d7f", background: "rgba(0,0,0,0.3)", flexShrink: 0 }}>
-                {QUICK_MSGS.map(qm => (
-                  <button key={qm.label} onClick={() => quickMsg(qm.text)} style={{ padding: "6px 10px", background: "rgba(0,99,255,0.2)", border: "1px solid #004d7f", color: "#e8f0ff", cursor: "pointer", fontSize: 10, borderRadius: 6, whiteSpace: "nowrap", flexShrink: 0 }}>{qm.label}</button>
-                ))}
-              </div>
-              <div style={{ padding: 10, borderTop: "1px solid #004d7f", background: "rgba(5,9,21,0.95)", flexShrink: 0 }}>
-                <div style={{ display: "flex", gap: 8 }}>
-                  <input value={chatInput} onChange={e => setChatInput(e.target.value)} onKeyDown={e => e.key === "Enter" && sendMsg()}
-                    placeholder="Message..." style={{ flex: 1, background: "rgba(0,0,0,0.5)", border: "1px solid #004d7f", color: "#00d4ff", padding: "10px 14px", borderRadius: 10, fontSize: 14, outline: "none" }} />
-                  <button onClick={sendMsg} style={{ padding: "10px 18px", background: "linear-gradient(135deg, #00d4ff, #0099ff)", color: "#0a0e27", border: "none", borderRadius: 10, cursor: "pointer", fontSize: 14, fontWeight: 700 }}>→</button>
-                </div>
+                <div>• Use Members tab to see who is in the room</div>
               </div>
             </div>
           )}
@@ -2092,8 +2038,6 @@ export default function App() {
                               <div onClick={() => toggleFav(member.peerId)} style={{ ...menuItemSt, fontSize: 13 }}>{member.isFav ? "💔 Unfavorite" : "❤️ Favorite"}</div>
                               {/* Fix 4: only host sees mute/kick/rename controls */}
                               {iAmRoomHost && <>
-                                <div onClick={() => muteMember(member.peerId)} style={{ ...menuItemSt, fontSize: 13 }}>🔇 Mute (5s)</div>
-                                <div onClick={() => openChangeNameModal(member.peerId)} style={{ ...menuItemSt, fontSize: 13 }}>✏️ Change Name</div>
                                 <div onClick={() => kickMember(member.peerId)} style={{ ...menuItemSt, fontSize: 13, color: "#ff6666", borderBottom: "none" }}>🚫 Remove</div>
                               </>}
                             </div>
@@ -2109,14 +2053,14 @@ export default function App() {
 
         {/* BOTTOM TAB BAR */}
         <div style={{ background: "linear-gradient(90deg, #0a0e27, #1a2558)", borderTop: "2px solid #00d4ff", display: "flex", flexShrink: 0 }}>
-          {(["stream", "chat", "members"] as const).map(tab => (
-            <button key={tab} onClick={() => setMobileTab(tab)} style={{
+          {(["stream", "members"] as const).map(tab => (
+            <button key={tab} onClick={() => setMobileTab(tab as typeof mobileTab)} style={{
               flex: 1, padding: "12px 0", background: mobileTab === tab ? "rgba(0,212,255,0.15)" : "transparent",
               border: "none", color: mobileTab === tab ? "#00d4ff" : "#556", cursor: "pointer",
               fontSize: 10, fontWeight: mobileTab === tab ? 700 : 400, letterSpacing: 1,
               borderTop: mobileTab === tab ? "2px solid #00d4ff" : "2px solid transparent",
             }}>
-              {tab === "stream" ? "🎮 STREAM" : tab === "chat" ? `💬 CHAT${chatMessages.length > 0 ? ` (${chatMessages.length})` : ""}` : `👥 (${members.length})`}
+              {tab === "stream" ? "🎮 STREAM" : `👥 (${members.length})`}
             </button>
           ))}
         </div>
@@ -2158,7 +2102,7 @@ export default function App() {
               <div style={{ marginBottom: 10, padding: "8px 10px", background: "linear-gradient(135deg, rgba(0,212,255,0.15), rgba(0,153,255,0.1))", border: "1px solid #00d4ff", borderRadius: 10, textAlign: "center" }}>
                 <div style={{ fontSize: 18 }}>👁️</div>
                 <div style={{ fontSize: 10, fontWeight: 800, color: "#00d4ff", letterSpacing: 1 }}>WATCHING AS GUEST</div>
-                <div style={{ fontSize: 9, color: "#a0b0d0", marginTop: 2 }}>View-only · chat enabled</div>
+                <div style={{ fontSize: 9, color: "#a0b0d0", marginTop: 2 }}>View-only</div>
               </div>
             )}
             <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
@@ -2169,7 +2113,6 @@ export default function App() {
                   { icon: "🖥️", label: "SCREEN", active: isScreenSharing, onClick: toggleScreenShare, color: "#00d4ff" },
                   ...(isScreenSharing && hasSystemAudio ? [{ icon: isSystemAudioEnabled ? "🔊" : "🔇", label: "SYS AUD", active: isSystemAudioEnabled, onClick: toggleSystemAudio, color: isSystemAudioEnabled ? "#00ff88" : "#556" }] : []),
                 ]),
-                { icon: "👥", label: "TEAM", active: false, onClick: () => setShowTeamModal(true), color: "#00d4ff" },
               ].map(btn => (
                 <div key={btn.label} onClick={btn.onClick} title={btn.label} style={{ width: 56, height: 56, borderRadius: "50%", cursor: "pointer", userSelect: "none", background: btn.active ? `linear-gradient(135deg, ${btn.color}, ${btn.color}aa)` : "rgba(0,212,255,0.1)", border: `2px solid ${btn.color}`, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", boxShadow: btn.active ? `0 0 28px ${btn.color}88` : `0 0 6px ${btn.color}22`, transition: "all .3s" }}>
                   <div style={{ fontSize: 20 }}>{btn.icon}</div>
@@ -2185,16 +2128,6 @@ export default function App() {
               <button onClick={endStreamOnly} style={{ marginTop: 8, width: "100%", padding: 7, background: "rgba(255,0,0,0.15)", border: "1px solid #ff4444", color: "#ff6666", cursor: "pointer", borderRadius: 8, fontSize: 11, fontWeight: 700 }}>⏹️ END STREAM</button>
             )}
           </div>
-
-          {!_isViewer && (isStreaming || joinedStreamHostId !== null) && (
-            <div style={panelSt}>
-              <div style={{ fontSize: 11, fontWeight: 700, color: "#00d4ff", marginBottom: 8 }}>🎙️ MICROPHONE</div>
-              <div onClick={toggleMic} style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "11px 0", borderRadius: 12, cursor: isMuted ? "not-allowed" : "pointer", background: isMuted ? "rgba(255,170,0,0.1)" : isMicOn ? "linear-gradient(135deg, rgba(0,255,0,0.18), rgba(0,200,0,0.12))" : "rgba(0,0,0,0.3)", border: `2px solid ${isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#555"}`, boxShadow: isMicOn ? "0 0 18px rgba(0,255,0,0.25)" : "none", transition: "all .3s" }}>
-                <span style={{ fontSize: 24 }}>{isMuted ? "🔇" : isMicOn ? "🎙️" : "🔇"}</span>
-                <span style={{ fontSize: 11, fontWeight: 700, color: isMuted ? "#ffaa00" : isMicOn ? "#00ff44" : "#888" }}>{isMuted ? "MUTED BY HOST" : isMicOn ? "MIC ON — tap to mute" : "MIC OFF — tap to talk"}</span>
-              </div>
-            </div>
-          )}
 
           <div style={panelSt}>
             <div style={{ fontSize: 11, fontWeight: 700, color: "#00d4ff", marginBottom: 8 }}>🎮 ROOM CONTROLS</div>
@@ -2292,38 +2225,9 @@ export default function App() {
                 <div style={{ fontSize: 12, fontWeight: 700, color: "#00d4ff" }}>You {iAmRoomHost ? <span style={{ fontSize: 9, background: "rgba(255,165,0,0.2)", color: "#ffaa00", border: "1px solid #ffaa00", padding: "1px 5px", borderRadius: 4, marginLeft: 4 }}>HOST</span> : null}</div>
                 <div style={{ display: "flex", alignItems: "center", gap: 5, marginTop: 3 }}>
                   <span style={{ fontSize: 10, color: "#a0b0d0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{userId}</span>
-                  <button onClick={() => { setNewUserIdInput(userId); setShowEditIdModal(true); }} style={{ padding: "2px 7px", background: "rgba(0,212,255,0.15)", border: "1px solid #00d4ff", color: "#00d4ff", cursor: "pointer", borderRadius: 4, fontSize: 8, flexShrink: 0 }}>✏️</button>
                 </div>
               </div>
               <div style={{ fontSize: 9, padding: "3px 7px", background: isConnected ? "rgba(0,255,0,0.1)" : "rgba(255,128,0,0.1)", border: `1px solid ${isConnected ? "#00ff00" : "#ff8800"}`, color: isConnected ? "#00ff00" : "#ff8800", borderRadius: 8, fontWeight: 700, flexShrink: 0 }}>{isConnected ? "● ON" : "⏳"}</div>
-            </div>
-          </div>
-
-          <div style={{ flex: 2, ...panelSt, padding: 0, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0 }}>
-            <div style={{ padding: "8px 12px", background: "linear-gradient(90deg, rgba(0,212,255,0.1), transparent)", borderBottom: "1px solid #004d7f", flexShrink: 0 }}>
-              <span style={{ fontSize: 11, fontWeight: 700, color: "#00d4ff" }}>💬 LIVE CHAT</span>
-            </div>
-            <div className="chat-messages-scroll" style={{ flex: 1, overflowY: "auto", padding: 8, display: "flex", flexDirection: "column", gap: 5, minHeight: 0 }}>
-              {chatMessages.length === 0
-                ? <div style={{ color: "#a0b0d0", fontSize: 10, textAlign: "center", marginTop: 16, opacity: .5 }}>Chat is empty. Say something!</div>
-                : chatMessages.map(msg => (
-                  <div key={msg.id} style={{ padding: "5px 8px", background: "rgba(0,99,255,0.1)", borderLeft: "3px solid #00d4ff", borderRadius: 6 }}>
-                    <div style={{ color: "#0099ff", fontWeight: 700, fontSize: 9 }}>{msg.sender}:</div>
-                    <div style={{ color: "#e8f0ff", marginTop: 2, wordBreak: "break-word", fontSize: 11 }}>{msg.text}</div>
-                  </div>
-                ))}
-              <div ref={chatEndRef} />
-            </div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 4, padding: "6px 8px", borderTop: "1px solid #004d7f", background: "rgba(0,0,0,0.2)", flexShrink: 0 }}>
-              {QUICK_MSGS.map(qm => (
-                <button key={qm.label} onClick={() => quickMsg(qm.text)} style={{ padding: 4, background: "rgba(0,99,255,0.15)", border: "1px solid #004d7f", color: "#e8f0ff", cursor: "pointer", fontSize: 9, borderRadius: 5 }}>{qm.label}</button>
-              ))}
-            </div>
-            <div style={{ padding: 8, borderTop: "1px solid #004d7f", flexShrink: 0 }}>
-              <div style={{ display: "flex", gap: 6 }}>
-                <input value={chatInput} onChange={e => setChatInput(e.target.value)} onKeyDown={e => e.key === "Enter" && sendMsg()} placeholder="Type message..." style={{ flex: 1, background: "rgba(0,0,0,0.5)", border: "1px solid #004d7f", color: "#00d4ff", padding: "7px 10px", borderRadius: 7, fontSize: 11, outline: "none" }} />
-                <button onClick={sendMsg} style={{ padding: "7px 12px", background: "linear-gradient(135deg, rgba(0,212,255,0.2), rgba(0,99,255,0.2))", border: "1px solid #00d4ff", color: "#00d4ff", cursor: "pointer", borderRadius: 7, fontSize: 11 }}>→</button>
-              </div>
             </div>
           </div>
 
@@ -2362,8 +2266,6 @@ export default function App() {
                               <div onClick={() => toggleFav(member.peerId)} style={menuItemSt}>{member.isFav ? "💔 Unfavorite" : "❤️ Favorite"}</div>
                               {/* Fix 4: only host sees mute/kick/rename on desktop */}
                               {iAmRoomHost && <>
-                                <div onClick={() => muteMember(member.peerId)} style={menuItemSt}>🔇 Mute (5s)</div>
-                                <div onClick={() => openChangeNameModal(member.peerId)} style={menuItemSt}>✏️ Change Name</div>
                                 <div onClick={() => kickMember(member.peerId)} style={{ ...menuItemSt, color: "#ff6666", borderBottom: "none" }}>🚫 Remove</div>
                               </>}
                             </div>
