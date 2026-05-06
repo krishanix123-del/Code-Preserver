@@ -79,6 +79,7 @@ export default function App() {
   // replaceTrack(null) leaves a frozen last frame on the receiver, so each peer
   // tells the room when their video stops/starts and we render a placeholder.
   const [peerVideoOff, setPeerVideoOff] = useState<Set<string>>(new Set());
+  const [peerConnStates, setPeerConnStates] = useState<Map<string, RTCPeerConnectionState>>(new Map());
   const [isMicOn, setIsMicOn] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
@@ -156,6 +157,7 @@ export default function App() {
   const miniVideoRef = useRef<HTMLVideoElement>(null);
   const localCenterRef = useRef<HTMLVideoElement>(null);
   const pcsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const iceRetryCountsRef = useRef<Map<string, number>>(new Map());
   // Per-PC outbound MediaStream — every track we ever send to a peer goes into the SAME
   // MediaStream so the receiver always sees one growing stream (avoids the "two-streams,
   // audio-only wins, video element black" race).
@@ -658,13 +660,17 @@ export default function App() {
     };
   }, []);
 
-  // Adaptive encoding: bumped for "lagless" feel — higher bitrates + framerate, prioritise framerate over resolution.
+  // Adaptive encoding: scale bitrate based on viewer count so the host's upload
+  // doesn't saturate when many people are watching (improvement #2 + #6).
   // Mobile: camera 900 Kbps / screen 1.5 Mbps | Desktop: camera 2.5 Mbps / screen 4 Mbps.
-  function applyVideoEncodingParams(pc: RTCPeerConnection, isScreenShare = false) {
+  // Viewer scaling: 1-2 viewers = full bitrate, 3-4 = 70%, 5+ = 50%.
+  function applyVideoEncodingParams(pc: RTCPeerConnection, isScreenShare = false, viewerCount = 1) {
     const isMob = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-    const maxBitrate = isScreenShare
+    const baseBitrate = isScreenShare
       ? (isMob ? 1_500_000 : 4_000_000)
       : (isMob ? 900_000 : 2_500_000);
+    const scaleFactor = viewerCount <= 2 ? 1.0 : viewerCount <= 4 ? 0.7 : 0.5;
+    const maxBitrate = Math.round(baseBitrate * scaleFactor);
     const maxFramerate = isScreenShare
       ? (isMob ? 20 : 30)
       : (isMob ? 30 : 30);
@@ -680,7 +686,6 @@ export default function App() {
           params.encodings[0].maxFramerate = maxFramerate;
           // 'maintain-framerate' keeps motion smooth at the cost of resolution — best for "lagless" perception
           (params.encodings[0] as { degradationPreference?: string }).degradationPreference = "maintain-framerate";
-          // Low jitter buffer at the sender side too
           (params as { degradationPreference?: string }).degradationPreference = "maintain-framerate";
           await sender.setParameters(params);
         } catch {}
@@ -809,6 +814,23 @@ export default function App() {
     const audioTransceiver = pc.addTransceiver("audio", { direction: "sendrecv", streams: [outboundStream] });
     const videoTransceiver = pc.addTransceiver("video", { direction: "sendrecv", streams: [outboundStream] });
 
+    // Improvement #5: set preferred codec — VP8 first (lowest CPU, most compatible),
+    // then H264 (hardware-accelerated on most phones), then VP9 as fallback.
+    // Consistent codec selection across all peers reduces encoding variance and CPU load.
+    try {
+      const caps = RTCRtpSender.getCapabilities("video");
+      if (caps) {
+        const order = ["VP8", "H264", "VP9"];
+        const sorted = [...caps.codecs].sort((a, b) => {
+          const an = a.mimeType.split("/")[1]?.toUpperCase() ?? "";
+          const bn = b.mimeType.split("/")[1]?.toUpperCase() ?? "";
+          const ai = order.indexOf(an); const bi = order.indexOf(bn);
+          return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
+        });
+        videoTransceiver.setCodecPreferences(sorted);
+      }
+    } catch {}
+
     // Seed the senders with whatever tracks we already have (mic / camera / screen).
     const audioTrackToAdd: MediaStreamTrack | null =
       audioStreamRef.current?.getAudioTracks()[0] ?? null;
@@ -872,24 +894,67 @@ export default function App() {
       };
     };
 
+    // Improvement #1 + #4: auto-reconnect helper — restartIce + renegotiate with
+    // iceRestart:true so a fresh TURN relay path is established automatically.
+    // Retries up to 3 times before notifying the host that the connection is unrecoverable.
+    const attemptIceRestart = async (reason: string) => {
+      const count = (iceRetryCountsRef.current.get(peerId) ?? 0) + 1;
+      iceRetryCountsRef.current.set(peerId, count);
+      if (count > 3) {
+        notify(`⚠️ Connection to a member failed after 3 retries (${reason})`, "error");
+        return;
+      }
+      try { pc.restartIce(); } catch {}
+      // Also renegotiate with iceRestart so the offer carries fresh ICE credentials
+      await new Promise(r => setTimeout(r, 500 * count)); // back-off: 500ms, 1s, 1.5s
+      try {
+        if (pc.signalingState === "stable") {
+          const offer = await pc.createOffer({ iceRestart: true });
+          await pc.setLocalDescription(offer);
+          socket.emit("offer", { to: peerId, offer });
+        }
+      } catch {}
+    };
+
     pc.oniceconnectionstatechange = () => {
+      // Improvement #3: update per-peer connection state for health indicator
+      setPeerConnStates(prev => {
+        const next = new Map(prev);
+        // Map ICE state → RTCPeerConnectionState-style string for unified UI
+        const s = pc.iceConnectionState;
+        const mapped: RTCPeerConnectionState =
+          s === "connected" || s === "completed" ? "connected" :
+          s === "checking" || s === "new" ? "connecting" :
+          s === "disconnected" ? "disconnected" : "failed";
+        next.set(peerId, mapped);
+        return next;
+      });
       if (pc.iceConnectionState === "disconnected") {
-        // Give it 4s to recover, then restart ICE
+        // Give it 3s to self-recover (transient network blip), then restart
         setTimeout(() => {
           if (pc.iceConnectionState === "disconnected" || pc.iceConnectionState === "failed") {
-            try { pc.restartIce(); } catch {}
+            attemptIceRestart("disconnected");
           }
-        }, 4000);
+        }, 3000);
       }
       if (pc.iceConnectionState === "failed") {
-        try { pc.restartIce(); } catch {}
+        attemptIceRestart("ICE failed");
+      }
+      if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
+        // Reset retry counter on successful connection
+        iceRetryCountsRef.current.set(peerId, 0);
       }
     };
 
     pc.onconnectionstatechange = () => {
+      // Improvement #3: track connection state for health badge in member list
+      setPeerConnStates(prev => { const next = new Map(prev); next.set(peerId, pc.connectionState); return next; });
+
       if (pc.connectionState === "connected") {
+        iceRetryCountsRef.current.set(peerId, 0);
         // Detect whether this PC is carrying screen share or camera
-        applyVideoEncodingParams(pc, isScreenSharingRef.current);
+        const vc = pcsRef.current.size; // rough viewer count for bitrate scaling
+        applyVideoEncodingParams(pc, isScreenSharingRef.current, vc);
         // When the connection becomes live, force-attach the video element so
         // members who joined while screen sharing was already active see content.
         const forceReattach = (attempt = 0) => {
@@ -905,12 +970,7 @@ export default function App() {
         setTimeout(() => forceReattach(), 500);
       }
       if (pc.connectionState === "failed") {
-        try { pc.restartIce(); } catch {}
-        setTimeout(() => {
-          if (pc.connectionState === "failed") {
-            try { pc.restartIce(); } catch {}
-          }
-        }, 5000);
+        attemptIceRestart("connection failed");
       }
     };
 
@@ -973,6 +1033,8 @@ export default function App() {
     const pc = pcsRef.current.get(peerId);
     if (pc) { pc.close(); pcsRef.current.delete(peerId); }
     outboundStreamsRef.current.delete(peerId);
+    iceRetryCountsRef.current.delete(peerId);
+    setPeerConnStates(prev => { const next = new Map(prev); next.delete(peerId); return next; });
     // Fix 1/7: clear video srcObject to prevent frozen/black frame ghost
     const vid = remoteVideoRefs.current.get(peerId);
     if (vid) { vid.pause(); vid.srcObject = null; }
@@ -1322,7 +1384,7 @@ export default function App() {
           // Clean up listener after 15s to prevent leaks if state never settles
           setTimeout(() => pc.removeEventListener("signalingstatechange", onStable), 15000);
         }
-        setTimeout(() => applyVideoEncodingParams(pc, true), 300);
+        setTimeout(() => applyVideoEncodingParams(pc, true, pcsRef.current.size), 300);
       }
 
       setIsScreenSharing(true);
@@ -2015,6 +2077,9 @@ export default function App() {
                   const isMe = member.peerId === "me";
                   const isHost = isMe ? iAmRoomHost : member.isRoomHost;
                   const online = isMe ? isConnected : member.connected !== false;
+                  const connState = isMe ? null : peerConnStates.get(member.peerId);
+                  const healthColor = connState === "connected" ? "#00ff88" : connState === "connecting" ? "#ffaa00" : connState === "failed" || connState === "disconnected" ? "#ff4444" : null;
+                  const healthLabel = connState === "connected" ? "🟢" : connState === "connecting" ? "🟡" : connState === "failed" ? "🔴" : connState === "disconnected" ? "🟠" : null;
                   return (
                     <div key={member.peerId} style={{ background: isMe ? "rgba(0,212,255,0.08)" : "rgba(0,99,255,0.06)", border: `1px solid ${isMe ? "#00d4ff44" : "#004d7f"}`, borderRadius: 10, padding: "10px 14px", display: "flex", alignItems: "center", gap: 10, opacity: online ? 1 : 0.55 }}>
                       <div style={{ width: 36, height: 36, borderRadius: "50%", background: "linear-gradient(135deg, #00d4ff, #0099ff)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, flexShrink: 0, position: "relative", filter: online ? "none" : "grayscale(0.7)" }}>
@@ -2027,8 +2092,9 @@ export default function App() {
                           <span style={{ fontSize: 9, padding: "1px 6px", borderRadius: 4, fontWeight: 700, background: isHost ? "rgba(255,165,0,0.2)" : "rgba(0,212,255,0.12)", color: isHost ? "#ffaa00" : "#00d4ff", border: `1px solid ${isHost ? "#ffaa00" : "#00d4ff"}` }}>{isHost ? "HOST" : "MBR"}</span>
                           {member.isStreaming && !isMe && online && <span style={{ fontSize: 9, color: "#ff4444" }}>🔴</span>}
                           {member.isFav && !isMe && <span>❤️</span>}
+                          {healthLabel && <span title={`WebRTC: ${connState}`} style={{ fontSize: 9 }}>{healthLabel}</span>}
                         </div>
-                        <div style={{ fontSize: 10, color: online ? "#00ff00" : "#999" }}>● {online ? "online" : "offline"}</div>
+                        <div style={{ fontSize: 10, color: healthColor ?? (online ? "#00ff00" : "#999") }}>● {connState ?? (online ? "online" : "offline")}</div>
                       </div>
                       {!isMe && (
                         <div style={{ position: "relative" }} onClick={e => e.stopPropagation()}>
@@ -2242,6 +2308,9 @@ export default function App() {
                   const isMe = member.peerId === "me";
                   const isHost = isMe ? iAmRoomHost : member.isRoomHost;
                   const online = isMe ? isConnected : member.connected !== false;
+                  const connState = isMe ? null : peerConnStates.get(member.peerId);
+                  const healthColor = connState === "connected" ? "#00ff88" : connState === "connecting" ? "#ffaa00" : connState === "failed" || connState === "disconnected" ? "#ff4444" : null;
+                  const healthLabel = connState === "connected" ? "🟢" : connState === "connecting" ? "🟡" : connState === "failed" ? "🔴" : connState === "disconnected" ? "🟠" : null;
                   return (
                     <div key={member.peerId} style={{ background: isMe ? "linear-gradient(135deg, rgba(0,212,255,0.12), rgba(0,99,255,0.08))" : "rgba(0,99,255,0.07)", border: `1px solid ${isMe ? "#00d4ff44" : "#004d7f"}`, borderRadius: 8, padding: "7px 10px", display: "flex", alignItems: "center", gap: 8, position: "relative", opacity: online ? 1 : 0.55 }}>
                       <div style={{ width: 30, height: 30, borderRadius: "50%", background: "linear-gradient(135deg, #00d4ff, #0099ff)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, flexShrink: 0, position: "relative", filter: online ? "none" : "grayscale(0.7)" }}>
@@ -2254,9 +2323,9 @@ export default function App() {
                           <span style={{ fontSize: 8, padding: "1px 5px", borderRadius: 4, fontWeight: 700, background: isHost ? "rgba(255,165,0,0.2)" : "rgba(0,212,255,0.12)", color: isHost ? "#ffaa00" : "#00d4ff", border: `1px solid ${isHost ? "#ffaa00" : "#00d4ff"}` }}>{isHost ? "HOST" : "MEMBER"}</span>
                           {member.isFav && !isMe && <span style={{ color: "#ff3366", fontSize: 11 }}>❤️</span>}
                           {member.isStreaming && !isMe && online && <span style={{ fontSize: 8, background: "rgba(255,0,0,0.2)", color: "#ff4444", border: "1px solid #ff4444", padding: "1px 4px", borderRadius: 4, fontWeight: 700 }}>🔴</span>}
-                          {localNicknames[member.peerId] && <span style={{ fontSize: 7, color: "#ffaa00", opacity: 0.7 }}>(renamed)</span>}
+                          {healthLabel && <span title={`WebRTC: ${connState}`} style={{ fontSize: 9 }}>{healthLabel}</span>}
                         </div>
-                        <div style={{ fontSize: 8, color: online ? "#00ff00" : "#999" }}>● {online ? "online" : "offline"}</div>
+                        <div style={{ fontSize: 8, color: healthColor ?? (online ? "#00ff00" : "#999") }}>● {connState ?? (online ? "online" : "offline")}</div>
                       </div>
                       {!isMe && (
                         <div style={{ position: "relative", flexShrink: 0 }} onClick={e => e.stopPropagation()}>
