@@ -812,24 +812,7 @@ export default function App() {
     // race. This eliminated the "screen invisible to viewers" bug that came from `addTrack`
     // mid-call needing onnegotiationneeded to fire reliably (which it doesn't always).
     const audioTransceiver = pc.addTransceiver("audio", { direction: "sendrecv", streams: [outboundStream] });
-    const videoTransceiver = pc.addTransceiver("video", { direction: "sendrecv", streams: [outboundStream] });
-
-    // Improvement #5: set preferred codec — VP8 first (lowest CPU, most compatible),
-    // then H264 (hardware-accelerated on most phones), then VP9 as fallback.
-    // Consistent codec selection across all peers reduces encoding variance and CPU load.
-    try {
-      const caps = RTCRtpSender.getCapabilities("video");
-      if (caps) {
-        const order = ["VP8", "H264", "VP9"];
-        const sorted = [...caps.codecs].sort((a, b) => {
-          const an = a.mimeType.split("/")[1]?.toUpperCase() ?? "";
-          const bn = b.mimeType.split("/")[1]?.toUpperCase() ?? "";
-          const ai = order.indexOf(an); const bi = order.indexOf(bn);
-          return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
-        });
-        videoTransceiver.setCodecPreferences(sorted);
-      }
-    } catch {}
+    pc.addTransceiver("video", { direction: "sendrecv", streams: [outboundStream] });
 
     // Seed the senders with whatever tracks we already have (mic / camera / screen).
     const audioTrackToAdd: MediaStreamTrack | null =
@@ -968,9 +951,6 @@ export default function App() {
           if (attempt < 5) setTimeout(() => forceReattach(attempt + 1), 700);
         };
         setTimeout(() => forceReattach(), 500);
-      }
-      if (pc.connectionState === "failed") {
-        attemptIceRestart("connection failed");
       }
     };
 
