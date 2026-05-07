@@ -812,7 +812,7 @@ export default function App() {
     // race. This eliminated the "screen invisible to viewers" bug that came from `addTrack`
     // mid-call needing onnegotiationneeded to fire reliably (which it doesn't always).
     const audioTransceiver = pc.addTransceiver("audio", { direction: "sendrecv", streams: [outboundStream] });
-    pc.addTransceiver("video", { direction: "sendrecv", streams: [outboundStream] });
+    const videoTransceiver = pc.addTransceiver("video", { direction: "sendrecv", streams: [outboundStream] });
 
     // Seed the senders with whatever tracks we already have (mic / camera / screen).
     const audioTrackToAdd: MediaStreamTrack | null =
