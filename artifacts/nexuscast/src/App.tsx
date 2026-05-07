@@ -164,6 +164,7 @@ export default function App() {
   const outboundStreamsRef = useRef<Map<string, MediaStream>>(new Map());
   const socketRef = useRef<Socket | null>(null);
   const remoteVideoRefs = useRef<Map<string, HTMLVideoElement>>(new Map());
+  const remoteStreamsRef = useRef<RemoteStream[]>([]);
 
   const userIdRef = useRef(userId);
   const userAvatarRef = useRef(userAvatar);
@@ -261,6 +262,7 @@ export default function App() {
   useEffect(() => { isScreenSharingRef.current = isScreenSharing; }, [isScreenSharing]);
   useEffect(() => { isWebcamOnRef.current = isWebcamOn; }, [isWebcamOn]);
   useEffect(() => { audioUnlockedRef.current = audioUnlocked; }, [audioUnlocked]);
+  useEffect(() => { remoteStreamsRef.current = remoteStreams; }, [remoteStreams]);
 
   // Generate QR code whenever shareCode changes
   useEffect(() => {
@@ -546,19 +548,24 @@ export default function App() {
       } catch (err) { console.error("offer err:", err); }
       // After renegotiation (host started/stopped screen share), force-reattach
       // the specific peer's video element so the browser picks up the new video
-      // data. We don't gate on videoWidth===0 because the track may have data
-      // flowing already but the element just needs a srcObject cycle + play().
-      // We retry several times to handle ICE connection delays.
+      // data. We retry for up to ~8 seconds to cover slow TURN ICE exchanges.
       if (isRenegotiation) {
         const forceReattach = (attempt = 0) => {
           const vid = remoteVideoRefs.current.get(from);
-          if (vid && vid.srcObject) {
-            const s = vid.srcObject as MediaStream;
-            vid.srcObject = null;
-            vid.srcObject = s;
-            vid.play().catch(() => {});
+          if (vid) {
+            // Use srcObject already on the element, or fall back to the stream
+            // stored in remoteStreamsRef (handles case where srcObject is null).
+            const s = (vid.srcObject as MediaStream | null)
+              ?? remoteStreamsRef.current.find(r => r.peerId === from)?.stream
+              ?? null;
+            if (s) {
+              vid.srcObject = null;
+              vid.srcObject = s;
+              vid.muted = !audioUnlockedRef.current;
+              vid.play().catch(() => {});
+            }
           }
-          if (attempt < 6) setTimeout(() => forceReattach(attempt + 1), 600);
+          if (attempt < 10) setTimeout(() => forceReattach(attempt + 1), 800);
         };
         setTimeout(() => forceReattach(), 300);
       }
@@ -2362,11 +2369,58 @@ function RemoteVideoEl({ stream, peerId, videoRefs, small, videoOff, audioUnlock
     // The parent's "🔊 Tap to enable audio" button unmutes all remote videos.
     vid.muted = !audioUnlocked;
     vid.play().catch(() => {});
-    // Auto-resume whenever data starts/resumes flowing (e.g. after replaceTrack)
+
+    // Auto-resume whenever the browser decides there's enough data to play.
     const onCanPlay = () => { vid.play().catch(() => {}); };
     vid.addEventListener("canplay", onCanPlay);
+    // Also resume on loadedmetadata (fires when video dimensions/codec are known)
+    const onMeta = () => { vid.play().catch(() => {}); };
+    vid.addEventListener("loadedmetadata", onMeta);
+
+    // When a video track goes from muted (no data) → unmuted (data flowing) —
+    // which is exactly what happens when the host does replaceTrack for screen
+    // share — cycle srcObject so the browser starts rendering the new frames.
+    const onUnmute = () => {
+      vid.srcObject = null;
+      vid.srcObject = stream;
+      vid.muted = !audioUnlocked;
+      vid.play().catch(() => {});
+    };
+    const attachUnmuteListeners = () => {
+      stream.getVideoTracks().forEach(t => t.addEventListener("unmute", onUnmute));
+    };
+    attachUnmuteListeners();
+    // Also catch any video track added to the stream after mount
+    const onAddTrack = (e: MediaStreamTrackEvent) => {
+      if (e.track.kind === "video") e.track.addEventListener("unmute", onUnmute);
+    };
+    stream.addEventListener("addtrack", onAddTrack as EventListener);
+
+    // Watchdog: if video is stuck (paused or no pixel data) for 2+ consecutive
+    // checks, cycle srcObject to force the browser to redisplay incoming frames.
+    // This is the last-resort recovery for TURN relay paths that take >8s to establish.
+    let stuckCount = 0;
+    const watchdog = setInterval(() => {
+      if (vid.videoWidth === 0 || vid.paused) {
+        stuckCount++;
+        if (stuckCount >= 2) {
+          vid.srcObject = null;
+          vid.srcObject = stream;
+          vid.muted = !audioUnlocked;
+          vid.play().catch(() => {});
+          stuckCount = 0;
+        }
+      } else {
+        stuckCount = 0;
+      }
+    }, 1500);
+
     return () => {
       vid.removeEventListener("canplay", onCanPlay);
+      vid.removeEventListener("loadedmetadata", onMeta);
+      stream.getVideoTracks().forEach(t => t.removeEventListener("unmute", onUnmute));
+      stream.removeEventListener("addtrack", onAddTrack as EventListener);
+      clearInterval(watchdog);
       videoRefs.current.delete(peerId);
     };
   }, [stream, peerId]);
