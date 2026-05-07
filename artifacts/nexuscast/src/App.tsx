@@ -753,6 +753,35 @@ export default function App() {
     });
   }
 
+  function forceReconnectVideo() {
+    // Cycle every remote video's srcObject so the browser flushes any stale/black
+    // frame and re-requests the incoming tracks. Also re-applies encoding params
+    // on all peer connections in case the sender needs nudging.
+    remoteStreamsRef.current.forEach(({ peerId, stream }) => {
+      const vid = remoteVideoRefs.current.get(peerId);
+      if (vid) {
+        vid.srcObject = null;
+        vid.srcObject = stream;
+        vid.muted = !audioUnlockedRef.current;
+        vid.play().catch(() => {});
+      }
+    });
+    // Also ask every peer to renegotiate so fresh ICE + encoding params kick in
+    pcsRef.current.forEach((pc, peerId) => {
+      try { pc.restartIce(); } catch {}
+      setTimeout(async () => {
+        try {
+          if (pc.signalingState === "stable") {
+            const offer = await pc.createOffer({ iceRestart: true });
+            await pc.setLocalDescription(offer);
+            socketRef.current?.emit("offer", { to: peerId, offer });
+          }
+        } catch {}
+      }, 200);
+    });
+    notify("Reconnecting video…", "info");
+  }
+
   async function initRoomAudio() {
     if (_isViewer) return; // view-only guests don't have a mic
     if (audioStreamRef.current) return;
@@ -1982,6 +2011,11 @@ export default function App() {
           {!audioUnlocked && remoteStreams.length > 0 && (
             <div onClick={unlockAudio} style={{ position: "absolute", bottom: 8, left: "50%", transform: "translateX(-50%)", background: "rgba(0,212,255,0.2)", border: "1px solid #00d4ff", borderRadius: 16, padding: "6px 16px", fontSize: 10, color: "#00d4ff" }}>🔊 Tap to enable audio</div>
           )}
+          {showRemoteCenter && (
+            <button onClick={forceReconnectVideo} title="Video stuck or black? Tap to reconnect" style={{ position: "absolute", top: 8, left: "50%", transform: "translateX(-50%)", background: "rgba(0,0,0,0.55)", border: "1px solid #334", borderRadius: 14, padding: "4px 12px", fontSize: 10, color: "#a0b0d0", cursor: "pointer", zIndex: 20, display: "flex", alignItems: "center", gap: 5 }}>
+              🔄 Black screen? Reconnect
+            </button>
+          )}
           {isWebcamOn && isScreenSharing && (
             <div style={{ position: "absolute", bottom: 8, right: 8, width: 110, height: 72, border: "2px solid #00d4ff", borderRadius: 8, overflow: "hidden", background: "#000" }}>
               <div style={{ fontSize: 7, color: "#00d4ff", background: "rgba(0,212,255,0.15)", padding: "2px 5px", borderBottom: "1px solid #00d4ff" }}>🖥️ SCREEN</div>
@@ -2241,6 +2275,11 @@ export default function App() {
 
             {!audioUnlocked && remoteStreams.length > 0 && (
               <div onClick={unlockAudio} style={{ position: "absolute", bottom: 60, left: "50%", transform: "translateX(-50%)", background: "rgba(0,212,255,0.2)", border: "1px solid #00d4ff", borderRadius: 20, padding: "8px 20px", cursor: "pointer", fontSize: 11, color: "#00d4ff", zIndex: 20 }}>🔊 Click to enable audio</div>
+            )}
+            {showRemoteCenter && (
+              <button onClick={forceReconnectVideo} title="Video stuck or black? Click to reconnect" style={{ position: "absolute", top: 10, left: "50%", transform: "translateX(-50%)", background: "rgba(0,0,0,0.6)", border: "1px solid #334", borderRadius: 16, padding: "5px 14px", fontSize: 11, color: "#a0b0d0", cursor: "pointer", zIndex: 20, display: "flex", alignItems: "center", gap: 6 }}>
+                🔄 Black screen? Reconnect
+              </button>
             )}
 
             {!showLocalCenter && !showRemoteCenter && (
