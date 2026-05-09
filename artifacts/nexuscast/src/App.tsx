@@ -787,10 +787,20 @@ export default function App() {
 
   async function initRoomAudio() {
     if (_isViewer) return; // view-only guests don't have a mic
+    if (!iAmRoomHostRef.current) return; // only the host broadcasts mic audio
     if (audioStreamRef.current) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        // High-quality mic: AEC + noise suppression remove echo & background noise.
+        // autoGainControl normalises volume so the host isn't too quiet or too loud.
+        // channelCount:1 keeps it mono, reducing bandwidth and improving AEC quality.
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+          sampleRate: 48000,
+        },
         video: false,
       });
       stream.getAudioTracks().forEach(t => { t.enabled = false; }); // default muted until user enables
@@ -850,7 +860,10 @@ export default function App() {
     // `replaceTrack(...)` on an already-negotiated sender — no addTrack, no renegotiation, no
     // race. This eliminated the "screen invisible to viewers" bug that came from `addTrack`
     // mid-call needing onnegotiationneeded to fire reliably (which it doesn't always).
-    const audioTransceiver = pc.addTransceiver("audio", { direction: "sendrecv", streams: [outboundStream] });
+    // Non-host members only receive audio (they never broadcast a mic track), so set
+    // their audio transceiver to recvonly to save upload bandwidth and prevent feedback.
+    const audioDirection = iAmRoomHostRef.current ? "sendrecv" : "recvonly";
+    const audioTransceiver = pc.addTransceiver("audio", { direction: audioDirection, streams: [outboundStream] });
     const videoTransceiver = pc.addTransceiver("video", { direction: "sendrecv", streams: [outboundStream] });
 
     // Seed the senders with whatever tracks we already have (mic / camera / screen).
@@ -1038,8 +1051,8 @@ export default function App() {
   // connectToPeer: initiator side — we create the offer (for all peers)
   async function connectToPeer(peerId: string, socket: Socket) {
     if (pcsRef.current.has(peerId)) return;
-    // Fire mic init in background — don't block connection on permission prompt
-    initRoomAudio().catch(() => {});
+    // Only the host acquires a mic — members are receive-only for audio.
+    if (iAmRoomHostRef.current) initRoomAudio().catch(() => {});
     const pc = getOrCreatePC(peerId, socket);
     try {
       const offer = await pc.createOffer();
@@ -1626,10 +1639,9 @@ export default function App() {
   }
 
   async function toggleMic() {
-    if (isMuted) { notify("You are muted by host. Please wait.", "warning"); return; }
-    // If we have no mic stream yet (member never started a stream), acquire it now.
-    // initRoomAudio() will also wire the fresh mic track into every existing PC's
-    // audio sender, so members can talk back to the host even without streaming.
+    if (!iAmRoomHost) { notify("Only the host can use the mic in this room", "warning"); return; }
+    if (isMuted) { notify("You are muted. Please wait.", "warning"); return; }
+    // If we have no mic stream yet, acquire it now and wire it into every PC.
     if (!audioStreamRef.current && !localStreamRef.current) {
       await initRoomAudio();
     }
@@ -2047,6 +2059,9 @@ export default function App() {
               {isScreenSharing && hasSystemAudio && (
                 <button onClick={toggleSystemAudio} title={isSystemAudioEnabled ? "Turn off system audio" : "Turn on system audio"} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isSystemAudioEnabled ? "#00ff88" : "#334"}`, background: isSystemAudioEnabled ? "rgba(0,255,136,0.2)" : "rgba(0,0,0,0.3)", color: isSystemAudioEnabled ? "#00ff88" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>{isSystemAudioEnabled ? "🔊" : "🔇"}</button>
               )}
+              {iAmRoomHost && (
+                <button onClick={toggleMic} title={isMicOn ? "Mute your mic" : "Unmute your mic"} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isMicOn ? "#00ff88" : "#334"}`, background: isMicOn ? "rgba(0,255,136,0.2)" : "rgba(0,0,0,0.3)", color: isMicOn ? "#00ff88" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>{isMicOn ? "🎙️" : "🔇"}</button>
+              )}
             </>
           )}
           {someoneIsLive && (
@@ -2091,6 +2106,33 @@ export default function App() {
                 <div>• Tap STREAM to share your screen</div>
                 <div>• Share room code with friends to join</div>
                 <div>• Use Members tab to see who is in the room</div>
+              </div>
+            </div>
+          )}
+
+          {mobileTab === "chat" && (
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+              <div className="chat-messages-scroll" style={{ flex: 1, overflowY: "auto", padding: "8px 12px", display: "flex", flexDirection: "column", gap: 6 }}>
+                {chatMessages.length === 0
+                  ? <div style={{ color: "#a0b0d0", fontSize: 11, textAlign: "center", marginTop: 20, opacity: 0.6 }}>No messages yet. Say hello! 👋</div>
+                  : chatMessages.map(msg => (
+                    <div key={msg.id} style={{ display: "flex", flexDirection: "column", alignItems: msg.sender === userId ? "flex-end" : "flex-start" }}>
+                      <span style={{ fontSize: 9, color: msg.sender === "⚡ SYSTEM" ? "#ffaa00" : msg.sender === userId ? "#00d4ff" : "#a0b0d0", fontWeight: 700, marginBottom: 2, paddingLeft: 4, paddingRight: 4 }}>{msg.sender === userId ? "You" : msg.sender}</span>
+                      <div style={{ fontSize: 12, color: msg.sender === "⚡ SYSTEM" ? "#ffaa00" : "#e8f0ff", background: msg.sender === "⚡ SYSTEM" ? "rgba(255,170,0,0.1)" : msg.sender === userId ? "rgba(0,212,255,0.18)" : "rgba(255,255,255,0.07)", padding: "7px 11px", borderRadius: msg.sender === userId ? "14px 14px 4px 14px" : "14px 14px 14px 4px", maxWidth: "80%", border: msg.sender === userId ? "1px solid rgba(0,212,255,0.3)" : "1px solid rgba(255,255,255,0.08)", wordBreak: "break-word" }}>{msg.text}</div>
+                    </div>
+                  ))}
+                <div ref={chatEndRef} />
+              </div>
+              <div style={{ padding: "8px 12px", borderTop: "1px solid #004d7f", display: "flex", gap: 8, flexShrink: 0, background: "rgba(5,9,21,0.95)" }}>
+                <input
+                  value={chatInput}
+                  onChange={e => setChatInput(e.target.value)}
+                  onKeyDown={e => e.key === "Enter" && sendMsg()}
+                  placeholder={currentRoom ? "Type a message…" : "Join a room to chat"}
+                  disabled={!currentRoom}
+                  style={{ flex: 1, background: "rgba(0,212,255,0.06)", border: "1px solid #004d7f", borderRadius: 20, padding: "9px 14px", color: "#e8f0ff", fontSize: 13, outline: "none" }}
+                />
+                <button onClick={sendMsg} disabled={!currentRoom} style={{ width: 40, height: 40, borderRadius: "50%", background: currentRoom ? "linear-gradient(135deg, #00d4ff, #0099ff)" : "rgba(0,212,255,0.1)", border: "none", color: currentRoom ? "#0a0e27" : "#556", fontSize: 18, cursor: currentRoom ? "pointer" : "default", fontWeight: 900, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>➤</button>
               </div>
             </div>
           )}
@@ -2145,14 +2187,22 @@ export default function App() {
 
         {/* BOTTOM TAB BAR */}
         <div style={{ background: "linear-gradient(90deg, #0a0e27, #1a2558)", borderTop: "2px solid #00d4ff", display: "flex", flexShrink: 0 }}>
-          {(["stream", "members"] as const).map(tab => (
+          {(["stream", "chat", "members"] as const).map(tab => (
             <button key={tab} onClick={() => setMobileTab(tab as typeof mobileTab)} style={{
               flex: 1, padding: "12px 0", background: mobileTab === tab ? "rgba(0,212,255,0.15)" : "transparent",
               border: "none", color: mobileTab === tab ? "#00d4ff" : "#556", cursor: "pointer",
               fontSize: 10, fontWeight: mobileTab === tab ? 700 : 400, letterSpacing: 1,
               borderTop: mobileTab === tab ? "2px solid #00d4ff" : "2px solid transparent",
+              position: "relative",
             }}>
-              {tab === "stream" ? "🎮 STREAM" : `👥 (${members.length})`}
+              {tab === "stream" ? "🎮 STREAM" : tab === "chat" ? (
+                <>
+                  💬 CHAT
+                  {chatMessages.length > 0 && mobileTab !== "chat" && (
+                    <span style={{ position: "absolute", top: 6, right: "25%", width: 7, height: 7, borderRadius: "50%", background: "#00d4ff", display: "block" }} />
+                  )}
+                </>
+              ) : `👥 (${members.length})`}
             </button>
           ))}
         </div>
@@ -2204,6 +2254,7 @@ export default function App() {
                   ...(canStartStream ? [{ icon: isStreaming ? "⏹" : "▶", label: "STREAM", active: isStreaming, onClick: handleStreamButtonClick, color: isStreaming ? "#ff4444" : "#00d4ff" }] : []),
                   { icon: "🖥️", label: "SCREEN", active: isScreenSharing, onClick: toggleScreenShare, color: "#00d4ff" },
                   ...(isScreenSharing && hasSystemAudio ? [{ icon: isSystemAudioEnabled ? "🔊" : "🔇", label: "SYS AUD", active: isSystemAudioEnabled, onClick: toggleSystemAudio, color: isSystemAudioEnabled ? "#00ff88" : "#556" }] : []),
+                  ...(iAmRoomHost ? [{ icon: isMicOn ? "🎙️" : "🔇", label: "MIC", active: isMicOn, onClick: toggleMic, color: isMicOn ? "#00ff88" : "#00d4ff" }] : []),
                 ]),
               ].map(btn => (
                 <div key={btn.label} onClick={btn.onClick} title={btn.label} style={{ width: 56, height: 56, borderRadius: "50%", cursor: "pointer", userSelect: "none", background: btn.active ? `linear-gradient(135deg, ${btn.color}, ${btn.color}aa)` : "rgba(0,212,255,0.1)", border: `2px solid ${btn.color}`, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", boxShadow: btn.active ? `0 0 28px ${btn.color}88` : `0 0 6px ${btn.color}22`, transition: "all .3s" }}>
@@ -2328,7 +2379,37 @@ export default function App() {
             </div>
           </div>
 
-          <div style={{ flex: 1, ...panelSt, padding: 0, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 160 }}>
+          {/* LIVE CHAT PANEL */}
+          <div style={{ flex: "1 1 180px", ...panelSt, padding: 0, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 160 }}>
+            <div style={{ padding: "8px 12px", borderBottom: "1px solid #004d7f", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <span style={{ fontSize: 11, fontWeight: 700, color: "#00d4ff" }}>💬 LIVE CHAT</span>
+              {chatMessages.length > 0 && <span style={{ fontSize: 9, color: "#a0b0d0" }}>{chatMessages.length} msg{chatMessages.length > 1 ? "s" : ""}</span>}
+            </div>
+            <div className="chat-messages-scroll" style={{ flex: 1, overflowY: "auto", padding: "6px 8px", display: "flex", flexDirection: "column", gap: 5 }}>
+              {chatMessages.length === 0
+                ? <div style={{ color: "#a0b0d0", fontSize: 10, textAlign: "center", marginTop: 10, opacity: 0.5 }}>No messages yet</div>
+                : chatMessages.map(msg => (
+                  <div key={msg.id} style={{ display: "flex", flexDirection: "column", alignItems: msg.sender === userId ? "flex-end" : "flex-start" }}>
+                    <span style={{ fontSize: 8, color: msg.sender === "⚡ SYSTEM" ? "#ffaa00" : msg.sender === userId ? "#00d4ff" : "#a0b0d0", fontWeight: 700, marginBottom: 1, paddingLeft: 3, paddingRight: 3 }}>{msg.sender === userId ? "You" : msg.sender}</span>
+                    <div style={{ fontSize: 11, color: msg.sender === "⚡ SYSTEM" ? "#ffaa00" : "#e8f0ff", background: msg.sender === "⚡ SYSTEM" ? "rgba(255,170,0,0.08)" : msg.sender === userId ? "rgba(0,212,255,0.15)" : "rgba(255,255,255,0.05)", padding: "5px 9px", borderRadius: msg.sender === userId ? "10px 10px 3px 10px" : "10px 10px 10px 3px", maxWidth: "90%", border: msg.sender === userId ? "1px solid rgba(0,212,255,0.25)" : "1px solid rgba(255,255,255,0.07)", wordBreak: "break-word" }}>{msg.text}</div>
+                  </div>
+                ))}
+              <div ref={chatEndRef} />
+            </div>
+            <div style={{ padding: "6px 8px", borderTop: "1px solid #004d7f", display: "flex", gap: 6, flexShrink: 0 }}>
+              <input
+                value={chatInput}
+                onChange={e => setChatInput(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && sendMsg()}
+                placeholder={currentRoom ? "Message…" : "Join a room to chat"}
+                disabled={!currentRoom}
+                style={{ flex: 1, background: "rgba(0,212,255,0.05)", border: "1px solid #004d7f", borderRadius: 14, padding: "5px 10px", color: "#e8f0ff", fontSize: 11, outline: "none" }}
+              />
+              <button onClick={sendMsg} disabled={!currentRoom} style={{ width: 32, height: 32, borderRadius: "50%", background: currentRoom ? "linear-gradient(135deg, #00d4ff, #0099ff)" : "rgba(0,212,255,0.1)", border: "none", color: currentRoom ? "#0a0e27" : "#556", cursor: currentRoom ? "pointer" : "default", fontWeight: 900, fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>➤</button>
+            </div>
+          </div>
+
+          <div style={{ flex: "0 0 auto", ...panelSt, padding: 0, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 120, maxHeight: 220 }}>
             <div style={{ padding: "8px 12px", borderBottom: "1px solid #004d7f", flexShrink: 0 }}>
               <span style={{ fontSize: 11, fontWeight: 700, color: "#00d4ff" }}>👥 MEMBERS ({members.length})</span>
             </div>
