@@ -88,6 +88,9 @@ export default function App() {
   const [recordedBytes, setRecordedBytes] = useState(0);
   const [showRecordingSaveModal, setShowRecordingSaveModal] = useState(false);
   const [streamSec, setStreamSec] = useState(0);
+  const [remoteStreamSec, setRemoteStreamSec] = useState(0);
+  const remoteStreamStartedAtRef = useRef<number | null>(null);
+  const remoteTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [currentRoom, setCurrentRoom] = useState<string | null>(null);
   const [iAmRoomHost, setIAmRoomHost] = useState(false);
   const [userId, setUserId] = useState(
@@ -325,7 +328,7 @@ export default function App() {
       notify("Connected to server", "success");
       if (currentRoomRef.current) {
         socket.emit("join-room", { roomCode: currentRoomRef.current, userId: userIdRef.current, avatar: userAvatarRef.current, isViewer: _isViewer });
-        if (isStreamingRef.current) socket.emit("start-stream");
+        if (isStreamingRef.current) socket.emit("start-stream", { startedAt: Date.now() });
       } else {
         // Auto-join from URL parameter (mobile app deep link / QR code scan / watch link)
         try {
@@ -350,13 +353,21 @@ export default function App() {
       else notify("Connection lost. Reconnecting...", "warning");
     });
 
-    socket.on("room-joined", ({ peers, iAmRoomHost: iAmHost }: { peers: { peerId: string; userId: string; avatar: string; isStreaming: boolean; isRoomHost: boolean; connected?: boolean; isViewer?: boolean }[]; iAmRoomHost: boolean; }) => {
+    socket.on("room-joined", ({ peers, iAmRoomHost: iAmHost }: { peers: { peerId: string; userId: string; avatar: string; isStreaming: boolean; streamStartedAt?: number; isRoomHost: boolean; connected?: boolean; isViewer?: boolean }[]; iAmRoomHost: boolean; }) => {
       setIAmRoomHost(iAmHost);
-      peers.forEach(({ peerId, userId: uid, avatar, isStreaming: streaming, isRoomHost, connected, isViewer: peerIsViewer }) => {
+      peers.forEach(({ peerId, userId: uid, avatar, isStreaming: streaming, streamStartedAt, isRoomHost, connected, isViewer: peerIsViewer }) => {
         setMembers(p => p.find(m => m.peerId === peerId) ? p : [...p, { peerId, userId: uid, avatar, isFav: false, isStreaming: streaming, isRoomHost, connected: connected !== false, isViewer: !!peerIsViewer }]);
         // Always connect so the host can push video later via renegotiation
         if (connected !== false) connectToPeer(peerId, socket);
         if (streaming && connected !== false) {
+          // Start the remote stream timer for this mid-join member
+          const t = streamStartedAt ?? Date.now();
+          remoteStreamStartedAtRef.current = t;
+          if (remoteTimerRef.current) clearInterval(remoteTimerRef.current);
+          setRemoteStreamSec(Math.floor((Date.now() - t) / 1000));
+          remoteTimerRef.current = setInterval(() => {
+            setRemoteStreamSec(Math.floor((Date.now() - (remoteStreamStartedAtRef.current ?? Date.now())) / 1000));
+          }, 1000);
           // Auto-join for ALL users — no manual JOIN click required
           socket.emit("join-stream-request", { hostPeerId: peerId });
           setJoinedStreamHostId(peerId);
@@ -384,7 +395,7 @@ export default function App() {
       });
       // Don't initiate — the new peer sends offers to existing peers; just notify if we're streaming
       if (isStreamingRef.current) {
-        socket.emit("start-stream");
+        socket.emit("start-stream", { startedAt: Date.now() });
         // Safety net: after the initial offer/answer + ICE exchange completes, verify
         // the new peer's video sender actually has our current track. If replaceTrack
         // inside getOrCreatePC raced against ICE setup and left the sender null, the
@@ -433,8 +444,16 @@ export default function App() {
       setMembers(p => p.map(m => m.peerId === peerId ? { ...m, connected: false, isStreaming: false } : m));
     });
 
-    socket.on("peer-started-stream", ({ peerId, userId: uid }: { peerId: string; userId: string }) => {
+    socket.on("peer-started-stream", ({ peerId, userId: uid, startedAt }: { peerId: string; userId: string; startedAt?: number }) => {
       setMembers(p => p.map(m => m.peerId === peerId ? { ...m, isStreaming: true } : m));
+      // Record when the stream started so members can display the elapsed timer
+      const t = startedAt ?? Date.now();
+      remoteStreamStartedAtRef.current = t;
+      if (remoteTimerRef.current) clearInterval(remoteTimerRef.current);
+      setRemoteStreamSec(Math.floor((Date.now() - t) / 1000));
+      remoteTimerRef.current = setInterval(() => {
+        setRemoteStreamSec(Math.floor((Date.now() - (remoteStreamStartedAtRef.current ?? Date.now())) / 1000));
+      }, 1000);
       // Establish WebRTC connection now so tracks are ready immediately
       if (!pcsRef.current.has(peerId)) connectToPeer(peerId, socket);
       // Auto-join for ALL users — no manual JOIN click required
@@ -447,6 +466,10 @@ export default function App() {
 
     socket.on("peer-stopped-stream", ({ peerId }: { peerId: string }) => {
       setMembers(p => p.map(m => m.peerId === peerId ? { ...m, isStreaming: false } : m));
+      // Clear the remote timer — stream ended
+      if (remoteTimerRef.current) { clearInterval(remoteTimerRef.current); remoteTimerRef.current = null; }
+      remoteStreamStartedAtRef.current = null;
+      setRemoteStreamSec(0);
       setJoinStreamPrompt(null);
       // Stream is over for everyone — drop the local viewer count immediately so the
       // badge resets even before the server's stream-viewer-count event lands.
@@ -491,9 +514,12 @@ export default function App() {
 
     socket.on("you-were-kicked", ({ byUserId }: { byUserId: string }) => {
       notify(`🚫 You have been removed from the room by ${byUserId}`, "error");
-      addMsg("⚡ SYSTEM", `You were removed from the room by ${byUserId}`);
       pcsRef.current.forEach(pc => pc.close());
       pcsRef.current.clear();
+      if (remoteTimerRef.current) { clearInterval(remoteTimerRef.current); remoteTimerRef.current = null; }
+      remoteStreamStartedAtRef.current = null;
+      setRemoteStreamSec(0);
+      setChatMessages([]);
       setRemoteStreams([]); setFocusedStream(null); setMembers([]);
       setCurrentRoom(null); setJoinedStreamHostId(null); setIAmRoomHost(false);
       setStreamViewerCount(0);
@@ -642,9 +668,12 @@ export default function App() {
     // Fix 5: host left — all members get notified and room cleared
     socket.on("host-left-room", ({ hostUserId }: { hostUserId: string }) => {
       notify(`🏠 Host (${hostUserId}) left. Room closed.`, "warning");
-      addMsg("⚡ SYSTEM", `Host (${hostUserId}) has left. Room dissolved.`);
       pcsRef.current.forEach(pc => pc.close());
       pcsRef.current.clear();
+      if (remoteTimerRef.current) { clearInterval(remoteTimerRef.current); remoteTimerRef.current = null; }
+      remoteStreamStartedAtRef.current = null;
+      setRemoteStreamSec(0);
+      setChatMessages([]);
       setRemoteStreams([]); setFocusedStream(null); setMembers([]);
       setCurrentRoom(null); setJoinedStreamHostId(null);
       setJoinStreamPrompt(null); setIAmRoomHost(false);
@@ -663,6 +692,7 @@ export default function App() {
       screenMixedTrackRef.current = null;
       try { screenAudioCtxRef.current?.close(); } catch {}
       screenAudioCtxRef.current = null;
+      if (remoteTimerRef.current) clearInterval(remoteTimerRef.current);
       socket.disconnect();
     };
   }, []);
@@ -1185,7 +1215,7 @@ export default function App() {
 
     if (!cameraStarted && option !== "screen") return;
     setIsStreaming(true);
-    if (currentRoomRef.current) socketRef.current?.emit("start-stream");
+    if (currentRoomRef.current) socketRef.current?.emit("start-stream", { startedAt: Date.now() });
     addMsg("⚡ SYSTEM", `Stream started${currentRoomRef.current ? ` in room ${currentRoomRef.current}` : " (local)"}`);
     notify("You are now LIVE! 🔴", "success");
   }
@@ -1305,14 +1335,40 @@ export default function App() {
     screenAudioCtxRef.current = null;
   }
 
-  /** Switch all peer audio senders between system audio track and mic track. */
+  /** Mix system audio + mic using Web Audio API and send the combined track to all peers. */
   function applySystemAudioState(enabled: boolean) {
     const sysTrack = systemAudioTrackRef.current;
     const micTrack =
       audioStreamRef.current?.getAudioTracks()[0]
       ?? localStreamRef.current?.getAudioTracks()[0]
       ?? null;
-    const trackToSend = (enabled && sysTrack) ? sysTrack : micTrack;
+
+    // Tear down any previous mix context before creating a new one
+    try { screenAudioCtxRef.current?.close(); } catch {}
+    screenAudioCtxRef.current = null;
+    try { screenMixedTrackRef.current?.stop(); } catch {}
+    screenMixedTrackRef.current = null;
+
+    let trackToSend: MediaStreamTrack | null;
+
+    if (enabled && sysTrack && micTrack) {
+      // Both system audio and mic available — mix them together
+      const ctx = new AudioContext();
+      const dest = ctx.createMediaStreamDestination();
+      ctx.createMediaStreamSource(new MediaStream([sysTrack])).connect(dest);
+      ctx.createMediaStreamSource(new MediaStream([micTrack])).connect(dest);
+      screenAudioCtxRef.current = ctx;
+      const mixed = dest.stream.getAudioTracks()[0];
+      screenMixedTrackRef.current = mixed;
+      trackToSend = mixed;
+    } else if (enabled && sysTrack) {
+      // Only system audio (no mic ready yet)
+      trackToSend = sysTrack;
+    } else {
+      // System audio off — send mic only (or null if mic is also off)
+      trackToSend = micTrack;
+    }
+
     pcsRef.current.forEach(pc => {
       const trs = pc.getTransceivers();
       const audioSender =
@@ -1517,7 +1573,7 @@ export default function App() {
     // notify peers so they know a stream is now active in the room.
     if (ok && !isStreamingRef.current && currentRoomRef.current) {
       setIsStreaming(true);
-      socketRef.current?.emit("start-stream");
+      socketRef.current?.emit("start-stream", { startedAt: Date.now() });
     }
   }
 
@@ -1678,15 +1734,23 @@ export default function App() {
         }
       });
     }
+    // If system audio is active, remix so the mixed track reflects the new mic state
+    if (isSystemAudioEnabled && systemAudioTrackRef.current) {
+      applySystemAudioState(true);
+    }
     setIsMicOn(next);
     notify(next ? "Mic ON 🎙️" : "Mic muted 🔇", "info");
   }
 
   function joinRoomOnServer(roomCode: string) {
+    setChatMessages([]);
+    if (remoteTimerRef.current) { clearInterval(remoteTimerRef.current); remoteTimerRef.current = null; }
+    remoteStreamStartedAtRef.current = null;
+    setRemoteStreamSec(0);
     setCurrentRoom(roomCode);
     setMembers([{ peerId: "me", userId: userIdRef.current, avatar: userAvatarRef.current, isFav: false, isStreaming: isStreamingRef.current, isRoomHost: false, connected: true, isViewer: _isViewer }]);
     socketRef.current?.emit("join-room", { roomCode, userId: userIdRef.current, avatar: userAvatarRef.current, isViewer: _isViewer });
-    if (isStreamingRef.current) socketRef.current?.emit("start-stream");
+    if (isStreamingRef.current) socketRef.current?.emit("start-stream", { startedAt: Date.now() });
     addMsg("⚡ SYSTEM", `Joined room: ${roomCode}`);
     notify(`Joined room ${roomCode}`, "success");
   }
@@ -1721,6 +1785,9 @@ export default function App() {
       socketRef.current?.emit("leave-room");
     }
     pcsRef.current.forEach(pc => pc.close()); pcsRef.current.clear();
+    if (remoteTimerRef.current) { clearInterval(remoteTimerRef.current); remoteTimerRef.current = null; }
+    remoteStreamStartedAtRef.current = null;
+    setRemoteStreamSec(0);
     // Stop room audio stream so mic is released
     audioStreamRef.current?.getTracks().forEach(t => t.stop());
     audioStreamRef.current = null;
@@ -1728,10 +1795,10 @@ export default function App() {
     localStreamRef.current?.getTracks().forEach(t => t.stop()); localStreamRef.current = null;
     screenStreamRef.current?.getTracks().forEach(t => t.stop()); screenStreamRef.current = null;
     teardownScreenAudio();
+    setChatMessages([]);
     setRemoteStreams([]); setFocusedStream(null); setMembers([]);
     setCurrentRoom(null); setJoinedStreamHostId(null); setIAmRoomHost(false);
     setIsMicOn(false); setIsWebcamOn(false); setIsScreenSharing(false); setIsStreaming(false);
-    addMsg("⚡ SYSTEM", amHost ? "You deleted the room." : "You left the room.");
     notify(amHost ? "Room deleted" : "Left the room", "info");
     if (_isNativeApp) postToNative({ type: "leave_room" });
   }
@@ -2069,7 +2136,7 @@ export default function App() {
               👁️ {viewerCount}
             </div>
           )}
-          <div style={{ color: "#00d4ff", fontFamily: "monospace", fontWeight: 700, fontSize: 14 }}>{fmt(streamSec)}</div>
+          <div style={{ color: "#00d4ff", fontFamily: "monospace", fontWeight: 700, fontSize: 14 }}>{iAmRoomHost ? fmt(streamSec) : (remoteStreamSec > 0 ? fmt(remoteStreamSec) : "")}</div>
         </div>
 
         {/* ROOM BAR */}
@@ -2265,7 +2332,7 @@ export default function App() {
             </div>
             <div style={{ textAlign: "center", marginTop: 10, padding: 8, background: "rgba(0,0,0,0.4)", borderRadius: 10, border: "1px solid #004d7f" }}>
               <div style={{ fontSize: 9, color: "#a0b0d0", letterSpacing: 1 }}>⏱️ STREAM DURATION</div>
-              <div className="timer-pulse" style={{ fontSize: 26, fontWeight: 800, fontFamily: "monospace", color: "#00d4ff" }}>{fmt(streamSec)}</div>
+              <div className="timer-pulse" style={{ fontSize: 26, fontWeight: 800, fontFamily: "monospace", color: "#00d4ff" }}>{iAmRoomHost ? fmt(streamSec) : fmt(remoteStreamSec)}</div>
             </div>
             {isStreaming && (
               <button onClick={endStreamOnly} style={{ marginTop: 8, width: "100%", padding: 7, background: "rgba(255,0,0,0.15)", border: "1px solid #ff4444", color: "#ff6666", cursor: "pointer", borderRadius: 8, fontSize: 11, fontWeight: 700 }}>⏹️ END STREAM</button>

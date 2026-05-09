@@ -6,6 +6,7 @@ interface MemberMeta {
   userId: string;
   avatar: string;
   isStreaming: boolean;
+  streamStartedAt?: number;
   connected: boolean;
   isViewer: boolean;
 }
@@ -95,7 +96,8 @@ export function attachSignaling(httpServer: HttpServer) {
         .filter(([id]) => id !== socket.id)
         .map(([id, meta]) => ({
           peerId: id, userId: meta.userId, avatar: meta.avatar,
-          isStreaming: meta.isStreaming, isRoomHost: id === room.hostSocketId,
+          isStreaming: meta.isStreaming, streamStartedAt: meta.streamStartedAt,
+          isRoomHost: id === room.hostSocketId,
           connected: meta.connected, isViewer: meta.isViewer,
         }));
 
@@ -115,18 +117,19 @@ export function attachSignaling(httpServer: HttpServer) {
       logger.info({ socketId: socket.id, roomCode, userId, isHost, reconnect: oldPeerId !== null }, "Joined room");
     });
 
-    socket.on("start-stream", () => {
+    socket.on("start-stream", ({ startedAt }: { startedAt?: number } = {}) => {
       if (!currentRoom) return;
       const room = rooms.get(currentRoom);
       if (!room) return;
       // Fix 3: only host can mark as streaming on server
       if (socket.id !== room.hostSocketId) return;
+      const now = startedAt ?? Date.now();
       const m = room.members.get(socket.id);
-      if (m) { m.isStreaming = true; userMeta.isStreaming = true; }
+      if (m) { m.isStreaming = true; m.streamStartedAt = now; userMeta.isStreaming = true; userMeta.streamStartedAt = now; }
       // Fresh stream — clear any leftover viewer set from a previous stream
       room.streamViewers.clear();
       socket.to(currentRoom).emit("peer-started-stream", {
-        peerId: socket.id, userId: userMeta.userId, avatar: userMeta.avatar,
+        peerId: socket.id, userId: userMeta.userId, avatar: userMeta.avatar, startedAt: now,
       });
       io.to(currentRoom).emit("members-update", membersList(room));
       io.to(currentRoom).emit("stream-viewer-count", { count: 0 });
