@@ -729,6 +729,8 @@ export default function App() {
     // The user's "🔊 Tap to enable audio" button calls unlockAudio() which
     // sets vid.muted = false on every remote video.
     if (!audioUnlockedRef.current) vid.muted = true;
+    // iOS Safari requires load() after setting srcObject before play() works.
+    try { vid.load(); } catch {}
     const tryPlay = (a = 0) => {
       vid.play().catch(() => {
         if (a < 5) setTimeout(() => tryPlay(a + 1), 500);
@@ -763,6 +765,7 @@ export default function App() {
         vid.srcObject = null;
         vid.srcObject = stream;
         vid.muted = !audioUnlockedRef.current;
+        try { vid.load(); } catch {}
         vid.play().catch(() => {});
       }
     });
@@ -1978,9 +1981,11 @@ export default function App() {
           </header>
         )}
 
-        {/* VIDEO AREA */}
-        <div style={{ position: "relative", background: "#000", aspectRatio: "16/9", flexShrink: 0, overflow: "hidden" }}>
-          <video ref={localCenterRef} autoPlay muted playsInline style={{ width: "100%", height: "100%", objectFit: (!isWebcamOn && isScreenSharing) ? "contain" : "cover", display: showLocalCenter ? "block" : "none", background: "#000" }} />
+        {/* VIDEO AREA — explicit height so it never collapses on iOS < 15 where
+            aspect-ratio CSS is unsupported and absolutely-positioned children
+            contribute 0 to parent height. 56.25vw = 9/16 of viewport width = 16:9. */}
+        <div style={{ position: "relative", background: "#000", width: "100%", height: "56.25vw", maxHeight: "45vh", flexShrink: 0, overflow: "hidden" }}>
+          <video ref={localCenterRef} autoPlay muted playsInline style={{ position: "absolute", top: 0, left: 0, right: 0, bottom: 0, width: "100%", height: "100%", objectFit: (!isWebcamOn && isScreenSharing) ? "contain" : "cover", display: showLocalCenter ? "block" : "none", background: "#000" }} />
           {showRemoteCenter && (
             focusedStream
               ? <RemoteVideoEl key={focusedStream.peerId} stream={focusedStream.stream} peerId={focusedStream.peerId} videoRefs={remoteVideoRefs} videoOff={peerVideoOff.has(focusedStream.peerId)} audioUnlocked={audioUnlocked} />
@@ -2407,6 +2412,9 @@ function RemoteVideoEl({ stream, peerId, videoRefs, small, videoOff, audioUnlock
     // streams that carry audio (which is always the case — host mic is in the stream).
     // The parent's "🔊 Tap to enable audio" button unmutes all remote videos.
     vid.muted = !audioUnlocked;
+    // iOS Safari requires load() after setting srcObject for WebRTC streams
+    // before play() will work. On other browsers this is a no-op.
+    try { vid.load(); } catch {}
     vid.play().catch(() => {});
 
     // Auto-resume whenever the browser decides there's enough data to play.
@@ -2474,11 +2482,20 @@ function RemoteVideoEl({ stream, peerId, videoRefs, small, videoOff, audioUnlock
 
   return (
     <>
-      <video ref={ref} autoPlay playsInline muted style={{ width: "100%", height: "100%", objectFit: small ? "cover" : "contain", position: small ? "relative" : "absolute", inset: 0, background: "#000" }} />
+      <video
+        ref={node => {
+          (ref as React.MutableRefObject<HTMLVideoElement | null>).current = node;
+          // webkit-playsinline is required for inline playback on older iOS Safari
+          // (iOS < 10 needs the attribute; React's playsInline prop covers iOS 10+).
+          if (node) node.setAttribute("webkit-playsinline", "");
+        }}
+        autoPlay playsInline muted
+        style={{ width: "100%", height: "100%", objectFit: small ? "cover" : "contain", position: small ? "relative" : "absolute", top: 0, left: 0, right: 0, bottom: 0, background: "#000" }}
+      />
       {videoOff && (
         // Overlay covers the (otherwise frozen) last frame the moment the broadcaster
         // turned their camera/screen off, so viewers see an explicit "off" state.
-        <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: small ? 4 : 10, background: "#000", color: "#a0b0d0", pointerEvents: "none", zIndex: 5 }}>
+        <div style={{ position: "absolute", top: 0, left: 0, right: 0, bottom: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: small ? 4 : 10, background: "#000", color: "#a0b0d0", pointerEvents: "none", zIndex: 5 }}>
           <div style={{ fontSize: small ? 22 : 48 }}>📷</div>
           <div style={{ fontSize: small ? 9 : 14, fontWeight: 700, letterSpacing: small ? 1 : 2, color: "#00d4ff" }}>CAMERA OFF</div>
           {!small && <div style={{ fontSize: 10, color: "#667", letterSpacing: 1 }}>Audio is still live</div>}
