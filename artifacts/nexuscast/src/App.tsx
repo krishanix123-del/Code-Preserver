@@ -1873,8 +1873,13 @@ export default function App() {
     const newId = newUserIdInput.trim();
     if (!newId) return;
     setUserId(newId);
+    userIdRef.current = newId;
     setMembers(prev => prev.map(m => m.peerId === "me" ? { ...m, userId: newId } : m));
-    setNewUserIdInput(""); setShowEditIdModal(false); notify("Username updated", "success");
+    // Re-broadcast new name to the room so all peers see the update immediately
+    if (currentRoom && socketRef.current) {
+      socketRef.current.emit("join-room", { roomCode: currentRoom, userId: newId, avatar: userAvatarRef.current, isViewer: _isViewer });
+    }
+    setNewUserIdInput(""); setShowEditIdModal(false); notify("Username updated!", "success");
   }
 
   function copyRoomCode() {
@@ -1964,6 +1969,23 @@ export default function App() {
           <input value={joinCodeInput} onChange={e => setJoinCodeInput(e.target.value.toUpperCase())} placeholder="e.g. ABC123" maxLength={8} style={{ ...inpSt, letterSpacing: 6, fontSize: 20, textAlign: "center" }} onKeyDown={e => e.key === "Enter" && joinTeamFromModal()} />
           <button onClick={joinTeamFromModal} style={btnSt}>JOIN ROOM</button>
           <button onClick={() => setShowJoinModal(false)} style={btn2St}>CANCEL</button>
+        </ModalBox>
+      </ModalOverlay>}
+
+      {showEditIdModal && <ModalOverlay onClose={() => setShowEditIdModal(false)}>
+        <ModalBox title="✏️ CHANGE YOUR NAME">
+          <p style={{ fontSize: 11, color: "#a0b0d0", marginBottom: 4 }}>This is the name other members see</p>
+          <input
+            value={newUserIdInput}
+            onChange={e => setNewUserIdInput(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && saveUserId()}
+            placeholder="Enter new display name"
+            maxLength={24}
+            autoFocus
+            style={{ ...inpSt, textAlign: "center", fontSize: 16, letterSpacing: 1 }}
+          />
+          <button onClick={saveUserId} style={btnSt}>✅ SAVE NAME</button>
+          <button onClick={() => setShowEditIdModal(false)} style={btn2St}>CANCEL</button>
         </ModalBox>
       </ModalOverlay>}
 
@@ -2165,8 +2187,9 @@ export default function App() {
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                   <div onClick={() => setShowAvatarModal(true)} style={{ width: 38, height: 38, borderRadius: "50%", background: "linear-gradient(135deg, #00d4ff, #0099ff)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, cursor: "pointer" }}>{userAvatar}</div>
                   <div style={{ flex: 1 }}>
-                    <div style={{ fontSize: 12, fontWeight: 700, color: "#00d4ff" }}>
-                      {userId} {iAmRoomHost ? <span style={{ fontSize: 8, color: "#ffaa00", border: "1px solid #ffaa00", padding: "1px 4px", borderRadius: 3, marginLeft: 3 }}>HOST</span> : null}
+                    <div style={{ fontSize: 12, fontWeight: 700, color: "#00d4ff", display: "flex", alignItems: "center", gap: 5 }}>
+                      {userId} {iAmRoomHost ? <span style={{ fontSize: 8, color: "#ffaa00", border: "1px solid #ffaa00", padding: "1px 4px", borderRadius: 3 }}>HOST</span> : null}
+                      <span onClick={() => { setNewUserIdInput(userId); setShowEditIdModal(true); }} title="Change your name" style={{ fontSize: 11, cursor: "pointer", color: "#a855f7", opacity: 0.8 }}>✏️</span>
                     </div>
                     <div style={{ fontSize: 9, color: isConnected ? "#00ff00" : "#ff8800" }}>{isConnected ? "● Connected" : "⏳ Reconnecting..."}</div>
                   </div>
@@ -2446,6 +2469,7 @@ export default function App() {
                 <div style={{ fontSize: 12, fontWeight: 700, color: "#00d4ff" }}>You {iAmRoomHost ? <span style={{ fontSize: 9, background: "rgba(255,165,0,0.2)", color: "#ffaa00", border: "1px solid #ffaa00", padding: "1px 5px", borderRadius: 4, marginLeft: 4 }}>HOST</span> : null}</div>
                 <div style={{ display: "flex", alignItems: "center", gap: 5, marginTop: 3 }}>
                   <span style={{ fontSize: 10, color: "#a0b0d0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{userId}</span>
+                  <span onClick={() => { setNewUserIdInput(userId); setShowEditIdModal(true); }} title="Change your name" style={{ fontSize: 11, cursor: "pointer", color: "#a855f7", opacity: 0.8, flexShrink: 0 }}>✏️</span>
                 </div>
               </div>
               <div style={{ fontSize: 9, padding: "3px 7px", background: isConnected ? "rgba(0,255,0,0.1)" : "rgba(255,128,0,0.1)", border: `1px solid ${isConnected ? "#00ff00" : "#ff8800"}`, color: isConnected ? "#00ff00" : "#ff8800", borderRadius: 8, fontWeight: 700, flexShrink: 0 }}>{isConnected ? "● ON" : "⏳"}</div>
