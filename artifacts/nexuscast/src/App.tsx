@@ -140,6 +140,7 @@ export default function App() {
   // Fix 8: mobile detection
   const [isMobile, setIsMobile] = useState(false);
   const [mobileTab, setMobileTab] = useState<"stream" | "chat" | "members">("stream");
+  const [isVideoExpanded, setIsVideoExpanded] = useState(false);
 
   const [miniPos, setMiniPos] = useState({ x: -1, y: -1 });
   const miniDragRef = useRef({ dragging: false, startX: 0, startY: 0, origX: 0, origY: 0 });
@@ -266,6 +267,45 @@ export default function App() {
   useEffect(() => { isWebcamOnRef.current = isWebcamOn; }, [isWebcamOn]);
   useEffect(() => { audioUnlockedRef.current = audioUnlocked; }, [audioUnlocked]);
   useEffect(() => { remoteStreamsRef.current = remoteStreams; }, [remoteStreams]);
+
+  // Adaptive bitrate: every 4s check each sender's stats for packet loss.
+  // If loss > 3% drop maxBitrate by 30%; if loss == 0 nudge it back up.
+  useEffect(() => {
+    if (!isStreaming) return;
+    const id = setInterval(async () => {
+      for (const pc of pcsRef.current.values()) {
+        for (const sender of pc.getSenders()) {
+          if (sender.track?.kind !== "video") continue;
+          try {
+            const stats = await pc.getStats(sender.track);
+            let lost = 0, sent = 0;
+            stats.forEach((r: RTCStats) => {
+              if (r.type === "outbound-rtp") {
+                const s = r as { packetsSent?: number; retransmittedPacketsSent?: number };
+                sent += (s.packetsSent ?? 0);
+              }
+              if (r.type === "remote-inbound-rtp") {
+                const s = r as { packetsLost?: number };
+                lost += (s.packetsLost ?? 0);
+              }
+            });
+            const lossRate = sent > 0 ? lost / sent : 0;
+            const params = sender.getParameters();
+            if (!params.encodings?.length) continue;
+            const cur = params.encodings[0].maxBitrate ?? (isScreenSharingRef.current ? 4_000_000 : 2_500_000);
+            let next = cur;
+            if (lossRate > 0.03) next = Math.max(300_000, Math.round(cur * 0.7));
+            else if (lossRate === 0) next = Math.min(isScreenSharingRef.current ? 4_000_000 : 2_500_000, Math.round(cur * 1.15));
+            if (next !== cur) {
+              params.encodings[0].maxBitrate = next;
+              await sender.setParameters(params).catch(() => {});
+            }
+          } catch {}
+        }
+      }
+    }, 4000);
+    return () => clearInterval(id);
+  }, [isStreaming]);
 
   // Generate QR code whenever shareCode changes
   useEffect(() => {
@@ -721,9 +761,11 @@ export default function App() {
           }
           params.encodings[0].maxBitrate = maxBitrate;
           params.encodings[0].maxFramerate = maxFramerate;
-          // 'maintain-framerate' keeps motion smooth at the cost of resolution — best for "lagless" perception
-          (params.encodings[0] as { degradationPreference?: string }).degradationPreference = "maintain-framerate";
-          (params as { degradationPreference?: string }).degradationPreference = "maintain-framerate";
+          // Screen share: keep resolution so text stays readable even at low fps.
+          // Camera: maintain framerate for smooth motion.
+          const pref = isScreenShare ? "maintain-resolution" : "maintain-framerate";
+          (params.encodings[0] as { degradationPreference?: string }).degradationPreference = pref;
+          (params as { degradationPreference?: string }).degradationPreference = pref;
           await sender.setParameters(params);
         } catch {}
       }
@@ -993,12 +1035,13 @@ export default function App() {
         return next;
       });
       if (pc.iceConnectionState === "disconnected") {
-        // Give it 3s to self-recover (transient network blip), then restart
+        // Mobile networks drop briefly — give 1.5s to self-recover, then restart.
+        // (Desktop uses the same value; faster recovery beats the old 3s wait.)
         setTimeout(() => {
           if (pc.iceConnectionState === "disconnected" || pc.iceConnectionState === "failed") {
             attemptIceRestart("disconnected");
           }
-        }, 3000);
+        }, 1500);
       }
       if (pc.iceConnectionState === "failed") {
         attemptIceRestart("ICE failed");
@@ -2089,8 +2132,9 @@ export default function App() {
 
         {/* VIDEO AREA — explicit height so it never collapses on iOS < 15 where
             aspect-ratio CSS is unsupported and absolutely-positioned children
-            contribute 0 to parent height. 56.25vw = 9/16 of viewport width = 16:9. */}
-        <div style={{ position: "relative", background: "#000", width: "100%", height: "56.25vw", maxHeight: "45vh", flexShrink: 0, overflow: "hidden" }}>
+            contribute 0 to parent height. 56.25vw = 9/16 of viewport width = 16:9.
+            isVideoExpanded overrides to fill the safe-area-aware viewport height. */}
+        <div style={{ position: isVideoExpanded ? "fixed" : "relative", top: isVideoExpanded ? 0 : undefined, left: isVideoExpanded ? 0 : undefined, right: isVideoExpanded ? 0 : undefined, bottom: isVideoExpanded ? 0 : undefined, zIndex: isVideoExpanded ? 9999 : undefined, background: "#000", width: "100%", height: isVideoExpanded ? "100dvh" : "56.25vw", maxHeight: isVideoExpanded ? "100dvh" : "45vh", flexShrink: 0, overflow: "hidden" }}>
           <video ref={localCenterRef} autoPlay muted playsInline style={{ position: "absolute", top: 0, left: 0, right: 0, bottom: 0, width: "100%", height: "100%", objectFit: (!isWebcamOn && isScreenSharing) ? "contain" : "cover", display: showLocalCenter ? "block" : "none", background: "#000" }} />
           {showRemoteCenter && (
             focusedStream
@@ -2122,10 +2166,17 @@ export default function App() {
           {!audioUnlocked && remoteStreams.length > 0 && (
             <div onClick={unlockAudio} style={{ position: "absolute", bottom: 8, left: "50%", transform: "translateX(-50%)", background: "linear-gradient(135deg, rgba(0,212,255,0.35), rgba(0,153,255,0.25))", border: "2px solid #00d4ff", borderRadius: 20, padding: "8px 20px", fontSize: 12, fontWeight: 700, color: "#00d4ff", boxShadow: "0 0 16px rgba(0,212,255,0.5)", animation: "statusBlink 2s infinite", letterSpacing: 1 }}>🔊 Tap to enable audio</div>
           )}
-          {showRemoteCenter && (
-            <button onClick={forceReconnectVideo} title="Video stuck or black? Tap to reconnect" style={{ position: "absolute", top: 8, left: "50%", transform: "translateX(-50%)", background: "rgba(0,0,0,0.55)", border: "1px solid #334", borderRadius: 14, padding: "4px 12px", fontSize: 10, color: "#a0b0d0", cursor: "pointer", zIndex: 20, display: "flex", alignItems: "center", gap: 5 }}>
-              🔄 Black screen? Reconnect
-            </button>
+          {(showRemoteCenter || showLocalCenter) && (
+            <div style={{ position: "absolute", top: 8, left: "50%", transform: "translateX(-50%)", display: "flex", gap: 6, zIndex: 20 }}>
+              {showRemoteCenter && (
+                <button onClick={forceReconnectVideo} title="Video stuck or black? Tap to reconnect" style={{ background: "rgba(0,0,0,0.6)", border: "1px solid #334", borderRadius: 14, padding: "4px 12px", fontSize: 10, color: "#a0b0d0", cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}>
+                  🔄 Reconnect
+                </button>
+              )}
+              <button onClick={() => setIsVideoExpanded(v => !v)} title={isVideoExpanded ? "Shrink video" : "Expand video to full screen"} style={{ background: "rgba(0,0,0,0.6)", border: "1px solid #334", borderRadius: 14, padding: "4px 12px", fontSize: 10, color: "#a0b0d0", cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}>
+                {isVideoExpanded ? "✕ Exit" : "⛶ Expand"}
+              </button>
+            </div>
           )}
           {isWebcamOn && isScreenSharing && (
             <div style={{ position: "absolute", bottom: 8, right: 8, width: 110, height: 72, border: "2px solid #00d4ff", borderRadius: 8, overflow: "hidden", background: "#000" }}>
@@ -2624,22 +2675,27 @@ function RemoteVideoEl({ stream, peerId, videoRefs, small, videoOff, audioUnlock
 
     // Watchdog: if video is stuck (paused or no pixel data) for 2+ consecutive
     // checks, cycle srcObject to force the browser to redisplay incoming frames.
-    // This is the last-resort recovery for TURN relay paths that take >8s to establish.
+    // 800ms interval → recovery in ~1.6s instead of 3s — important on mobile.
     let stuckCount = 0;
+    let lastTime = -1;
     const watchdog = setInterval(() => {
-      if (vid.videoWidth === 0 || vid.paused) {
+      const nowTime = vid.currentTime;
+      const isStuck = vid.videoWidth === 0 || vid.paused || (nowTime === lastTime && !vid.paused);
+      lastTime = nowTime;
+      if (isStuck) {
         stuckCount++;
         if (stuckCount >= 2) {
           vid.srcObject = null;
           vid.srcObject = stream;
           vid.muted = !audioUnlocked;
+          try { vid.load(); } catch {}
           vid.play().catch(() => {});
           stuckCount = 0;
         }
       } else {
         stuckCount = 0;
       }
-    }, 1500);
+    }, 800);
 
     return () => {
       vid.removeEventListener("canplay", onCanPlay);
