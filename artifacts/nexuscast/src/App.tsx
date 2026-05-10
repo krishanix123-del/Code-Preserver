@@ -817,7 +817,6 @@ export default function App() {
 
   async function initRoomAudio() {
     if (_isViewer) return; // view-only guests don't have a mic
-    if (!iAmRoomHostRef.current) return; // only the host broadcasts mic audio
     if (audioStreamRef.current) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -890,9 +889,8 @@ export default function App() {
     // `replaceTrack(...)` on an already-negotiated sender — no addTrack, no renegotiation, no
     // race. This eliminated the "screen invisible to viewers" bug that came from `addTrack`
     // mid-call needing onnegotiationneeded to fire reliably (which it doesn't always).
-    // Non-host members only receive audio (they never broadcast a mic track), so set
-    // their audio transceiver to recvonly to save upload bandwidth and prevent feedback.
-    const audioDirection = iAmRoomHostRef.current ? "sendrecv" : "recvonly";
+    // All peers use sendrecv so both host and members can broadcast mic audio.
+    const audioDirection = "sendrecv";
     const audioTransceiver = pc.addTransceiver("audio", { direction: audioDirection, streams: [outboundStream] });
     const videoTransceiver = pc.addTransceiver("video", { direction: "sendrecv", streams: [outboundStream] });
 
@@ -1081,8 +1079,8 @@ export default function App() {
   // connectToPeer: initiator side — we create the offer (for all peers)
   async function connectToPeer(peerId: string, socket: Socket) {
     if (pcsRef.current.has(peerId)) return;
-    // Only the host acquires a mic — members are receive-only for audio.
-    if (iAmRoomHostRef.current) initRoomAudio().catch(() => {});
+    // All members acquire a mic so they can speak to each other.
+    initRoomAudio().catch(() => {});
     const pc = getOrCreatePC(peerId, socket);
     try {
       const offer = await pc.createOffer();
@@ -1424,9 +1422,13 @@ export default function App() {
       // Store the raw system audio track so the toggle can switch it on/off
       systemAudioTrackRef.current = capturedSystemAudio;
       setHasSystemAudio(!!capturedSystemAudio);
-      // Start with system audio OFF — user must explicitly turn it on.
-      // This avoids surprising echo / unexpected audio being broadcast.
-      setIsSystemAudioEnabled(false);
+      // Auto-enable system audio if browser granted it — no extra click needed.
+      if (capturedSystemAudio) {
+        setIsSystemAudioEnabled(true);
+        applySystemAudioState(true);
+      } else {
+        setIsSystemAudioEnabled(false);
+      }
 
       // Push only the video track to every connected peer.
       // Audio sender stays on the mic track (echo-cancelled at capture time).
@@ -1485,9 +1487,9 @@ export default function App() {
       screenVideoTrack.onended = () => stopScreenShare();
 
       if (capturedSystemAudio) {
-        notify("Screen sharing active 🖥️ — use the 🔊 button to broadcast system audio", "success");
+        notify("Screen sharing active 🖥️ — system audio broadcasting ON 🔊", "success");
       } else {
-        notify("Screen sharing active 🖥️ (no system audio — in Chrome, pick a Tab and tick 'Share tab audio')", "info");
+        notify("Screen sharing active 🖥️ — for audio: in Chrome pick a Tab and tick 'Share tab audio'", "info");
       }
       return true;
     } catch (err: unknown) {
@@ -1695,7 +1697,6 @@ export default function App() {
   }
 
   async function toggleMic() {
-    if (!iAmRoomHost) { notify("Only the host can use the mic in this room", "warning"); return; }
     if (isMuted) { notify("You are muted. Please wait.", "warning"); return; }
     // If we have no mic stream yet, acquire it now and wire it into every PC.
     if (!audioStreamRef.current && !localStreamRef.current) {
@@ -2119,7 +2120,7 @@ export default function App() {
           )}
           {isStreaming && <div style={{ position: "absolute", top: 8, right: 8, background: "rgba(255,0,0,0.25)", padding: "3px 8px", borderRadius: 12, fontSize: 9, fontWeight: 700, color: "#ff4444", border: "1px solid #ff4444", animation: "statusBlink 1s infinite" }}>● LIVE</div>}
           {!audioUnlocked && remoteStreams.length > 0 && (
-            <div onClick={unlockAudio} style={{ position: "absolute", bottom: 8, left: "50%", transform: "translateX(-50%)", background: "rgba(0,212,255,0.2)", border: "1px solid #00d4ff", borderRadius: 16, padding: "6px 16px", fontSize: 10, color: "#00d4ff" }}>🔊 Tap to enable audio</div>
+            <div onClick={unlockAudio} style={{ position: "absolute", bottom: 8, left: "50%", transform: "translateX(-50%)", background: "linear-gradient(135deg, rgba(0,212,255,0.35), rgba(0,153,255,0.25))", border: "2px solid #00d4ff", borderRadius: 20, padding: "8px 20px", fontSize: 12, fontWeight: 700, color: "#00d4ff", boxShadow: "0 0 16px rgba(0,212,255,0.5)", animation: "statusBlink 2s infinite", letterSpacing: 1 }}>🔊 Tap to enable audio</div>
           )}
           {showRemoteCenter && (
             <button onClick={forceReconnectVideo} title="Video stuck or black? Tap to reconnect" style={{ position: "absolute", top: 8, left: "50%", transform: "translateX(-50%)", background: "rgba(0,0,0,0.55)", border: "1px solid #334", borderRadius: 14, padding: "4px 12px", fontSize: 10, color: "#a0b0d0", cursor: "pointer", zIndex: 20, display: "flex", alignItems: "center", gap: 5 }}>
@@ -2152,7 +2153,7 @@ export default function App() {
               {isScreenSharing && hasSystemAudio && (
                 <button onClick={toggleSystemAudio} title={isSystemAudioEnabled ? "Turn off system audio" : "Turn on system audio"} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isSystemAudioEnabled ? "#00ff88" : "#334"}`, background: isSystemAudioEnabled ? "rgba(0,255,136,0.2)" : "rgba(0,0,0,0.3)", color: isSystemAudioEnabled ? "#00ff88" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>{isSystemAudioEnabled ? "🔊" : "🔇"}</button>
               )}
-              {iAmRoomHost && (
+              {!_isViewer && (
                 <button onClick={toggleMic} title={isMicOn ? "Mute your mic" : "Unmute your mic"} style={{ width: 44, height: 44, borderRadius: "50%", border: `2px solid ${isMicOn ? "#00ff88" : "#334"}`, background: isMicOn ? "rgba(0,255,136,0.2)" : "rgba(0,0,0,0.3)", color: isMicOn ? "#00ff88" : "#667", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>{isMicOn ? "🎙️" : "🔇"}</button>
               )}
             </>
@@ -2350,7 +2351,7 @@ export default function App() {
                   ...(canStartStream ? [{ icon: isStreaming ? "⏹" : "▶", label: "STREAM", active: isStreaming, onClick: handleStreamButtonClick, color: isStreaming ? "#ff4444" : "#00d4ff" }] : []),
                   { icon: "🖥️", label: "SCREEN", active: isScreenSharing, onClick: toggleScreenShare, color: "#00d4ff" },
                   ...(isScreenSharing && hasSystemAudio ? [{ icon: isSystemAudioEnabled ? "🔊" : "🔇", label: "SYS AUD", active: isSystemAudioEnabled, onClick: toggleSystemAudio, color: isSystemAudioEnabled ? "#00ff88" : "#556" }] : []),
-                  ...(iAmRoomHost ? [{ icon: isMicOn ? "🎙️" : "🔇", label: "MIC", active: isMicOn, onClick: toggleMic, color: isMicOn ? "#00ff88" : "#00d4ff" }] : []),
+                  { icon: isMicOn ? "🎙️" : "🔇", label: "MIC", active: isMicOn, onClick: toggleMic, color: isMicOn ? "#00ff88" : "#00d4ff" },
                 ]),
               ].map(btn => (
                 <div key={btn.label} onClick={btn.onClick} title={btn.label} style={{ width: 56, height: 56, borderRadius: "50%", cursor: "pointer", userSelect: "none", background: btn.active ? `linear-gradient(135deg, ${btn.color}, ${btn.color}aa)` : "rgba(0,212,255,0.1)", border: `2px solid ${btn.color}`, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", boxShadow: btn.active ? `0 0 28px ${btn.color}88` : `0 0 6px ${btn.color}22`, transition: "all .3s" }}>
@@ -2426,7 +2427,7 @@ export default function App() {
             )}
 
             {!audioUnlocked && remoteStreams.length > 0 && (
-              <div onClick={unlockAudio} style={{ position: "absolute", bottom: 60, left: "50%", transform: "translateX(-50%)", background: "rgba(0,212,255,0.2)", border: "1px solid #00d4ff", borderRadius: 20, padding: "8px 20px", cursor: "pointer", fontSize: 11, color: "#00d4ff", zIndex: 20 }}>🔊 Click to enable audio</div>
+              <div onClick={unlockAudio} style={{ position: "absolute", bottom: 60, left: "50%", transform: "translateX(-50%)", background: "linear-gradient(135deg, rgba(0,212,255,0.35), rgba(0,153,255,0.25))", border: "2px solid #00d4ff", borderRadius: 24, padding: "10px 24px", cursor: "pointer", fontSize: 13, fontWeight: 700, color: "#00d4ff", zIndex: 20, boxShadow: "0 0 20px rgba(0,212,255,0.5)", animation: "statusBlink 2s infinite", letterSpacing: 1 }}>🔊 Click here to enable audio</div>
             )}
             {showRemoteCenter && (
               <button onClick={forceReconnectVideo} title="Video stuck or black? Click to reconnect" style={{ position: "absolute", top: 10, left: "50%", transform: "translateX(-50%)", background: "rgba(0,0,0,0.6)", border: "1px solid #334", borderRadius: 16, padding: "5px 14px", fontSize: 11, color: "#a0b0d0", cursor: "pointer", zIndex: 20, display: "flex", alignItems: "center", gap: 6 }}>
